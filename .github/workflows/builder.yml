@@ -23,7 +23,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.0.2
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
@@ -44,7 +44,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.0.2
       - uses: freerangebytes/setup-actionlint@v0.1.1
       - name: Run actionlint
         run: |
@@ -57,11 +57,11 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.0.2
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-      - uses: robherley/go-test-action@v0
+      - uses: robherley/go-test-action@v1
         with:
           testArguments: -coverprofile=coverage.out -covermode=atomic ./...
           omit: untested
@@ -89,7 +89,7 @@ jobs:
       contents: read
       pull-requests: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.0.2
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
@@ -110,8 +110,8 @@ jobs:
       pull-requests: write
       security-events: write
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/dependency-review-action@v4
+      - uses: actions/checkout@v6.0.2
+      - uses: actions/dependency-review-action@v5
         if: github.event_name == 'pull_request'
         with:
           fail-on-severity: moderate
@@ -127,7 +127,7 @@ jobs:
           output-file: govulncheck.sarif
 
       - name: Upload SARIF
-        uses: github/codeql-action/upload-sarif@v4.32.6
+        uses: github/codeql-action/upload-sarif@v4.36.0
         if: always()
         with:
           sarif_file: govulncheck.sarif
@@ -184,7 +184,7 @@ jobs:
           (matrix.mode == 'release' && startsWith(github.ref, 'refs/tags/'))
           || (matrix.mode == 'snapshot' && (github.ref == 'refs/heads/main' || github.event_name == 'pull_request'))
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.0.2
         if: steps.guard.outputs.run == 'true'
         with:
           fetch-depth: 0
@@ -200,7 +200,7 @@ jobs:
 
       - name: Log in to GHCR
         if: steps.guard.outputs.run == 'true'
-        uses: nick-fields/retry@v3
+        uses: nick-fields/retry@v4
         with:
           timeout_seconds: 30
           max_attempts: 3
@@ -211,11 +211,11 @@ jobs:
 
       - name: Install Nix
         if: steps.guard.outputs.run == 'true'
-        uses: DeterminateSystems/nix-installer-action@v21
+        uses: DeterminateSystems/nix-installer-action@v22
 
       - name: Install cosign
         if: steps.guard.outputs.run == 'true' && matrix.cosign
-        uses: sigstore/cosign-installer@v4.1.0
+        uses: sigstore/cosign-installer@v4.1.2
 
       - name: Run GoReleaser
         if: steps.guard.outputs.run == 'true'
