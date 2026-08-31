@@ -3,7 +3,6 @@ updates:
   - package-ecosystem: github-actions
     directories:
       - /
-      - /swatches/.github/workflows
     schedule:
       interval: monthly
     groups:
@@ -22,3 +21,8 @@ updates:
     commit-message:
       prefix: "deps"
       include: "scope"
+
+  - package-ecosystem: "nix"
+    directory: "/"
+    schedule:
+      interval: "weekly"

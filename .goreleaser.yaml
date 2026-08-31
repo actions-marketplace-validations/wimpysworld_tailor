@@ -99,7 +99,9 @@ homebrew_casks:
     license: BlueOak-1.0.0
 
 aurs:
-  - name: tailor-bin
+  - ids:
+      - compressed
+    name: tailor-bin
     description: "Ready-to-wear project templates for GitHub repositories."
     homepage: https://github.com/wimpysworld/tailor
     maintainers:
@@ -121,6 +123,11 @@ nix:
     homepage: https://github.com/wimpysworld/tailor
     license: blueOak100
 
+retry:
+  attempts: 5
+  delay: 10s
+  max_delay: 2m
+
 dockers_v2:
   - id: ghcr
     dockerfile: Dockerfile
@@ -133,10 +140,6 @@ dockers_v2:
     platforms:
       - linux/amd64
       - linux/arm64
-    retry:
-      attempts: 5
-      delay: 10s
-      max_delay: 2m
     labels:
       "org.opencontainers.image.title": "{{ .ProjectName }}"
       "org.opencontainers.image.description": "Ready-to-wear project templates for GitHub repositories."

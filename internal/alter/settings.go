@@ -3,12 +3,10 @@ package alter
 import (
 	"errors"
 	"fmt"
-	"os"
 	"reflect"
 	"slices"
 	"strings"
 
-	"github.com/cli/go-gh/v2/pkg/api"
 	"github.com/wimpysworld/tailor/internal/config"
 	"github.com/wimpysworld/tailor/internal/gh"
 	"github.com/wimpysworld/tailor/internal/model"
@@ -21,39 +19,48 @@ const (
 	WouldSet       RepoSettingCategory = "would set"
 	RepoNoChange   RepoSettingCategory = "no change"
 	WouldSkipScope RepoSettingCategory = "would skip (insufficient scope)"
-	WouldSkipRole  RepoSettingCategory = "would skip (insufficient role)"
 )
 
 // RepoSettingResult records the field name, category, and display value for one
-// repository setting. Annotation carries optional context for skip categories,
-// embedded in the label (e.g. "token missing required scope").
+// repository setting. Skip results for write operations leave Field empty and
+// carry the skipped Operation instead. Annotation carries optional context for
+// skip categories, embedded in the label (e.g. "token missing required scope").
 type RepoSettingResult struct {
+	Section    string
 	Field      string
 	Category   RepoSettingCategory
 	Value      string
 	Annotation string
+	Operation  gh.Operation
 }
 
 // ProcessRepoSettings compares declared settings against live settings
 // and optionally applies them. Returns results for output formatting.
-func ProcessRepoSettings(cfg *config.Config, mode ApplyMode, client *api.RESTClient, owner, name string, hasRepo bool) ([]RepoSettingResult, error) {
+func ProcessRepoSettings(cfg *config.Config, mode ApplyMode, target RepoTarget) ([]RepoSettingResult, error) {
 	if cfg.Repository == nil {
 		return nil, nil
 	}
 
-	if !hasRepo {
-		fmt.Fprintln(os.Stderr, "No GitHub repository context found. Repository settings will be applied once a remote is configured.")
+	if target.missingRepo("Repository settings") {
 		return nil, nil
 	}
 
-	live, warnings, err := gh.ReadRepoSettings(client, owner, name)
+	live, warnings, err := gh.ReadRepoSettings(target.Client, target.Owner, target.Name)
 	if err != nil {
 		return nil, err
 	}
 
 	// Convert read-path warnings into skip results and collect the affected
 	// field names so the corresponding WouldSet entries can be suppressed.
-	skipResults, skippedFields := readWarningsToResults(warnings, cfg.Repository)
+	skipResults, skippedFields := readWarningsToResults(warnings, cfg.Repository, live)
+
+	if cfg.Repository.AutomatedSecurityFixesEnabled != nil &&
+		*cfg.Repository.AutomatedSecurityFixesEnabled &&
+		(cfg.Repository.VulnerabilityAlertsEnabled == nil || !*cfg.Repository.VulnerabilityAlertsEnabled) &&
+		live.VulnerabilityAlertsEnabled != nil &&
+		!*live.VulnerabilityAlertsEnabled {
+		fmt.Fprintln(target.stderr(), "warning: automated_security_fixes_enabled is true but vulnerability alerts are disabled on GitHub; enable vulnerability_alerts_enabled first")
+	}
 
 	results := compareSettings(cfg.Repository, live)
 
@@ -73,7 +80,7 @@ func ProcessRepoSettings(cfg *config.Config, mode ApplyMode, client *api.RESTCli
 	results = append(results, skipResults...)
 
 	if mode.ShouldWrite() && hasChanges(results) {
-		applyResult, err := gh.ApplyRepoSettings(client, owner, name, cfg.Repository)
+		applyResult, err := gh.ApplyRepoSettingsWithCurrent(target.Client, target.Owner, target.Name, settingsForApply(cfg.Repository, results), live)
 		if err != nil {
 			return nil, err
 		}
@@ -83,20 +90,36 @@ func ProcessRepoSettings(cfg *config.Config, mode ApplyMode, client *api.RESTCli
 	return results, nil
 }
 
+func settingsForApply(declared *model.RepositorySettings, results []RepoSettingResult) *model.RepositorySettings {
+	changed := make(map[string]bool)
+	for _, result := range results {
+		if result.Category == WouldSet {
+			changed[result.Field] = true
+		}
+	}
+
+	apply := new(model.RepositorySettings)
+	applyValue := reflect.ValueOf(apply).Elem()
+	for _, field := range model.RepositorySettingFields(declared) {
+		if changed[field.YAMLKey] {
+			applyValue.Field(field.Index).Set(field.Value)
+		}
+	}
+	return apply
+}
+
 // skippedToResults converts gh.ApplyResult skipped operations into
-// RepoSettingResult entries with WouldSkipScope or WouldSkipRole categories.
+// RepoSettingResult entries with WouldSkipScope categories.
 func skippedToResults(ar *gh.ApplyResult) []RepoSettingResult {
 	if ar == nil {
 		return nil
 	}
 	var results []RepoSettingResult
 	for _, sk := range ar.Skipped {
-		cat := classifySkipCategory(sk.Err)
 		results = append(results, RepoSettingResult{
-			Field:      sk.Operation,
-			Category:   cat,
-			Value:      sk.Err.Error(),
-			Annotation: skipAnnotation(sk.Err),
+			Operation:  sk.Operation,
+			Category:   WouldSkipScope,
+			Annotation: skipAnnotation,
 		})
 	}
 	return results
@@ -105,87 +128,75 @@ func skippedToResults(ar *gh.ApplyResult) []RepoSettingResult {
 // compareSettings iterates non-nil pointer fields in declared and compares
 // each against the corresponding field in live. Returns a result per declared field.
 func compareSettings(declared, live *model.RepositorySettings) []RepoSettingResult {
-	dv := reflect.ValueOf(declared).Elem()
-	lv := reflect.ValueOf(live).Elem()
-	dt := dv.Type()
-
 	var results []RepoSettingResult
 
-	for i := range dt.NumField() {
-		field := dt.Field(i)
-		tag := field.Tag.Get("yaml")
-		if tag == "" || tag == ",inline" {
-			continue
-		}
-		key, _, _ := strings.Cut(tag, ",")
-
-		dfv := dv.Field(i)
-		if dfv.Kind() != reflect.Pointer || dfv.IsNil() {
+	liveFields := model.RepositorySettingFields(live)
+	for _, field := range model.RepositorySettingFields(declared) {
+		if !field.Set {
 			continue
 		}
 
+		dfv := field.Value
 		declaredVal := dfv.Elem().Interface()
 
 		var displayVal string
 		var equal bool
 
-		lfv := lv.Field(i)
+		lfv := liveFields[field.Index].Value
 
 		if dfv.Elem().Kind() == reflect.Slice {
 			dSlice := dfv.Elem().Interface().([]string)
 			displayVal = strings.Join(dSlice, ", ")
 			if !lfv.IsNil() {
 				lSlice := lfv.Elem().Interface().([]string)
-				equal = slices.Equal(dSlice, lSlice)
+				equal = equalStringSets(dSlice, lSlice)
 			}
 		} else {
 			displayVal = fmt.Sprintf("%v", declaredVal)
 			equal = !lfv.IsNil() && lfv.Elem().Interface() == declaredVal
 		}
 
+		category := WouldSet
 		if equal {
-			results = append(results, RepoSettingResult{
-				Field:    key,
-				Category: RepoNoChange,
-				Value:    displayVal,
-			})
-		} else {
-			results = append(results, RepoSettingResult{
-				Field:    key,
-				Category: WouldSet,
-				Value:    displayVal,
-			})
+			category = RepoNoChange
 		}
+		results = append(results, RepoSettingResult{
+			Field:    field.YAMLKey,
+			Category: category,
+			Value:    displayVal,
+		})
 	}
 
 	return results
 }
 
-// readWarningOperationFields maps read-path operation names (from
-// ErrInsufficientScope/ErrInsufficientRole) to the config field names
-// (YAML tags) they affect. Workflow permissions covers two fields.
-// The installation token entry covers fields that return zero values
-// in GitHub Actions.
-var readWarningOperationFields = map[string][]string{
-	"fetch workflow permissions": {"default_workflow_permissions", "can_approve_pull_request_reviews"},
-	gh.InstallationTokenReadOp: {
-		"allow_auto_merge",
-		"allow_rebase_merge",
-		"allow_squash_merge",
-		"allow_update_branch",
-		"delete_branch_on_merge",
-		"squash_merge_commit_message",
-		"squash_merge_commit_title",
-	},
+// equalStringSets reports whether a and b contain the same elements regardless
+// of order. GitHub imposes no meaning on list order for topics or
+// patterns_allowed. Sorts copies; neither input is mutated.
+func equalStringSets(a, b []string) bool {
+	as := slices.Clone(a)
+	bs := slices.Clone(b)
+	slices.Sort(as)
+	slices.Sort(bs)
+	return slices.Equal(as, bs)
+}
+
+// readWarningOperationFields maps read-path operation kinds from
+// ErrInsufficientScope to the config field names they affect.
+var readWarningOperationFields = map[gh.OperationKind][]string{
+	gh.OpFetchVulnerabilityAlerts:           {"vulnerability_alerts_enabled"},
+	gh.OpFetchAutomatedSecurityFixes:        {"automated_security_fixes_enabled"},
+	gh.OpFetchPrivateVulnerabilityReporting: {"private_vulnerability_reporting_enabled"},
+	gh.OpFetchWorkflowPermissions:           {"default_workflow_permissions", "can_approve_pull_request_reviews"},
 }
 
 // readWarningsToResults converts read-path access-error warnings into
 // RepoSettingResult entries with the appropriate skip category. Only fields
-// that the user declared in their config produce results - undeclared fields
+// that the user declared in their config produce results. Undeclared fields
 // are silently ignored. It also returns a set of field names that should be
 // suppressed from compareSettings output (because their nil live value is due
 // to a 403, not a real diff).
-func readWarningsToResults(warnings []error, declared *model.RepositorySettings) ([]RepoSettingResult, map[string]bool) {
+func readWarningsToResults(warnings []error, declared, live *model.RepositorySettings) ([]RepoSettingResult, map[string]bool) {
 	if len(warnings) == 0 {
 		return nil, nil
 	}
@@ -202,19 +213,36 @@ func readWarningsToResults(warnings []error, declared *model.RepositorySettings)
 			continue
 		}
 
-		cat := classifySkipCategory(w)
-		ann := skipAnnotation(w)
-
 		for _, f := range fields {
 			if !declaredFields[f] {
+				continue
+			}
+			if skippedFields[f] {
 				continue
 			}
 			skippedFields[f] = true
 			results = append(results, RepoSettingResult{
 				Field:      f,
-				Category:   cat,
-				Value:      w.Error(),
-				Annotation: ann,
+				Category:   WouldSkipScope,
+				Annotation: skipAnnotation,
+			})
+		}
+
+		dependent := ""
+		switch {
+		case op == gh.OpFetchVulnerabilityAlerts && declared.AutomatedSecurityFixesEnabled != nil && *declared.AutomatedSecurityFixesEnabled &&
+			live.AutomatedSecurityFixesEnabled != nil && !*live.AutomatedSecurityFixesEnabled:
+			dependent = "automated_security_fixes_enabled"
+		case op == gh.OpFetchAutomatedSecurityFixes && declared.VulnerabilityAlertsEnabled != nil && !*declared.VulnerabilityAlertsEnabled &&
+			live.VulnerabilityAlertsEnabled != nil && *live.VulnerabilityAlertsEnabled:
+			dependent = "vulnerability_alerts_enabled"
+		}
+		if dependent != "" && !skippedFields[dependent] {
+			skippedFields[dependent] = true
+			results = append(results, RepoSettingResult{
+				Field:      dependent,
+				Category:   WouldSkipScope,
+				Annotation: skipAnnotation,
 			})
 		}
 	}
@@ -228,35 +256,22 @@ func declaredFieldNames(s *model.RepositorySettings) map[string]bool {
 	if s == nil {
 		return nil
 	}
-	rv := reflect.ValueOf(s).Elem()
-	rt := rv.Type()
 	names := make(map[string]bool)
-	for i := range rt.NumField() {
-		f := rt.Field(i)
-		tag := f.Tag.Get("yaml")
-		if tag == "" || tag == ",inline" {
-			continue
-		}
-		key, _, _ := strings.Cut(tag, ",")
-		fv := rv.Field(i)
-		if fv.Kind() == reflect.Pointer && !fv.IsNil() {
-			names[key] = true
+	for _, field := range model.RepositorySettingFields(s) {
+		if field.Set {
+			names[field.YAMLKey] = true
 		}
 	}
 	return names
 }
 
-// warningOperation extracts the Operation field from a read-path warning.
-func warningOperation(err error) string {
+// warningOperation extracts the operation kind from a read-path warning.
+func warningOperation(err error) gh.OperationKind {
 	var scopeErr *gh.ErrInsufficientScope
 	if errors.As(err, &scopeErr) {
-		return scopeErr.Operation
+		return scopeErr.Operation.Kind
 	}
-	var roleErr *gh.ErrInsufficientRole
-	if errors.As(err, &roleErr) {
-		return roleErr.Operation
-	}
-	return ""
+	return gh.OpNone
 }
 
 // hasChanges returns true if any result is WouldSet.

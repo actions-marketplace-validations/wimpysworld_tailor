@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/cli/go-gh/v2/pkg/api"
+	"github.com/wimpysworld/tailor/internal/gh"
 	"github.com/wimpysworld/tailor/internal/ghfake"
 	"github.com/wimpysworld/tailor/internal/testutil"
 )
@@ -25,7 +26,6 @@ type docketTestOpts struct {
 // httptest server, and returns a *api.RESTClient (nil when token is empty).
 func setupDocketTest(t *testing.T, opts docketTestOpts) *api.RESTClient {
 	t.Helper()
-	t.Setenv("GITHUB_ACTIONS", "") // prevent env-var shortcut in FetchUsername
 	ghfake.FakeAuth(t, opts.token)
 	if opts.repoOwner != "" {
 		ghfake.FakeRepo(t, opts.repoOwner, opts.repoName)
@@ -99,11 +99,42 @@ func TestRun(t *testing.T) {
 			wantAuth: "not authenticated",
 		},
 		{
+			name: "token rejected as unauthenticated",
+			opts: docketTestOpts{
+				token:     "gho_expired",
+				repoOwner: "octocat",
+				repoName:  "my-project",
+				apiStatus: http.StatusUnauthorized,
+				apiBody:   `{"message":"Bad credentials"}`,
+			},
+			wantUser: "(none)",
+			wantRepo: "octocat/my-project",
+			wantAuth: "not authenticated",
+		},
+		{
+			name: "forbidden API response",
+			opts: docketTestOpts{
+				token:     "gho_test",
+				apiStatus: http.StatusForbidden,
+				apiBody:   `{"message":"Resource not accessible by integration"}`,
+			},
+			wantErr: true,
+		},
+		{
 			name: "authenticated but API failure",
 			opts: docketTestOpts{
 				token:     "gho_test",
 				apiStatus: http.StatusInternalServerError,
 				apiBody:   `{"message":"Internal Server Error"}`,
+			},
+			wantErr: true,
+		},
+		{
+			name: "malformed API response",
+			opts: docketTestOpts{
+				token:     "gho_test",
+				apiStatus: http.StatusOK,
+				apiBody:   `{"login":`,
 			},
 			wantErr: true,
 		},
@@ -137,6 +168,58 @@ func TestRun(t *testing.T) {
 	}
 }
 
+func TestRunUsesOneHostForAuthAndClient(t *testing.T) {
+	t.Setenv("GH_CONFIG_DIR", t.TempDir())
+	t.Setenv("GH_HOST", "ghe.example.com")
+	ghfake.FakeNoRepo(t)
+
+	var authHost string
+	restoreToken := gh.SetTokenForHostFunc(func(host string) (string, string) {
+		authHost = host
+		return "gho_test", "oauth_token"
+	})
+	t.Cleanup(restoreToken)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"login":"octocat"}`)
+	}))
+	t.Cleanup(server.Close)
+
+	var clientHost string
+	restoreClient := gh.SetNewRESTClientFunc(func(host string) (*api.RESTClient, error) {
+		clientHost = host
+		return testutil.NewTestClient(t, server), nil
+	})
+	t.Cleanup(restoreClient)
+
+	result, err := Run(nil)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if result.Auth != "authenticated" {
+		t.Errorf("Auth = %q, want %q", result.Auth, "authenticated")
+	}
+	if authHost != "ghe.example.com" {
+		t.Errorf("auth check host = %q, want %q", authHost, "ghe.example.com")
+	}
+	if clientHost != authHost {
+		t.Errorf("client host = %q, auth check host = %q, want equal hosts", clientHost, authHost)
+	}
+}
+
+func TestRunTransportFailure(t *testing.T) {
+	ghfake.FakeAuth(t, "gho_test")
+	ghfake.FakeNoRepo(t)
+
+	server := httptest.NewServer(http.NotFoundHandler())
+	client := testutil.NewTestClient(t, server)
+	server.Close()
+
+	if _, err := Run(client); err == nil {
+		t.Fatal("Run() expected transport error, got nil")
+	}
+}
+
 func TestFormatOutput(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -164,6 +247,17 @@ func TestFormatOutput(t *testing.T) {
 			want: "user:           (none)\n" +
 				"repository:     (none)\n" +
 				"auth:           not authenticated\n",
+		},
+		{
+			name: "control characters escaped",
+			result: &Result{
+				User:       "octo\ncat",
+				Repository: "octocat/project\x1b[2J",
+				Auth:       "auth\u202eenticated",
+			},
+			want: "user:           octo\\x0acat\n" +
+				"repository:     octocat/project\\x1b[2J\n" +
+				"auth:           auth\\u202eenticated\n",
 		},
 	}
 

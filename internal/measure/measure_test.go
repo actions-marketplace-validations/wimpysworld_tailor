@@ -290,16 +290,15 @@ func TestIntegrationOutputOrderAndPadding(t *testing.T) {
 		t.Errorf("output order and padding:\ngot:\n%s\nwant:\n%s", got, want)
 	}
 
-	// Verify 16-char label padding explicitly by checking that column 16
-	// (0-indexed) of every non-empty, non-advisory line is the first
-	// character of the destination path.
+	// Column 16 (0-indexed) is the first destination-path character for
+	// every non-empty, non-advisory line.
 	lines := strings.FieldsFunc(got, func(r rune) bool { return r == '\n' })
 	for _, line := range lines {
 		if len(line) < 17 {
 			t.Errorf("line too short for padding check: %q", line)
 			continue
 		}
-		// Characters 0-15 are the padded label; character 16 starts the value.
+		// Characters 0-15 are the padded label. Character 16 starts the value.
 		label := line[:16]
 		lastLabelChar := label[len(label)-1]
 		if lastLabelChar != ' ' && lastLabelChar != ':' {
@@ -327,6 +326,26 @@ func TestIntegrationLicenseWithPlaceholders(t *testing.T) {
 	}
 	if strings.Contains(got, "present:        LICENSE") {
 		t.Errorf("LICENSE with placeholders should not appear as present:\n%s", got)
+	}
+}
+
+func TestIntegrationLicenseWithMarkdownLinkIsPresent(t *testing.T) {
+	dir := t.TempDir()
+
+	content := "Copyright (c) [year](#year) The Authors.\n"
+	if err := os.WriteFile(filepath.Join(dir, "LICENSE"), []byte(content), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	testutil.CreateFile(t, dir, "README.md")
+
+	health := CheckHealth(dir)
+	got := FormatOutput(health, nil, false)
+
+	if strings.Contains(got, "warning:        LICENSE") {
+		t.Errorf("LICENSE with Markdown link should not appear as warning:\n%s", got)
+	}
+	if !strings.Contains(got, "present:        LICENSE") {
+		t.Errorf("LICENSE with Markdown link should appear as present:\n%s", got)
 	}
 }
 

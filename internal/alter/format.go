@@ -5,127 +5,247 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+
+	"github.com/wimpysworld/tailor/internal/gh"
+	"github.com/wimpysworld/tailor/internal/termtext"
 )
 
 // defaultLabelWidth is the minimum column width for status labels in formatted
-// output. Sized to accommodate "would skip (insufficient scope): " (37 characters).
-// Annotations on triggered swatches may widen this dynamically.
+// output. It fits the longest fixed label, "would skip (insufficient scope):",
+// with padding.
 const defaultLabelWidth = 37
+
+// outputLine pairs a status label with the text that follows it.
+type outputLine struct {
+	label string
+	text  string
+}
 
 // FormatOutput produces the alter command output from repo settings results,
 // label results, and swatch results (including licence).
-func FormatOutput(repoResults []RepoSettingResult, labelResults []LabelResult, swatchResults []SwatchResult) string {
+func FormatOutput(repoResults []RepoSettingResult, labelResults []LabelResult, swatchResults []SwatchResult, mode ApplyMode) string {
 	if len(repoResults) == 0 && len(labelResults) == 0 && len(swatchResults) == 0 {
 		return ""
 	}
+	if mode.ShouldWrite() {
+		repoResults = removeSkipped(repoResults, repoSkippedKind, repoActionKind)
+		labelResults = removeSkipped(labelResults, labelSkippedName, labelActionName)
+	}
 
-	sortedSwatches := sortSwatchResults(swatchResults)
-	width := labelWidth(repoResults, labelResults, sortedSwatches)
+	lines := slices.Concat(repoLines(repoResults, mode), labelLines(labelResults, mode), swatchLines(swatchResults, mode))
+
+	for i := range lines {
+		lines[i].label = termtext.EscapeControlText(lines[i].label)
+		lines[i].text = termtext.EscapeControlText(lines[i].text)
+	}
+
+	width := defaultLabelWidth
+	for _, line := range lines {
+		if w := len(line.label) + 1; w > width {
+			width = w
+		}
+	}
 
 	var b strings.Builder
-
-	for _, r := range sortRepoResults(repoResults) {
-		label := repoLabel(r)
-		switch r.Category {
-		case WouldSet:
-			fmt.Fprintf(&b, "%-*srepository.%s = %s\n", width, label, r.Field, r.Value)
-		case RepoNoChange:
-			fmt.Fprintf(&b, "%-*srepository.%s (already %s)\n", width, label, r.Field, r.Value)
-		case WouldSkipScope, WouldSkipRole:
-			fmt.Fprintf(&b, "%-*s%s\n", width, label, r.Field)
-		}
+	for _, line := range lines {
+		fmt.Fprintf(&b, "%-*s%s\n", width, line.label, line.text)
 	}
-
-	for _, r := range sortLabelResults(labelResults) {
-		label := labelResultLabel(r)
-		switch r.Category {
-		case WouldCreate, WouldUpdate:
-			fmt.Fprintf(&b, "%-*slabel.%s = %s\n", width, label, r.Name, r.Value)
-		case LabelNoChange:
-			fmt.Fprintf(&b, "%-*slabel.%s (already %s)\n", width, label, r.Name, r.Value)
-		case LabelSkipScope, LabelSkipRole:
-			fmt.Fprintf(&b, "%-*s%s\n", width, label, r.Name)
-		}
-	}
-
-	for _, r := range sortedSwatches {
-		label := swatchLabel(r)
-		fmt.Fprintf(&b, "%-*s%s\n", width, label, r.Path)
-	}
-
 	return b.String()
 }
 
-// formatAnnotatedLabel embeds an annotation into a skip-category label when
-// isSkip is true and annotation is non-empty. For example:
-// "would skip (insufficient scope: token missing required scope):".
-func formatAnnotatedLabel(category, annotation string, isSkip bool) string {
+// repoLines renders repo setting results as sorted output lines.
+func repoLines(results []RepoSettingResult, mode ApplyMode) []outputLine {
+	order := func(r RepoSettingResult) int { return repoOrder(r.Category) }
+	lines := make([]outputLine, 0, len(results))
+	for _, r := range sortResults(results, order, repoSortKey) {
+		section := cmp.Or(r.Section, "repository")
+		var text string
+		switch r.Category {
+		case WouldSet:
+			text = fmt.Sprintf("%s.%s = %s", section, r.Field, r.Value)
+		case RepoNoChange:
+			text = fmt.Sprintf("%s.%s (already %s)", section, r.Field, r.Value)
+		case WouldSkipScope:
+			switch {
+			case r.Field == "":
+				text = r.Operation.String()
+			case r.Section == "actions" && isActionsPolicyField(r.Field):
+				text = "actions." + r.Field
+			default:
+				text = r.Field
+			}
+		default:
+			continue
+		}
+		label := resultLabel(string(r.Category), r.Annotation, r.Category == WouldSkipScope, mode)
+		lines = append(lines, outputLine{label, text})
+	}
+	return lines
+}
+
+// labelLines renders label results as sorted output lines.
+func labelLines(results []LabelResult, mode ApplyMode) []outputLine {
+	order := func(r LabelResult) int { return labelOrder(r.Category) }
+	lines := make([]outputLine, 0, len(results))
+	for _, r := range sortResults(results, order, labelSortKey) {
+		var text string
+		switch r.Category {
+		case WouldCreate, WouldUpdate:
+			text = fmt.Sprintf("label.%s = %s", r.Name, r.Value)
+		case LabelNoChange:
+			text = fmt.Sprintf("label.%s (already %s)", r.Name, r.Value)
+		case LabelSkipScope:
+			text = r.Operation.String()
+		default:
+			continue
+		}
+		label := resultLabel(string(r.Category), r.Annotation, r.Category == LabelSkipScope, mode)
+		lines = append(lines, outputLine{label, text})
+	}
+	return lines
+}
+
+// swatchLines renders swatch results as sorted output lines.
+func swatchLines(results []SwatchResult, mode ApplyMode) []outputLine {
+	key := func(r SwatchResult) string { return r.Path }
+	lines := make([]outputLine, 0, len(results))
+	for _, r := range sortResults(results, swatchOrder, key) {
+		label := resultLabel(string(r.Category), "", false, mode)
+		lines = append(lines, outputLine{label, r.Path + swatchReason(r)})
+	}
+	return lines
+}
+
+func isActionsPolicyField(field string) bool {
+	_, ok := actionsFieldGroupFor(field)
+	return ok
+}
+
+// removeSkipped drops actionable results whose write operation was reported
+// as skipped. skipKey identifies the skipped operation a scope-skip result
+// records; actionKey identifies the operation an actionable result would
+// perform. Each returns false when the result is not of its kind.
+func removeSkipped[T any, K comparable](results []T, skipKey, actionKey func(T) (K, bool)) []T {
+	skipped := make(map[K]bool)
+	for _, result := range results {
+		if key, ok := skipKey(result); ok {
+			skipped[key] = true
+		}
+	}
+	if len(skipped) == 0 {
+		return results
+	}
+
+	filtered := make([]T, 0, len(results))
+	for _, result := range results {
+		if key, ok := actionKey(result); !ok || !skipped[key] {
+			filtered = append(filtered, result)
+		}
+	}
+	return filtered
+}
+
+// repoSkippedKind returns the operation kind a scope-skip result records.
+func repoSkippedKind(r RepoSettingResult) (gh.OperationKind, bool) {
+	return r.Operation.Kind, r.Category == WouldSkipScope && r.Operation.Kind != gh.OpNone
+}
+
+// repoActionKind returns the kind of the write operation that applies an
+// actionable result's field.
+func repoActionKind(r RepoSettingResult) (gh.OperationKind, bool) {
+	if r.Category != WouldSet {
+		return gh.OpNone, false
+	}
+	if r.Section == "actions" {
+		if group, ok := actionsFieldGroupFor(r.Field); ok {
+			return group.writeOperation(), true
+		}
+	}
+	switch r.Field {
+	case "private_vulnerability_reporting_enabled":
+		return gh.OpSetPrivateVulnerabilityReporting, true
+	case "vulnerability_alerts_enabled":
+		return gh.OpSetVulnerabilityAlerts, true
+	case "automated_security_fixes_enabled":
+		return gh.OpSetAutomatedSecurityFixes, true
+	case "topics":
+		return gh.OpSetTopics, true
+	case "default_workflow_permissions", "can_approve_pull_request_reviews":
+		return gh.OpSetWorkflowPermissions, true
+	default:
+		return gh.OpPatchRepoSettings, true
+	}
+}
+
+// labelSkippedName returns the label name a scope-skip result records.
+func labelSkippedName(r LabelResult) (string, bool) {
+	return r.Operation.Label, r.Category == LabelSkipScope
+}
+
+// labelActionName returns the label name an actionable result would write.
+func labelActionName(r LabelResult) (string, bool) {
+	return r.Name, r.Category == WouldCreate || r.Category == WouldUpdate
+}
+
+// resultLabel formats a status label, translating dry-run categories to
+// write-mode wording and embedding a skip annotation when present. For
+// example: "would skip (insufficient scope: token missing required scope):".
+func resultLabel(category, annotation string, isSkip bool, mode ApplyMode) string {
+	category = outputCategory(category, mode)
 	if annotation != "" && isSkip {
-		base := strings.TrimSuffix(category, ")")
-		return base + ": " + annotation + "):"
+		return "would skip (insufficient scope: " + annotation + "):"
 	}
 	return category + ":"
 }
 
-// repoLabel returns the formatted label for a repo setting result.
-func repoLabel(r RepoSettingResult) string {
-	isSkip := r.Category == WouldSkipScope || r.Category == WouldSkipRole
-	return formatAnnotatedLabel(string(r.Category), r.Annotation, isSkip)
+func outputCategory(category string, mode ApplyMode) string {
+	if !mode.ShouldWrite() {
+		return category
+	}
+
+	switch category {
+	case "would set":
+		return "set"
+	case "would create":
+		return "created"
+	case "would update":
+		return "updated"
+	case "would copy":
+		return "copied"
+	case "would overwrite":
+		return "overwritten"
+	case "would remove":
+		return "removed"
+	default:
+		return category
+	}
 }
 
-// labelResultLabel returns the formatted label for a label result.
-func labelResultLabel(r LabelResult) string {
-	isSkip := r.Category == LabelSkipScope || r.Category == LabelSkipRole
-	return formatAnnotatedLabel(string(r.Category), r.Annotation, isSkip)
+func swatchReason(r SwatchResult) string {
+	if r.Reason == "" {
+		return ""
+	}
+	return " (" + string(r.Reason) + ")"
 }
 
-// swatchLabel returns the formatted label for a swatch result, including any
-// trigger annotation. For example: "would deploy (triggered: allow_auto_merge):".
-func swatchLabel(r SwatchResult) string {
-	if r.Annotation != "" {
-		return string(r.Category) + " (" + r.Annotation + "):"
-	}
-	return string(r.Category) + ":"
-}
-
-// labelWidth computes the column width needed to accommodate all labels. It
-// returns at least defaultLabelWidth, widening if any annotated label exceeds
-// that.
-func labelWidth(repos []RepoSettingResult, labels []LabelResult, swatches []SwatchResult) int {
-	width := defaultLabelWidth
-	for _, r := range repos {
-		if w := len(repoLabel(r)) + 1; w > width {
-			width = w
-		}
-	}
-	for _, r := range labels {
-		if w := len(labelResultLabel(r)) + 1; w > width {
-			width = w
-		}
-	}
-	for _, r := range swatches {
-		if w := len(swatchLabel(r)) + 1; w > width {
-			width = w
-		}
-	}
-	return width
-}
-
-// sortRepoResults returns a sorted copy: actionable (WouldSet) before
-// informational (RepoNoChange), lexicographic by field within each group.
-func sortRepoResults(results []RepoSettingResult) []RepoSettingResult {
-	if len(results) == 0 {
-		return nil
-	}
-	sorted := make([]RepoSettingResult, len(results))
-	copy(sorted, results)
-	slices.SortStableFunc(sorted, func(a, b RepoSettingResult) int {
-		if c := cmp.Compare(repoOrder(a.Category), repoOrder(b.Category)); c != 0 {
+// sortResults returns a sorted copy: actionable categories before
+// informational, lexicographic by sort key within each priority.
+func sortResults[T any](results []T, order func(T) int, key func(T) string) []T {
+	return slices.SortedStableFunc(slices.Values(results), func(a, b T) int {
+		if c := cmp.Compare(order(a), order(b)); c != 0 {
 			return c
 		}
-		return cmp.Compare(a.Field, b.Field)
+		return cmp.Compare(key(a), key(b))
 	})
-	return sorted
+}
+
+// repoSortKey returns the field name, or the skipped operation text for
+// write-skip results, which have no field name.
+func repoSortKey(r RepoSettingResult) string {
+	if r.Field != "" {
+		return r.Field
+	}
+	return r.Operation.String()
 }
 
 // repoOrder returns the sort priority for a RepoSettingCategory.
@@ -135,46 +255,20 @@ func repoOrder(c RepoSettingCategory) int {
 		return 0
 	case RepoNoChange:
 		return 1
-	case WouldSkipScope, WouldSkipRole:
+	case WouldSkipScope:
 		return 2
 	default:
 		return 3
 	}
 }
 
-// sortSwatchResults returns a sorted copy: actionable (WouldCopy, WouldOverwrite)
-// before informational (NoChange, SkippedFirstFit), lexicographic by path within
-// each group.
-func sortSwatchResults(results []SwatchResult) []SwatchResult {
-	if len(results) == 0 {
-		return nil
+// labelSortKey returns the label name, or the skipped operation text for
+// skip results, which have no label name.
+func labelSortKey(r LabelResult) string {
+	if r.Name != "" {
+		return r.Name
 	}
-	sorted := make([]SwatchResult, len(results))
-	copy(sorted, results)
-	slices.SortStableFunc(sorted, func(a, b SwatchResult) int {
-		if c := cmp.Compare(swatchOrder(a.Category), swatchOrder(b.Category)); c != 0 {
-			return c
-		}
-		return cmp.Compare(a.Path, b.Path)
-	})
-	return sorted
-}
-
-// sortLabelResults returns a sorted copy: actionable (WouldCreate, WouldUpdate)
-// before informational (LabelNoChange), lexicographic by name within each group.
-func sortLabelResults(results []LabelResult) []LabelResult {
-	if len(results) == 0 {
-		return nil
-	}
-	sorted := make([]LabelResult, len(results))
-	copy(sorted, results)
-	slices.SortStableFunc(sorted, func(a, b LabelResult) int {
-		if c := cmp.Compare(labelOrder(a.Category), labelOrder(b.Category)); c != 0 {
-			return c
-		}
-		return cmp.Compare(a.Name, b.Name)
-	})
-	return sorted
+	return r.Operation.String()
 }
 
 // labelOrder returns the sort priority for a LabelCategory.
@@ -186,35 +280,33 @@ func labelOrder(c LabelCategory) int {
 		return 1
 	case LabelNoChange:
 		return 2
-	case LabelSkipScope, LabelSkipRole:
+	case LabelSkipScope:
 		return 3
 	default:
 		return 4
 	}
 }
 
-// swatchOrder returns the sort priority for a SwatchCategory.
-// Actionable categories sort before informational: deploy, overwrite, remove,
-// then no-change, skipped, ignored.
-func swatchOrder(c SwatchCategory) int {
-	switch c {
-	case WouldCopy:
+// swatchOrder returns the sort priority for a SwatchResult.
+// Actionable categories sort before informational categories.
+func swatchOrder(result SwatchResult) int {
+	switch result.Category {
+	case WouldUpdateConfig:
 		return 0
-	case WouldOverwrite:
-		return 1
-	case WouldDeploy:
-		return 2
 	case WouldRemove:
+		return 1
+	case WouldCopy:
+		return 2
+	case WouldOverwrite:
 		return 3
-	case Removed:
-		return 4
 	case NoChange:
-		return 5
-	case SkippedFirstFit:
+		return 4
+	case Skipped:
+		if result.Reason == SkipFirstFitExists {
+			return 5
+		}
 		return 6
-	case SkippedNever:
-		return 7
 	default:
-		return 8
+		return 7
 	}
 }

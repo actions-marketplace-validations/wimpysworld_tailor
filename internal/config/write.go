@@ -2,66 +2,94 @@ package config
 
 import (
 	"bytes"
+	"crypto/rand"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
-	"path/filepath"
+	"reflect"
 	"strings"
 	"text/template"
+
+	"github.com/wimpysworld/tailor/internal/model"
+	"gopkg.in/yaml.v3"
 )
 
-// yamlSpecial lists characters that require quoting in YAML values.
-const yamlSpecial = ":{}[]#&*!|>'\"%@`\n"
+// yamlDoubleQuoted preserves the established style. yaml.v3 handles all
+// quoting that YAML syntax requires.
+const yamlDoubleQuoted = "{}[]#&*!|>'\"%@`"
+
+// yamlVal encodes v as one YAML string scalar. Newlines use double quotes so
+// the result stays on one line when the template adds its indentation.
+func yamlVal(v string) (string, error) {
+	var node yaml.Node
+	node.SetString(v)
+	if strings.ContainsAny(v, yamlDoubleQuoted) || strings.Contains(v, "\n") {
+		node.Style = yaml.DoubleQuotedStyle
+	}
+
+	encoded, err := yaml.Marshal(&node)
+	if err != nil {
+		return "", fmt.Errorf("encoding YAML scalar: %w", err)
+	}
+	return strings.TrimSuffix(string(encoded), "\n"), nil
+}
+
+// settingLines renders one "  key: value" line per set field. Scalar fields
+// keep struct order; list fields follow them, preserving the output order
+// that places topics last.
+func settingLines(fields []model.SettingField) ([]string, error) {
+	var lines, lists []string
+	for _, field := range fields {
+		if !field.Set {
+			continue
+		}
+		v := field.Value.Elem()
+		switch v.Kind() {
+		case reflect.String:
+			value, err := yamlVal(v.String())
+			if err != nil {
+				return nil, err
+			}
+			lines = append(lines, fmt.Sprintf("  %s: %s", field.YAMLKey, value))
+		case reflect.Bool:
+			lines = append(lines, fmt.Sprintf("  %s: %t", field.YAMLKey, v.Bool()))
+		case reflect.Slice:
+			list, err := listLines(field.YAMLKey, v)
+			if err != nil {
+				return nil, err
+			}
+			lists = append(lists, list)
+		}
+	}
+	return append(lines, lists...), nil
+}
+
+// listLines renders a string-list field as a block sequence, or [] when empty.
+func listLines(key string, v reflect.Value) (string, error) {
+	if v.Len() == 0 {
+		return fmt.Sprintf("  %s: []", key), nil
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "  %s:", key)
+	for i := range v.Len() {
+		value, err := yamlVal(v.Index(i).String())
+		if err != nil {
+			return "", err
+		}
+		fmt.Fprintf(&b, "\n    - %s", value)
+	}
+	return b.String(), nil
+}
 
 // templateFuncs provides helpers for the config template.
 var templateFuncs = template.FuncMap{
-	"deref": func(p *string) string {
-		if p == nil {
-			return ""
-		}
-		return *p
+	"yamlVal": yamlVal,
+	"repositoryLines": func(r *model.RepositorySettings) ([]string, error) {
+		return settingLines(model.RepositorySettingFields(r))
 	},
-	"yamlString": func(p *string) string {
-		if p == nil {
-			return "\"\""
-		}
-		v := *p
-		if strings.ContainsAny(v, yamlSpecial) || v != strings.TrimSpace(v) || v == "" {
-			return fmt.Sprintf("%q", v)
-		}
-		return v
-	},
-	"yamlVal": func(v string) string {
-		if strings.ContainsAny(v, yamlSpecial) || v != strings.TrimSpace(v) || v == "" {
-			return fmt.Sprintf("%q", v)
-		}
-		return v
-	},
-	"derefSlice": func(p *[]string) []string {
-		if p == nil {
-			return nil
-		}
-		return *p
-	},
-	"derefBool": func(p *bool) string {
-		if p == nil {
-			return ""
-		}
-		if *p {
-			return "true"
-		}
-		return "false"
-	},
-	"set": func(p any) bool {
-		switch v := p.(type) {
-		case *string:
-			return v != nil
-		case *bool:
-			return v != nil
-		case *[]string:
-			return v != nil
-		default:
-			return false
-		}
+	"actionsLines": func(a *model.ActionsSettings) ([]string, error) {
+		return settingLines(model.ActionsSettingFields(a))
 	},
 }
 
@@ -70,73 +98,20 @@ var templateFuncs = template.FuncMap{
 // between swatch entries, and omission of nil pointer fields.
 var configTemplate = template.Must(template.New("config").Funcs(templateFuncs).Parse(
 	`# {{ .Verb }} by tailor on {{ .Date }}
-license: {{ .License }}
+license: {{ yamlVal .License }}
 
 {{- if .Repository }}
 
 repository:
-{{- if set .Repository.Description }}
-  description: {{ yamlString .Repository.Description }}
+{{- range repositoryLines .Repository }}
+{{ . }}
 {{- end }}
-{{- if set .Repository.Homepage }}
-  homepage: {{ deref .Repository.Homepage }}
 {{- end }}
-{{- if set .Repository.HasWiki }}
-  has_wiki: {{ derefBool .Repository.HasWiki }}
-{{- end }}
-{{- if set .Repository.HasDiscussions }}
-  has_discussions: {{ derefBool .Repository.HasDiscussions }}
-{{- end }}
-{{- if set .Repository.HasProjects }}
-  has_projects: {{ derefBool .Repository.HasProjects }}
-{{- end }}
-{{- if set .Repository.HasIssues }}
-  has_issues: {{ derefBool .Repository.HasIssues }}
-{{- end }}
-{{- if set .Repository.AllowMergeCommit }}
-  allow_merge_commit: {{ derefBool .Repository.AllowMergeCommit }}
-{{- end }}
-{{- if set .Repository.AllowSquashMerge }}
-  allow_squash_merge: {{ derefBool .Repository.AllowSquashMerge }}
-{{- end }}
-{{- if set .Repository.AllowRebaseMerge }}
-  allow_rebase_merge: {{ derefBool .Repository.AllowRebaseMerge }}
-{{- end }}
-{{- if set .Repository.SquashMergeCommitTitle }}
-  squash_merge_commit_title: {{ yamlString .Repository.SquashMergeCommitTitle }}
-{{- end }}
-{{- if set .Repository.SquashMergeCommitMessage }}
-  squash_merge_commit_message: {{ yamlString .Repository.SquashMergeCommitMessage }}
-{{- end }}
-{{- if set .Repository.MergeCommitTitle }}
-  merge_commit_title: {{ yamlString .Repository.MergeCommitTitle }}
-{{- end }}
-{{- if set .Repository.MergeCommitMessage }}
-  merge_commit_message: {{ yamlString .Repository.MergeCommitMessage }}
-{{- end }}
-{{- if set .Repository.DeleteBranchOnMerge }}
-  delete_branch_on_merge: {{ derefBool .Repository.DeleteBranchOnMerge }}
-{{- end }}
-{{- if set .Repository.AllowUpdateBranch }}
-  allow_update_branch: {{ derefBool .Repository.AllowUpdateBranch }}
-{{- end }}
-{{- if set .Repository.AllowAutoMerge }}
-  allow_auto_merge: {{ derefBool .Repository.AllowAutoMerge }}
-{{- end }}
-{{- if set .Repository.WebCommitSignoffRequired }}
-  web_commit_signoff_required: {{ derefBool .Repository.WebCommitSignoffRequired }}
-{{- end }}
-{{- if set .Repository.DefaultWorkflowPermissions }}
-  default_workflow_permissions: {{ deref .Repository.DefaultWorkflowPermissions }}
-{{- end }}
-{{- if set .Repository.CanApprovePullRequestReviews }}
-  can_approve_pull_request_reviews: {{ derefBool .Repository.CanApprovePullRequestReviews }}
-{{- end }}
-{{- if set .Repository.Topics }}
-  topics:{{ if eq (len (derefSlice .Repository.Topics)) 0 }} []{{ else }}
-{{- range derefSlice .Repository.Topics }}
-    - {{ yamlVal . }}
-{{- end }}{{ end }}
+{{- if .Actions }}
+
+actions:
+{{- range actionsLines .Actions }}
+{{ . }}
 {{- end }}
 {{- end }}
 {{- if .Labels }}
@@ -159,7 +134,7 @@ swatches:
 `))
 
 // Write renders cfg to <dir>/.tailor.yml with the given header date and verb.
-func Write(dir string, cfg *Config, date string, verb string) error {
+func Write(dir string, cfg *Config, date string, verb string) (retErr error) {
 	var buf bytes.Buffer
 	if err := configTemplate.Execute(&buf, struct {
 		Date string
@@ -173,9 +148,75 @@ func Write(dir string, cfg *Config, date string, verb string) error {
 		return fmt.Errorf("rendering config template: %w", err)
 	}
 
-	path := filepath.Join(dir, ".tailor.yml")
-	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
-		return fmt.Errorf("writing config: %w", err)
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return fmt.Errorf("opening project root %q: %w", dir, err)
+	}
+	defer root.Close()
+
+	mode := os.FileMode(0o644)
+	info, err := root.Lstat(configPath)
+	switch {
+	case err == nil:
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("writing config: %s is a symbolic link", configPath)
+		}
+		if info.Mode().IsRegular() {
+			mode = info.Mode().Perm()
+		}
+	case !errors.Is(err, fs.ErrNotExist):
+		return fmt.Errorf("inspecting config: %w", err)
+	}
+
+	tempPath := configPath + ".tmp-" + rand.Text()
+	temp, err := root.OpenFile(tempPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return fmt.Errorf("creating temporary config: %w", err)
+	}
+	tempOpen := true
+	defer func() {
+		if tempOpen {
+			if err := temp.Close(); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("closing temporary config: %w", err))
+			}
+		}
+		if tempPath != "" {
+			if err := root.Remove(tempPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				retErr = errors.Join(retErr, fmt.Errorf("removing temporary config: %w", err))
+			}
+		}
+	}()
+
+	if _, err := temp.Write(buf.Bytes()); err != nil {
+		return fmt.Errorf("writing temporary config: %w", err)
+	}
+	if err := temp.Chmod(mode); err != nil {
+		return fmt.Errorf("setting temporary config permissions: %w", err)
+	}
+	if err := temp.Sync(); err != nil {
+		return fmt.Errorf("syncing temporary config: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		tempOpen = false
+		return fmt.Errorf("closing temporary config: %w", err)
+	}
+	tempOpen = false
+
+	if err := root.Rename(tempPath, configPath); err != nil {
+		return fmt.Errorf("replacing config: %w", err)
+	}
+	tempPath = ""
+
+	rootDir, err := root.Open(".")
+	if err != nil {
+		return fmt.Errorf("opening config directory: %w", err)
+	}
+	if err := rootDir.Sync(); err != nil {
+		_ = rootDir.Close()
+		return fmt.Errorf("syncing config directory: %w", err)
+	}
+	if err := rootDir.Close(); err != nil {
+		return fmt.Errorf("closing config directory: %w", err)
 	}
 
 	return nil

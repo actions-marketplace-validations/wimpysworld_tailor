@@ -1,14 +1,22 @@
+# Tailor is pure Go and releases build with CGO_ENABLED=0. Pin the same
+# here so lint and test analyse the code the release ships; a broken local
+# C toolchain otherwise degrades staticcheck into false positives.
+export CGO_ENABLED := "0"
+
 # List available recipes
 default:
     @just --list
 
 # Alter tailor swatches
 alter:
-    @tailor alter
+    @go run ./cmd/tailor alter
 
 # Build tailor binary
 build:
     @go build -ldflags "-s -w" -o tailor ./cmd/tailor
+
+# Build snapshot release packages
+snapshot:
     @goreleaser release --snapshot --clean --skip=sign
 
 # Check goreleaser config and nix flake
@@ -18,9 +26,7 @@ check:
 
 # Run linters
 lint:
-    @go vet ./...
-    @gocyclo -top 20 -avg -ignore '_test\.go$' .
-    @ineffassign ./...
+    @gocyclo -over 30 -top 20 -avg -ignore '_test\.go$' .
     @golangci-lint run
     @actionlint
 
@@ -30,8 +36,8 @@ test:
 
 # Check what tailor would change and measure
 measure:
-    @tailor baste
-    @tailor measure
+    @go run ./cmd/tailor baste
+    @go run ./cmd/tailor measure
 
 # Create a new release tag (requires VERSION=x.y.z)
 release VERSION:
@@ -39,7 +45,7 @@ release VERSION:
     set -e
 
     # Validate version format
-    if ! echo "{{VERSION}}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+    if ! [[ "{{VERSION}}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         echo "Error: VERSION must be in format x.y.z (e.g., 0.1.0)"
         exit 1
     fi

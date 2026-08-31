@@ -27,7 +27,22 @@ func TestRunFormatOutputIntegration(t *testing.T) {
 				"auth:",
 				"octocat",
 				"octocat/my-project",
-				"authenticated",
+				"auth:           authenticated",
+			},
+		},
+		{
+			name: "token rejected as unauthenticated",
+			opts: docketTestOpts{
+				token:     "gho_expired",
+				repoOwner: "octocat",
+				repoName:  "my-project",
+				apiStatus: http.StatusUnauthorized,
+				apiBody:   `{"message":"Bad credentials"}`,
+			},
+			wantContains: []string{
+				"user:           (none)",
+				"repository:     octocat/my-project",
+				"auth:           not authenticated",
 			},
 		},
 		{

@@ -3,6 +3,7 @@ package alter_test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,6 +16,8 @@ import (
 	"testing"
 
 	"github.com/cli/go-gh/v2/pkg/api"
+	"gopkg.in/yaml.v3"
+
 	"github.com/wimpysworld/tailor/internal/alter"
 	"github.com/wimpysworld/tailor/internal/config"
 	"github.com/wimpysworld/tailor/internal/ghfake"
@@ -22,6 +25,15 @@ import (
 	"github.com/wimpysworld/tailor/internal/swatch"
 	"github.com/wimpysworld/tailor/internal/testutil"
 )
+
+var approvedDefaultActionPatterns = []string{
+	"freerangebytes/setup-actionlint@*",
+	"golang/govulncheck-action@*",
+	"golangci/golangci-lint-action@*",
+	"nick-fields/retry@*",
+	"robherley/go-test-action@*",
+	"softprops/action-gh-release@*",
+}
 
 // apiCall records a single API request made to the mock server.
 type apiCall struct {
@@ -74,17 +86,19 @@ type testOption func(*alterServerConfig)
 
 // alterServerConfig holds the mock server's response data.
 type alterServerConfig struct {
-	username     string
-	owner        string
-	repo         string
-	repoJSON     repoJSON
-	licenceID    string
-	licenceBody  string
-	labels       []model.LabelEntry // labels returned by GET /repos/{owner}/{repo}/labels
-	noRepo       bool               // stub RepoContext to return false
-	userError    int                // non-zero: return this HTTP status for GET /user
-	licenceError int                // non-zero: return this HTTP status for GET /licenses/*
-	patchError   int                // non-zero: return this HTTP status for PATCH /repos/*
+	username          string
+	owner             string
+	repo              string
+	repoJSON          repoJSON
+	licenceID         string
+	licenceBody       string
+	labels            []model.LabelEntry // labels returned by GET /repos/{owner}/{repo}/labels
+	noRepo            bool               // stub RepoContext to return false
+	userError         int                // non-zero: return this HTTP status for GET /user
+	licenceError      int                // non-zero: return this HTTP status for GET /licenses/*
+	patchError        int                // non-zero: return this HTTP status for PATCH /repos/*
+	securityEndpoints bool
+	alertPutError     int
 }
 
 // WithUsername sets the mock username for GET /user.
@@ -138,12 +152,19 @@ func WithPatchError(statusCode int) testOption {
 	return func(c *alterServerConfig) { c.patchError = statusCode }
 }
 
+func withSecurityEndpoints(alertPutError int) testOption {
+	return func(c *alterServerConfig) {
+		c.securityEndpoints = true
+		c.alertPutError = alertPutError
+		c.repoJSON.Permissions.Admin = true
+	}
+}
+
 // setupAlterTest creates a temp dir, writes .tailor.yml from the provided
 // YAML string, sets up a mock HTTP server, stubs the repo context, and
 // returns an alterTestContext ready for use with alter.Run.
 func setupAlterTest(t *testing.T, configYAML string, opts ...testOption) *alterTestContext {
 	t.Helper()
-	t.Setenv("GITHUB_ACTIONS", "") // prevent env-var shortcut in FetchUsername
 
 	sc := &alterServerConfig{
 		username:    "testuser",
@@ -158,26 +179,23 @@ func setupAlterTest(t *testing.T, configYAML string, opts ...testOption) *alterT
 
 	dir := t.TempDir()
 
-	// Write config file.
 	if err := os.WriteFile(filepath.Join(dir, ".tailor.yml"), []byte(configYAML), 0o644); err != nil {
 		t.Fatalf("writing .tailor.yml: %v", err)
 	}
 
 	ctx := &alterTestContext{Dir: dir}
 
-	// Build mock server.
 	repoPath := fmt.Sprintf("/repos/%s/%s", sc.owner, sc.repo)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 
-		// Read body for mutating requests.
+		// Capture mutating request bodies for later assertions.
 		var body string
 		if r.Body != nil && (r.Method == http.MethodPatch || r.Method == http.MethodPut || r.Method == http.MethodPost) {
 			data, _ := io.ReadAll(r.Body)
 			body = string(data)
 		}
 
-		// Record all calls.
 		ctx.recordCall(r.Method, path, body)
 
 		switch {
@@ -194,9 +212,35 @@ func setupAlterTest(t *testing.T, configYAML string, opts ...testOption) *alterT
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(sc.repoJSON)
 
+		case sc.securityEndpoints && r.Method == http.MethodGet && path == repoPath+"/vulnerability-alerts":
+			w.WriteHeader(http.StatusNotFound)
+
+		case sc.securityEndpoints && r.Method == http.MethodGet && path == repoPath+"/automated-security-fixes":
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"enabled":false,"paused":false}`)
+
+		case sc.securityEndpoints && r.Method == http.MethodPut && path == repoPath+"/vulnerability-alerts":
+			if sc.alertPutError != 0 {
+				w.WriteHeader(sc.alertPutError)
+				fmt.Fprint(w, `{"message":"error"}`)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+
+		case sc.securityEndpoints && r.Method == http.MethodPut && path == repoPath+"/automated-security-fixes":
+			w.WriteHeader(http.StatusNoContent)
+
 		case r.Method == http.MethodGet && path == repoPath+"/actions/permissions/workflow":
 			w.Header().Set("Content-Type", "application/json")
 			fmt.Fprint(w, `{"default_workflow_permissions":"read","can_approve_pull_request_reviews":false}`)
+
+		case r.Method == http.MethodGet && path == repoPath+"/actions/permissions":
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"enabled":true,"allowed_actions":"selected","sha_pinning_required":true}`)
+
+		case r.Method == http.MethodGet && path == repoPath+"/actions/permissions/selected-actions":
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"github_owned_allowed":true,"verified_allowed":false,"patterns_allowed":["z/*","a/*"]}`)
 
 		case r.Method == http.MethodGet && strings.HasPrefix(path, "/licenses/"):
 			if sc.licenceError != 0 {
@@ -218,6 +262,9 @@ func setupAlterTest(t *testing.T, configYAML string, opts ...testOption) *alterT
 			fmt.Fprint(w, `{}`)
 
 		case r.Method == http.MethodPut && path == repoPath+"/actions/permissions/workflow":
+			w.WriteHeader(http.StatusNoContent)
+
+		case r.Method == http.MethodPut && (path == repoPath+"/actions/permissions" || path == repoPath+"/actions/permissions/selected-actions"):
 			w.WriteHeader(http.StatusNoContent)
 
 		case r.Method == http.MethodGet && path == repoPath+"/labels":
@@ -243,7 +290,6 @@ func setupAlterTest(t *testing.T, configYAML string, opts ...testOption) *alterT
 	ctx.Server = server
 	ctx.Client = testutil.NewTestClient(t, server)
 
-	// Stub repo context.
 	if sc.noRepo {
 		ghfake.FakeNoRepo(t)
 	} else {
@@ -269,29 +315,13 @@ func loadTestConfig(t *testing.T, dir string) *config.Config {
 func captureAlterRun(t *testing.T, cfg *config.Config, dir string, mode alter.ApplyMode, client *api.RESTClient) string {
 	t.Helper()
 
-	oldStdout := os.Stdout
-	r, w, _ := os.Pipe()
-	os.Stdout = w
-
-	// Suppress stderr (licence warnings).
-	oldStderr := os.Stderr
-	_, wErr, _ := os.Pipe()
-	os.Stderr = wErr
-
-	err := alter.Run(cfg, dir, mode, client)
-
-	w.Close()
-	wErr.Close()
-	os.Stdout = oldStdout
-	os.Stderr = oldStderr
-
+	var stdout strings.Builder
+	err := alter.Run(cfg, dir, mode, client, &stdout, io.Discard)
 	if err != nil {
 		t.Fatalf("alter.Run() error: %v", err)
 	}
 
-	var buf bytes.Buffer
-	_, _ = buf.ReadFrom(r)
-	return buf.String()
+	return stdout.String()
 }
 
 // runAlterExpectError runs alter.Run in Apply mode and returns the error.
@@ -299,20 +329,7 @@ func captureAlterRun(t *testing.T, cfg *config.Config, dir string, mode alter.Ap
 func runAlterExpectError(t *testing.T, cfg *config.Config, dir string, client *api.RESTClient) error {
 	t.Helper()
 
-	oldStdout := os.Stdout
-	_, wOut, _ := os.Pipe()
-	os.Stdout = wOut
-
-	oldStderr := os.Stderr
-	_, wErr, _ := os.Pipe()
-	os.Stderr = wErr
-
-	err := alter.Run(cfg, dir, alter.Apply, client)
-
-	wOut.Close()
-	wErr.Close()
-	os.Stdout = oldStdout
-	os.Stderr = oldStderr
+	err := alter.Run(cfg, dir, alter.Apply, client, io.Discard, io.Discard)
 
 	if err == nil {
 		t.Fatal("expected alter.Run() to return an error, got nil")
@@ -327,26 +344,10 @@ func runAlterExpectError(t *testing.T, cfg *config.Config, dir string, client *a
 func captureAlterRunWithStderr(t *testing.T, cfg *config.Config, dir string, mode alter.ApplyMode, client *api.RESTClient) (string, string, error) {
 	t.Helper()
 
-	oldStdout := os.Stdout
-	rOut, wOut, _ := os.Pipe()
-	os.Stdout = wOut
+	var stdout, stderr strings.Builder
+	err := alter.Run(cfg, dir, mode, client, &stdout, &stderr)
 
-	oldStderr := os.Stderr
-	rErr, wErr, _ := os.Pipe()
-	os.Stderr = wErr
-
-	err := alter.Run(cfg, dir, mode, client)
-
-	wOut.Close()
-	wErr.Close()
-	os.Stdout = oldStdout
-	os.Stderr = oldStderr
-
-	var bufOut, bufErr bytes.Buffer
-	_, _ = bufOut.ReadFrom(rOut)
-	_, _ = bufErr.ReadFrom(rErr)
-
-	return bufOut.String(), bufErr.String(), err
+	return stdout.String(), stderr.String(), err
 }
 
 // requireContains fails if output does not contain substr.
@@ -354,6 +355,113 @@ func requireContains(t *testing.T, output, substr string) {
 	t.Helper()
 	if !strings.Contains(output, substr) {
 		t.Errorf("expected output to contain %q, got:\n%s", substr, output)
+	}
+}
+
+func TestAlterRunNormalisesSecurityPrerequisite(t *testing.T) {
+	const configYAML = `license: none
+repository:
+  vulnerability_alerts_enabled: false
+  automated_security_fixes_enabled: true
+swatches:
+  - path: .tailor.yml
+    alteration: never
+`
+	const warning = "warning: set vulnerability_alerts_enabled to true because automated_security_fixes_enabled requires vulnerability alerts\n"
+
+	tests := []struct {
+		name      string
+		mode      alter.ApplyMode
+		wantWrite bool
+	}{
+		{name: "alter", mode: alter.Apply, wantWrite: true},
+		{name: "recut", mode: alter.Recut, wantWrite: true},
+		{name: "baste", mode: alter.DryRun},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tc := setupAlterTest(t, configYAML, withSecurityEndpoints(0))
+			writeOnDisk(t, tc.Dir, "LICENSE", []byte("existing"))
+			before, err := os.ReadFile(filepath.Join(tc.Dir, ".tailor.yml"))
+			if err != nil {
+				t.Fatalf("reading initial config: %v", err)
+			}
+
+			cfg := loadTestConfig(t, tc.Dir)
+			stdout, stderr, err := captureAlterRunWithStderr(t, cfg, tc.Dir, tt.mode, tc.Client)
+			if err != nil {
+				t.Fatalf("alter.Run() error: %v", err)
+			}
+			if stderr != warning {
+				t.Errorf("stderr = %q, want %q", stderr, warning)
+			}
+			if tt.wantWrite {
+				requireContains(t, stdout, "updated:")
+			} else {
+				requireContains(t, stdout, "would update:")
+			}
+			requireContains(t, stdout, ".tailor.yml")
+
+			after, err := os.ReadFile(filepath.Join(tc.Dir, ".tailor.yml"))
+			if err != nil {
+				t.Fatalf("reading final config: %v", err)
+			}
+			if tt.wantWrite {
+				persisted := loadTestConfig(t, tc.Dir)
+				testutil.AssertPtr(t, persisted.Repository.VulnerabilityAlertsEnabled, false, true, "vulnerability_alerts_enabled")
+				if bytes.Equal(after, before) {
+					t.Error(".tailor.yml bytes did not change")
+				}
+			} else {
+				if !bytes.Equal(after, before) {
+					t.Error("baste changed .tailor.yml")
+				}
+				if calls := tc.MutatingCalls(); len(calls) != 0 {
+					t.Errorf("baste made mutating API calls: %v", calls)
+				}
+				return
+			}
+
+			var securityWrites []string
+			for _, call := range tc.MutatingCalls() {
+				if strings.Contains(call.Path, "vulnerability-alerts") || strings.Contains(call.Path, "automated-security-fixes") {
+					securityWrites = append(securityWrites, call.Path)
+				}
+			}
+			wantOrder := []string{"/repos/testowner/testrepo/vulnerability-alerts", "/repos/testowner/testrepo/automated-security-fixes"}
+			if !slices.Equal(securityWrites, wantOrder) {
+				t.Errorf("security API order = %v, want %v", securityWrites, wantOrder)
+			}
+		})
+	}
+}
+
+func TestAlterRunAlertFailureBlocksAutomatedSecurityFixes(t *testing.T) {
+	const configYAML = `license: none
+repository:
+  vulnerability_alerts_enabled: false
+  automated_security_fixes_enabled: true
+swatches:
+  - path: .tailor.yml
+    alteration: never
+`
+	tc := setupAlterTest(t, configYAML, withSecurityEndpoints(http.StatusInternalServerError))
+	writeOnDisk(t, tc.Dir, "LICENSE", []byte("existing"))
+
+	cfg := loadTestConfig(t, tc.Dir)
+	_, stderr, err := captureAlterRunWithStderr(t, cfg, tc.Dir, alter.Apply, tc.Client)
+	if err == nil {
+		t.Fatal("alter.Run() returned nil, want alert API error")
+	}
+	requireContains(t, stderr, "warning: set vulnerability_alerts_enabled to true")
+
+	persisted := loadTestConfig(t, tc.Dir)
+	testutil.AssertPtr(t, persisted.Repository.VulnerabilityAlertsEnabled, false, true, "vulnerability_alerts_enabled")
+	for _, call := range tc.MutatingCalls() {
+		if strings.Contains(call.Path, "automated-security-fixes") {
+			t.Fatalf("automated security fixes API called after alert failure: %v", tc.MutatingCalls())
+		}
 	}
 }
 
@@ -365,9 +473,8 @@ func requireNotContains(t *testing.T, output, substr string) {
 	}
 }
 
-// TestAlterRunDryRunSmokeTest verifies the integration test infrastructure works
-// by running alter.Run in DryRun mode with a single swatch entry. It checks that
-// the expected output is produced and no files are written.
+// TestAlterRunDryRunSmokeTest verifies the integration test infrastructure with
+// a single swatch entry. Dry-run reports expected output and writes no files.
 func TestAlterRunDryRunSmokeTest(t *testing.T) {
 	configYAML := `license: mit
 swatches:
@@ -377,25 +484,9 @@ swatches:
 	tc := setupAlterTest(t, configYAML)
 	cfg := loadTestConfig(t, tc.Dir)
 
-	// Capture stdout.
-	oldStdout := os.Stdout
-	r, w, _ := os.Pipe()
-	os.Stdout = w
+	output := captureAlterRun(t, cfg, tc.Dir, alter.DryRun, tc.Client)
 
-	err := alter.Run(cfg, tc.Dir, alter.DryRun, tc.Client)
-
-	w.Close()
-	os.Stdout = oldStdout
-
-	if err != nil {
-		t.Fatalf("alter.Run() error: %v", err)
-	}
-
-	var buf bytes.Buffer
-	_, _ = buf.ReadFrom(r)
-	output := buf.String()
-
-	// Verify output contains expected "would copy" lines.
+	// Dry-run output reports the swatch and licence copies.
 	if !strings.Contains(output, "would copy:") {
 		t.Errorf("expected output to contain 'would copy:', got:\n%s", output)
 	}
@@ -406,7 +497,7 @@ swatches:
 		t.Errorf("expected output to contain 'LICENSE', got:\n%s", output)
 	}
 
-	// Verify no swatch files were written.
+	// Dry-run leaves the filesystem unchanged.
 	if _, err := os.Stat(filepath.Join(tc.Dir, ".gitignore")); err == nil {
 		t.Error("dry run wrote .gitignore to disk")
 	}
@@ -414,9 +505,102 @@ swatches:
 		t.Error("dry run wrote LICENSE to disk")
 	}
 
-	// Verify no mutating API calls were made.
+	// Dry-run must not make mutating API calls.
 	if mc := tc.MutatingCalls(); len(mc) != 0 {
 		t.Errorf("dry run made %d mutating API calls: %v", len(mc), mc)
+	}
+	for _, call := range tc.Calls() {
+		if call.Path == "/repos/testowner/testrepo/actions/permissions" || strings.HasSuffix(call.Path, "/actions/permissions/selected-actions") {
+			t.Errorf("config without actions section made Actions policy call: %v", call)
+		}
+	}
+}
+
+func TestAlterRunActionsPolicy(t *testing.T) {
+	configYAML := `license: none
+actions:
+  enabled: false
+  allowed_actions: selected
+  sha_pinning_required: true
+  github_owned_allowed: true
+  verified_allowed: false
+  patterns_allowed:
+    - a/*
+    - z/*
+swatches: []
+`
+	tc := setupAlterTest(t, configYAML)
+	cfg := loadTestConfig(t, tc.Dir)
+
+	output := captureAlterRun(t, cfg, tc.Dir, alter.DryRun, tc.Client)
+	requireContains(t, output, "actions.enabled = false")
+	requireContains(t, output, "actions.patterns_allowed (already a/*, z/*)")
+	if calls := tc.MutatingCalls(); len(calls) != 0 {
+		t.Fatalf("dry run made mutating calls: %v", calls)
+	}
+
+	output = captureAlterRun(t, cfg, tc.Dir, alter.Apply, tc.Client)
+	requireContains(t, output, "actions.enabled = false")
+	calls := tc.MutatingCalls()
+	if len(calls) != 1 || calls[0].Path != "/repos/testowner/testrepo/actions/permissions" {
+		t.Fatalf("mutating calls = %v, want one Actions permissions PUT", calls)
+	}
+}
+
+func TestAlterRunOutputByMode(t *testing.T) {
+	configYAML := `license: mit
+repository:
+  has_wiki: false
+labels:
+  - name: bug
+    color: d73a4a
+    description: A problem
+swatches:
+  - path: .gitignore
+    alteration: first-fit
+`
+	tests := []struct {
+		name string
+		mode alter.ApplyMode
+		want string
+	}{
+		{
+			name: "dry run",
+			mode: alter.DryRun,
+			want: "would set:                           repository.has_wiki = false\n" +
+				"would create:                        label.bug = #d73a4a \"A problem\"\n" +
+				"would copy:                          .gitignore\n" +
+				"would copy:                          LICENSE\n",
+		},
+		{
+			name: "apply",
+			mode: alter.Apply,
+			want: "set:                                 repository.has_wiki = false\n" +
+				"created:                             label.bug = #d73a4a \"A problem\"\n" +
+				"copied:                              .gitignore\n" +
+				"copied:                              LICENSE\n",
+		},
+		{
+			name: "recut",
+			mode: alter.Recut,
+			want: "set:                                 repository.has_wiki = false\n" +
+				"created:                             label.bug = #d73a4a \"A problem\"\n" +
+				"copied:                              .gitignore\n" +
+				"copied:                              LICENSE\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tc := setupAlterTest(t, configYAML,
+				WithRepoSettings(repoJSON{HasWiki: true}),
+			)
+			cfg := loadTestConfig(t, tc.Dir)
+			got := captureAlterRun(t, cfg, tc.Dir, tt.mode, tc.Client)
+			if got != tt.want {
+				t.Errorf("alter.Run() output =\n%s\nwant:\n%s", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -439,22 +623,7 @@ swatches:
 
 	cfg := loadTestConfig(t, tc.Dir)
 
-	oldStdout := os.Stdout
-	r, w, _ := os.Pipe()
-	os.Stdout = w
-
-	err := alter.Run(cfg, tc.Dir, alter.DryRun, tc.Client)
-
-	w.Close()
-	os.Stdout = oldStdout
-
-	if err != nil {
-		t.Fatalf("alter.Run() error: %v", err)
-	}
-
-	var buf bytes.Buffer
-	_, _ = buf.ReadFrom(r)
-	output := buf.String()
+	output := captureAlterRun(t, cfg, tc.Dir, alter.DryRun, tc.Client)
 
 	if !strings.Contains(output, "would set:") {
 		t.Errorf("expected output to contain 'would set:', got:\n%s", output)
@@ -463,7 +632,7 @@ swatches:
 		t.Errorf("expected output to contain 'repository.has_wiki', got:\n%s", output)
 	}
 
-	// Verify no mutating API calls.
+	// Dry-run must not make mutating API calls.
 	if mc := tc.MutatingCalls(); len(mc) != 0 {
 		t.Errorf("dry run made %d mutating API calls: %v", len(mc), mc)
 	}
@@ -480,21 +649,8 @@ swatches:
 	tc := setupAlterTest(t, configYAML)
 	cfg := loadTestConfig(t, tc.Dir)
 
-	// Suppress stdout.
-	oldStdout := os.Stdout
-	_, w, _ := os.Pipe()
-	os.Stdout = w
+	_ = captureAlterRun(t, cfg, tc.Dir, alter.Apply, tc.Client)
 
-	err := alter.Run(cfg, tc.Dir, alter.Apply, tc.Client)
-
-	w.Close()
-	os.Stdout = oldStdout
-
-	if err != nil {
-		t.Fatalf("alter.Run() error: %v", err)
-	}
-
-	// Verify .gitignore was written.
 	data, err := os.ReadFile(filepath.Join(tc.Dir, ".gitignore"))
 	if err != nil {
 		t.Fatalf(".gitignore not written: %v", err)
@@ -507,7 +663,6 @@ swatches:
 		t.Error(".gitignore content does not match embedded swatch")
 	}
 
-	// Verify LICENSE was written.
 	if _, err := os.Stat(filepath.Join(tc.Dir, "LICENSE")); err != nil {
 		t.Fatalf("LICENSE not written: %v", err)
 	}
@@ -535,19 +690,19 @@ swatches:
 	cfg := loadTestConfig(t, tc.Dir)
 	output := captureAlterRun(t, cfg, tc.Dir, alter.DryRun, tc.Client)
 
-	// All swatches absent: "would copy" for each.
+	// Missing swatches and licence are all reported as copies.
 	requireContains(t, output, "would copy:")
 	requireContains(t, output, ".gitignore")
 	requireContains(t, output, "CODE_OF_CONDUCT.md")
 	requireContains(t, output, "SECURITY.md")
 	requireContains(t, output, "LICENSE")
 
-	// Repo settings that differ: "would set".
+	// Repo settings that differ are reported as settings changes.
 	requireContains(t, output, "would set:")
 	requireContains(t, output, "repository.has_wiki")
 	requireContains(t, output, "repository.delete_branch_on_merge")
 
-	// No mutating API calls.
+	// Dry-run must not make mutating API calls.
 	if mc := tc.MutatingCalls(); len(mc) != 0 {
 		t.Errorf("dry run made %d mutating API calls: %v", len(mc), mc)
 	}
@@ -573,31 +728,31 @@ swatches:
 		WithRepoSettings(repoJSON{HasWiki: false}),
 	)
 
-	// Pre-write all swatch files with matching embedded content.
+	// Existing files use matching embedded content.
 	for _, src := range []string{".gitignore", "CODE_OF_CONDUCT.md", "SECURITY.md"} {
 		content := mustContent(t, src)
 		writeOnDisk(t, tc.Dir, src, content)
 	}
-	// Pre-write licence.
+	// Existing licence exercises first-fit licence behaviour.
 	writeOnDisk(t, tc.Dir, "LICENSE", []byte("existing licence"))
 
 	cfg := loadTestConfig(t, tc.Dir)
 	output := captureAlterRun(t, cfg, tc.Dir, alter.DryRun, tc.Client)
 
-	// first-fit .gitignore exists: "skipped (first-fit, exists)".
-	requireContains(t, output, "skipped (first-fit, exists):")
-	requireContains(t, output, ".gitignore")
+	// Existing first-fit destinations report the path before the reason.
+	requireContains(t, output, "skipped:                             .gitignore (first-fit, exists)")
 
 	// Non-substituted always CODE_OF_CONDUCT.md with matching content: "no change".
 	requireContains(t, output, "no change:")
 	requireContains(t, output, "CODE_OF_CONDUCT.md")
 
-	// Substituted always SECURITY.md: always "would overwrite" regardless of content match.
+	// SECURITY.md contains unresolved template content on disk, so resolved
+	// substituted content reports "would overwrite".
 	requireContains(t, output, "would overwrite:")
 	requireContains(t, output, "SECURITY.md")
 
-	// Licence exists: "skipped (first-fit, exists)".
-	requireContains(t, output, "LICENSE")
+	// The existing licence uses the same first-fit skip format.
+	requireContains(t, output, "skipped:                             LICENSE (first-fit, exists)")
 
 	// Repo setting matches: "no change".
 	requireContains(t, output, "repository.has_wiki")
@@ -605,7 +760,7 @@ swatches:
 	// No "would copy" should appear since all files exist.
 	requireNotContains(t, output, "would copy:")
 
-	// No mutating API calls.
+	// Dry-run must not make mutating API calls.
 	if mc := tc.MutatingCalls(); len(mc) != 0 {
 		t.Errorf("dry run made %d mutating API calls: %v", len(mc), mc)
 	}
@@ -625,8 +780,8 @@ swatches:
 `
 	tc := setupAlterTest(t, configYAML)
 
-	// Pre-write .gitignore (first-fit, will be skipped) and CODE_OF_CONDUCT.md
-	// with matching content (always, will be no change).
+	// Existing .gitignore exercises first-fit skip. Matching
+	// CODE_OF_CONDUCT.md content exercises always/no-change.
 	writeOnDisk(t, tc.Dir, ".gitignore", mustContent(t, ".gitignore"))
 	writeOnDisk(t, tc.Dir, "CODE_OF_CONDUCT.md", mustContent(t, "CODE_OF_CONDUCT.md"))
 	// CONTRIBUTING.md absent: will be "would copy".
@@ -635,18 +790,46 @@ swatches:
 	cfg := loadTestConfig(t, tc.Dir)
 	output := captureAlterRun(t, cfg, tc.Dir, alter.DryRun, tc.Client)
 
-	// .gitignore present + first-fit = skipped.
-	requireContains(t, output, "skipped (first-fit, exists):")
+	// Existing first-fit swatches are skipped.
+	requireContains(t, output, "skipped:                             .gitignore (first-fit, exists)")
 
-	// CODE_OF_CONDUCT.md present + always + content matches = no change.
+	// Existing always swatches with matching content report no change.
 	requireContains(t, output, "no change:")
 
-	// CONTRIBUTING.md absent = would copy.
+	// Missing swatches report copies.
 	requireContains(t, output, "would copy:")
 	requireContains(t, output, "CONTRIBUTING.md")
 
-	// LICENSE absent = would copy.
+	// Missing licences share the same copy status.
 	requireContains(t, output, "LICENSE")
+}
+
+func TestAlterRunSkippedOutputAllModes(t *testing.T) {
+	const configYAML = `license: mit
+swatches:
+  - path: .envrc
+    alteration: first-fit
+  - path: .github/pull_request_template.md
+    alteration: never
+`
+
+	for _, mode := range []alter.ApplyMode{alter.DryRun, alter.Apply, alter.Recut} {
+		t.Run(fmt.Sprint(mode), func(t *testing.T) {
+			tc := setupAlterTest(t, configYAML, WithLicence("mit", "unused"))
+			writeOnDisk(t, tc.Dir, ".envrc", []byte("existing"))
+			writeOnDisk(t, tc.Dir, "LICENSE", []byte("existing"))
+
+			cfg := loadTestConfig(t, tc.Dir)
+			output := captureAlterRun(t, cfg, tc.Dir, mode, tc.Client)
+			if mode == alter.Recut {
+				requireContains(t, output, "skipped:                             LICENSE (first-fit, exists)")
+			} else {
+				requireContains(t, output, "skipped:                             .envrc (first-fit, exists)")
+			}
+			requireContains(t, output, "skipped:                             .github/pull_request_template.md (mode never)")
+			requireNotContains(t, output, "would skip")
+		})
+	}
 }
 
 // TestAlterRunDryRunAlwaysSwatchDiffersContent verifies that a non-substituted
@@ -659,9 +842,9 @@ swatches:
 `
 	tc := setupAlterTest(t, configYAML)
 
-	// Pre-write CODE_OF_CONDUCT.md with different content.
+	// Existing stale content reports an overwrite.
 	writeOnDisk(t, tc.Dir, "CODE_OF_CONDUCT.md", []byte("outdated conduct document"))
-	// Pre-write LICENSE to suppress warning.
+	// Existing licence suppresses the missing-licence warning.
 	writeOnDisk(t, tc.Dir, "LICENSE", []byte("existing"))
 
 	cfg := loadTestConfig(t, tc.Dir)
@@ -670,7 +853,7 @@ swatches:
 	requireContains(t, output, "would overwrite:")
 	requireContains(t, output, "CODE_OF_CONDUCT.md")
 
-	// Verify the file was NOT modified (dry-run).
+	// Dry-run does not change the stale file.
 	data, err := os.ReadFile(filepath.Join(tc.Dir, "CODE_OF_CONDUCT.md"))
 	if err != nil {
 		t.Fatal(err)
@@ -693,7 +876,7 @@ swatches:
 
 	// Write SECURITY.md with the exact embedded content (before substitution).
 	writeOnDisk(t, tc.Dir, "SECURITY.md", mustContent(t, "SECURITY.md"))
-	// Pre-write LICENSE to suppress warning.
+	// Existing licence suppresses the missing-licence warning.
 	writeOnDisk(t, tc.Dir, "LICENSE", []byte("existing"))
 
 	cfg := loadTestConfig(t, tc.Dir)
@@ -710,8 +893,8 @@ swatches:
 	}
 }
 
-// TestAlterRunDryRunNoFilesWritten verifies that after a comprehensive dry-run,
-// no new files are created and no existing files are modified.
+// TestAlterRunDryRunNoFilesWritten verifies that a comprehensive dry-run
+// creates no new files and modifies no existing files.
 func TestAlterRunDryRunNoFilesWritten(t *testing.T) {
 	configYAML := `license: mit
 repository:
@@ -730,11 +913,11 @@ swatches:
 		WithRepoSettings(repoJSON{HasWiki: true}),
 	)
 
-	// Pre-write one file with known content to verify it is not modified.
+	// Existing known content proves dry-run does not modify files.
 	existingContent := []byte("original content")
 	writeOnDisk(t, tc.Dir, "CODE_OF_CONDUCT.md", existingContent)
 
-	// Record filesystem state before dry-run.
+	// Capture filesystem state before dry-run.
 	dirEntries := func() map[string]int64 {
 		entries := make(map[string]int64)
 		_ = filepath.Walk(tc.Dir, func(path string, info os.FileInfo, _ error) error {
@@ -754,14 +937,14 @@ swatches:
 
 	after := dirEntries()
 
-	// Check no new files were created.
+	// Dry-run creates no new files.
 	for path := range after {
 		if _, existed := before[path]; !existed {
 			t.Errorf("dry run created new file: %s", path)
 		}
 	}
 
-	// Verify CODE_OF_CONDUCT.md was not modified.
+	// Dry-run preserves existing file content.
 	data, err := os.ReadFile(filepath.Join(tc.Dir, "CODE_OF_CONDUCT.md"))
 	if err != nil {
 		t.Fatal(err)
@@ -770,14 +953,14 @@ swatches:
 		t.Error("dry run modified CODE_OF_CONDUCT.md")
 	}
 
-	// Verify no swatch files that were absent were written.
+	// Absent swatches remain absent after dry-run.
 	for _, absent := range []string{".gitignore", "SECURITY.md", "CONTRIBUTING.md", "LICENSE"} {
 		if _, err := os.Stat(filepath.Join(tc.Dir, absent)); err == nil {
 			t.Errorf("dry run wrote %s to disk", absent)
 		}
 	}
 
-	// No mutating API calls.
+	// Dry-run must not make mutating API calls.
 	if mc := tc.MutatingCalls(); len(mc) != 0 {
 		t.Errorf("dry run made %d mutating API calls: %v", len(mc), mc)
 	}
@@ -817,8 +1000,8 @@ swatches:
 	}
 
 	// Classify each line as actionable or informational.
-	actionableLabels := []string{"would set:", "would copy:", "would overwrite:", "would deploy:"}
-	informationalLabels := []string{"no change:", "skipped (first-fit, exists):"}
+	actionableLabels := []string{"would set:", "would copy:", "would overwrite:"}
+	informationalLabels := []string{"no change:", "skipped:"}
 
 	isActionable := func(line string) bool {
 		for _, label := range actionableLabels {
@@ -871,7 +1054,7 @@ swatches:
 }
 
 // TestAlterRunDryRunColumnWidth verifies that all category labels in the output
-// are padded to exactly 29 characters (the labelWidth constant from format.go).
+// use the default 37-character column width.
 func TestAlterRunDryRunColumnWidth(t *testing.T) {
 	configYAML := `license: mit
 repository:
@@ -901,18 +1084,16 @@ swatches:
 		t.Fatal("expected non-empty output")
 	}
 
-	// Each line should have the label portion padded to 29 characters,
-	// meaning position 29 starts the content (no leading space at pos 29
-	// unless the label itself is shorter).
+	// Each line has the label portion padded to 37 characters.
 	knownLabels := []string{
 		"would copy:",
 		"would overwrite:",
 		"no change:",
-		"skipped (first-fit, exists):",
+		"skipped:",
 		"would set:",
 	}
 
-	const expectedWidth = 29
+	const expectedWidth = 37
 	for _, line := range lines {
 		if len(line) < expectedWidth {
 			t.Errorf("line too short to contain label + content: %q", line)
@@ -961,7 +1142,7 @@ swatches:
 		t.Errorf("expected LICENSE to exist after apply: %v", err)
 	}
 
-	// Repo settings PATCH must have been called.
+	// Apply sends the repo settings PATCH.
 	found := false
 	for _, call := range tc.MutatingCalls() {
 		if call.Method == http.MethodPatch && strings.Contains(call.Path, "/repos/") {
@@ -974,8 +1155,8 @@ swatches:
 	}
 }
 
-// TestAlterRunApplyFileContentMatchesEmbedded verifies that non-substituted
-// swatch files written during apply match the embedded swatch content exactly.
+// TestAlterRunApplyFileContentMatchesEmbedded verifies that apply writes
+// non-substituted swatches with the exact embedded content.
 func TestAlterRunApplyFileContentMatchesEmbedded(t *testing.T) {
 	configYAML := `license: none
 swatches:
@@ -989,7 +1170,7 @@ swatches:
     alteration: always
 `
 	tc := setupAlterTest(t, configYAML)
-	// Pre-write LICENSE to suppress warning.
+	// Existing licence suppresses the missing-licence warning.
 	writeOnDisk(t, tc.Dir, "LICENSE", []byte("existing"))
 
 	cfg := loadTestConfig(t, tc.Dir)
@@ -1007,8 +1188,8 @@ swatches:
 	}
 }
 
-// TestAlterRunApplyFundingYmlSubstituted verifies that FUNDING.yml written
-// during apply contains the mock username, not the raw {{GITHUB_USERNAME}} token.
+// TestAlterRunApplyFundingYmlSubstituted verifies that apply writes FUNDING.yml
+// with the mock username, not the raw {{GITHUB_USERNAME}} token.
 func TestAlterRunApplyFundingYmlSubstituted(t *testing.T) {
 	configYAML := `license: none
 swatches:
@@ -1035,8 +1216,8 @@ swatches:
 	}
 }
 
-// TestAlterRunApplySecurityMdSubstituted verifies that SECURITY.md written
-// during apply contains the constructed advisory URL, not the raw {{ADVISORY_URL}} token.
+// TestAlterRunApplySecurityMdSubstituted verifies that apply writes SECURITY.md
+// with the constructed advisory URL, not the raw {{ADVISORY_URL}} token.
 func TestAlterRunApplySecurityMdSubstituted(t *testing.T) {
 	configYAML := `license: none
 swatches:
@@ -1087,7 +1268,7 @@ swatches:
 		t.Error("expected file, got directory")
 	}
 
-	// Verify parent directories exist.
+	// Parent directories are created with the nested swatch.
 	dirPath := filepath.Join(tc.Dir, ".github/ISSUE_TEMPLATE")
 	info, err = os.Stat(dirPath)
 	if err != nil {
@@ -1113,14 +1294,14 @@ swatches:
 	tc := setupAlterTest(t, configYAML)
 	writeOnDisk(t, tc.Dir, "LICENSE", []byte("existing"))
 
-	// Pre-write first-fit files with custom content.
+	// Existing first-fit files keep their custom content in apply mode.
 	writeOnDisk(t, tc.Dir, ".gitignore", []byte("my custom gitignore"))
 	writeOnDisk(t, tc.Dir, ".github/FUNDING.yml", []byte("my custom funding"))
 
 	cfg := loadTestConfig(t, tc.Dir)
 	_ = captureAlterRun(t, cfg, tc.Dir, alter.Apply, tc.Client)
 
-	// First-fit files must retain their original content.
+	// First-fit files retain their original content.
 	data, err := os.ReadFile(filepath.Join(tc.Dir, ".gitignore"))
 	if err != nil {
 		t.Fatal(err)
@@ -1137,15 +1318,15 @@ swatches:
 		t.Errorf("FUNDING.yml was overwritten; got %q", string(data))
 	}
 
-	// Always swatch (CODE_OF_CONDUCT.md) should have been written.
+	// Missing always swatches are written in apply mode.
 	if _, err := os.Stat(filepath.Join(tc.Dir, "CODE_OF_CONDUCT.md")); err != nil {
 		t.Errorf("CODE_OF_CONDUCT.md should have been written: %v", err)
 	}
 }
 
-// TestAlterRunApplyAlwaysSwatchNoWriteOnMD5Match verifies that a non-substituted
-// "always" swatch whose content already matches the embedded swatch is left alone.
-func TestAlterRunApplyAlwaysSwatchNoWriteOnMD5Match(t *testing.T) {
+// Non-substituted always swatches use SHA-256 content comparison and are left
+// alone when content matches the embedded swatch.
+func TestAlterRunApplyAlwaysSwatchNoWriteOnSHA256Match(t *testing.T) {
 	configYAML := `license: none
 swatches:
   - path: CODE_OF_CONDUCT.md
@@ -1154,11 +1335,11 @@ swatches:
 	tc := setupAlterTest(t, configYAML)
 	writeOnDisk(t, tc.Dir, "LICENSE", []byte("existing"))
 
-	// Pre-write CODE_OF_CONDUCT.md with exact embedded content.
+	// Existing content matches the embedded swatch exactly.
 	original := mustContent(t, "CODE_OF_CONDUCT.md")
 	writeOnDisk(t, tc.Dir, "CODE_OF_CONDUCT.md", original)
 
-	// Record modification time before apply.
+	// Capture modification time before apply.
 	infoBefore, err := os.Stat(filepath.Join(tc.Dir, "CODE_OF_CONDUCT.md"))
 	if err != nil {
 		t.Fatal(err)
@@ -1168,16 +1349,16 @@ swatches:
 	cfg := loadTestConfig(t, tc.Dir)
 	_ = captureAlterRun(t, cfg, tc.Dir, alter.Apply, tc.Client)
 
-	// Content must remain identical.
+	// Matching content is preserved.
 	data, err := os.ReadFile(filepath.Join(tc.Dir, "CODE_OF_CONDUCT.md"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(data, original) {
-		t.Error("CODE_OF_CONDUCT.md content changed despite MD5 match")
+		t.Error("CODE_OF_CONDUCT.md content changed despite SHA-256 match")
 	}
 
-	// Modification time should not have changed (file was not re-written).
+	// Matching content is not rewritten.
 	infoAfter, err := os.Stat(filepath.Join(tc.Dir, "CODE_OF_CONDUCT.md"))
 	if err != nil {
 		t.Fatal(err)
@@ -1199,7 +1380,7 @@ swatches:
 		WithLicence("mit", "Fresh MIT text"),
 	)
 
-	// Pre-write LICENSE with custom content.
+	// Existing custom licence is exempt from apply.
 	writeOnDisk(t, tc.Dir, "LICENSE", []byte("My Custom Licence"))
 
 	cfg := loadTestConfig(t, tc.Dir)
@@ -1234,7 +1415,7 @@ swatches:
 	cfg := loadTestConfig(t, tc.Dir)
 	_ = captureAlterRun(t, cfg, tc.Dir, alter.Apply, tc.Client)
 
-	// Find the PATCH call.
+	// The PATCH call carries the declared repository settings.
 	var patchCall *apiCall
 	for _, call := range tc.MutatingCalls() {
 		if call.Method == http.MethodPatch && strings.Contains(call.Path, "/repos/testowner/testrepo") {
@@ -1246,7 +1427,6 @@ swatches:
 		t.Fatal("no PATCH call to repos/{owner}/{repo} found")
 	}
 
-	// Verify the body contains expected settings.
 	var body map[string]any
 	if err := json.Unmarshal([]byte(patchCall.Body), &body); err != nil {
 		t.Fatalf("failed to parse PATCH body as JSON: %v", err)
@@ -1263,10 +1443,6 @@ swatches:
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Phase 6.4 - Recut integration tests
-// ---------------------------------------------------------------------------
-
 // TestAlterRunRecutOverwritesFirstFitSwatches verifies that recut
 // overwrites pre-existing first-fit swatch files with embedded content.
 func TestAlterRunRecutOverwritesFirstFitSwatches(t *testing.T) {
@@ -1280,14 +1456,14 @@ swatches:
 	tc := setupAlterTest(t, configYAML)
 	writeOnDisk(t, tc.Dir, "LICENSE", []byte("existing"))
 
-	// Pre-write first-fit files with custom content.
+	// Existing first-fit files are overwritten by recut.
 	writeOnDisk(t, tc.Dir, ".gitignore", []byte("custom gitignore"))
 	writeOnDisk(t, tc.Dir, "CODE_OF_CONDUCT.md", []byte("custom conduct"))
 
 	cfg := loadTestConfig(t, tc.Dir)
 	_ = captureAlterRun(t, cfg, tc.Dir, alter.Recut, tc.Client)
 
-	// Both files must now contain embedded swatch content, not custom content.
+	// Both files contain embedded swatch content, not custom content.
 	for _, src := range []string{".gitignore", "CODE_OF_CONDUCT.md"} {
 		got, err := os.ReadFile(filepath.Join(tc.Dir, src))
 		if err != nil {
@@ -1326,9 +1502,9 @@ swatches:
 	}
 }
 
-// TestAlterRunRecutMergesConfigAndOverwrites verifies that recut with
-// first-fit config.yml triggers merge of missing default swatches, then
-// processes config.yml through normal recut (overwrite) semantics.
+// TestAlterRunRecutMergesConfigAndOverwrites verifies that recut with a
+// first-fit .tailor.yml entry merges missing default swatches, then rewrites
+// .tailor.yml through the config write step.
 func TestAlterRunRecutMergesConfigAndOverwrites(t *testing.T) {
 	configYAML := `license: none
 swatches:
@@ -1345,9 +1521,9 @@ swatches:
 	if err != nil {
 		t.Fatal(err)
 	}
-	// After recut, config.yml is overwritten by swatch processing.
+	// After recut, the merge step rewrites .tailor.yml.
 	if len(data) == 0 {
-		t.Error("config.yml is empty after recut")
+		t.Error(".tailor.yml is empty after recut")
 	}
 }
 
@@ -1365,7 +1541,7 @@ swatches:
 	)
 	writeOnDisk(t, tc.Dir, "LICENSE", []byte("existing"))
 
-	// Pre-write FUNDING.yml with stale content.
+	// Existing stale funding content is replaced with freshly resolved content.
 	writeOnDisk(t, tc.Dir, ".github/FUNDING.yml", []byte("github: staleuser"))
 
 	cfg := loadTestConfig(t, tc.Dir)
@@ -1385,10 +1561,6 @@ swatches:
 		t.Error("FUNDING.yml contains raw {{GITHUB_USERNAME}} token")
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Phase 6.5 - Error path integration tests
-// ---------------------------------------------------------------------------
 
 // TestAlterRunErrorUnrecognisedSwatchSource verifies that a config with an
 // unknown swatch source produces an error mentioning valid sources.
@@ -1490,7 +1662,7 @@ swatches:
 }
 
 // TestAlterRunErrorGetUserFailure verifies that a 401 from GET /user
-// propagates as an error. No files should be written and no PATCH calls made.
+// propagates as an error. No files are written and no PATCH calls are made.
 func TestAlterRunErrorGetUserFailure(t *testing.T) {
 	configYAML := `license: none
 swatches:
@@ -1505,23 +1677,63 @@ swatches:
 	cfg := loadTestConfig(t, tc.Dir)
 	err := runAlterExpectError(t, cfg, tc.Dir, tc.Client)
 
-	if !strings.Contains(err.Error(), "username") && !strings.Contains(err.Error(), "user") {
-		t.Errorf("error = %q, want substring containing 'username' or 'user'", err)
+	if !strings.Contains(err.Error(), "verifying GitHub authentication") {
+		t.Errorf("error = %q, want substring 'verifying GitHub authentication'", err)
 	}
 
-	// No swatch files should have been written.
+	// No swatch files are written.
 	if _, statErr := os.Stat(filepath.Join(tc.Dir, ".gitignore")); statErr == nil {
 		t.Error(".gitignore was written despite GET /user failure")
 	}
 
-	// No mutating API calls.
+	// No mutating API calls are made.
 	if mc := tc.MutatingCalls(); len(mc) != 0 {
 		t.Errorf("expected no mutating calls, got %d: %v", len(mc), mc)
 	}
 }
 
+// TestAlterRunInvalidTokenExitsBeforeLocalChanges verifies that a present but
+// invalid token stops alter before config migration writes and retired
+// workflow cleanup touch any local file.
+func TestAlterRunInvalidTokenExitsBeforeLocalChanges(t *testing.T) {
+	configYAML := `license: none
+swatches:
+  - path: .github/workflows/tailor.yml
+    alteration: never
+  - path: .gitignore
+    alteration: first-fit
+`
+	tc := setupAlterTest(t, configYAML,
+		WithUserError(http.StatusUnauthorized),
+	)
+	retiredPath := filepath.Join(tc.Dir, ".github/workflows/tailor.yml")
+	writeOnDisk(t, tc.Dir, ".github/workflows/tailor.yml", []byte("retired"))
+
+	cfg := loadTestConfig(t, tc.Dir)
+	_ = runAlterExpectError(t, cfg, tc.Dir, tc.Client)
+
+	// The retired entry migration is not written back to .tailor.yml.
+	configData, err := os.ReadFile(filepath.Join(tc.Dir, ".tailor.yml"))
+	if err != nil {
+		t.Fatalf("ReadFile(.tailor.yml): %v", err)
+	}
+	if string(configData) != configYAML {
+		t.Errorf(".tailor.yml was rewritten despite invalid token:\n%s", configData)
+	}
+
+	// The retired workflow file is not removed.
+	if _, statErr := os.Stat(retiredPath); statErr != nil {
+		t.Errorf("retired workflow file was removed despite invalid token: %v", statErr)
+	}
+
+	// No swatch files are written.
+	if _, statErr := os.Stat(filepath.Join(tc.Dir, ".gitignore")); statErr == nil {
+		t.Error(".gitignore was written despite invalid token")
+	}
+}
+
 // TestAlterRunErrorPatchFailure verifies that a 500 from PATCH on repo
-// settings propagates as an error. No swatch files should be written because
+// settings propagates as an error. No swatch files are written because
 // repo settings are processed before swatches.
 func TestAlterRunErrorPatchFailure(t *testing.T) {
 	configYAML := `license: none
@@ -1544,7 +1756,7 @@ swatches:
 		t.Fatal("expected error from PATCH failure")
 	}
 
-	// No swatch files should have been written (repo settings fail first).
+	// No swatch files are written because repo settings fail first.
 	if _, statErr := os.Stat(filepath.Join(tc.Dir, ".gitignore")); statErr == nil {
 		t.Error(".gitignore was written despite PATCH failure")
 	}
@@ -1569,7 +1781,7 @@ swatches:
 	cfg := loadTestConfig(t, tc.Dir)
 	_ = captureAlterRun(t, cfg, tc.Dir, alter.Apply, tc.Client)
 
-	// Swatch files should be written despite the PATCH 403.
+	// Swatch files are written despite the PATCH 403.
 	if _, statErr := os.Stat(filepath.Join(tc.Dir, ".gitignore")); statErr != nil {
 		t.Error(".gitignore was not written despite graceful PATCH degradation")
 	}
@@ -1595,12 +1807,12 @@ swatches:
 		t.Fatalf("alter.Run() returned unexpected error: %v", err)
 	}
 
-	// Stderr should contain the repo context warning.
+	// Stderr contains the repo context warning.
 	if !strings.Contains(stderr, "No GitHub repository context found") {
 		t.Errorf("expected stderr warning about no repo context, got: %q", stderr)
 	}
 
-	// Swatches should still be processed: .gitignore written.
+	// Swatches still run, so .gitignore is written.
 	if _, statErr := os.Stat(filepath.Join(tc.Dir, ".gitignore")); statErr != nil {
 		t.Errorf(".gitignore should have been written despite no repo context: %v", statErr)
 	}
@@ -1642,150 +1854,56 @@ swatches:
 	if !strings.Contains(string(issueData), "{{SUPPORT_URL}}") {
 		t.Error(".github/ISSUE_TEMPLATE/config.yml does not contain raw {{SUPPORT_URL}} token; expected unsubstituted")
 	}
+
+	// Even unsubstituted, the file must parse as YAML with url as a string.
+	if got := issueContactURL(t, issueData); got != "{{SUPPORT_URL}}" {
+		t.Errorf("contact url = %q, want raw {{SUPPORT_URL}} token", got)
+	}
 }
 
-// ---------------------------------------------------------------------------
-// Phase 4.1 - Triggered swatch integration tests
-// ---------------------------------------------------------------------------
+// issueContactURL parses issue template config data as YAML and returns the
+// first contact link URL, failing the test if the data is not valid YAML or
+// the URL is not a plain string.
+func issueContactURL(t *testing.T, data []byte) string {
+	t.Helper()
+	var parsed struct {
+		ContactLinks []struct {
+			URL string `yaml:"url"`
+		} `yaml:"contact_links"`
+	}
+	if err := yaml.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf(".github/ISSUE_TEMPLATE/config.yml is not valid YAML with a string url: %v", err)
+	}
+	if len(parsed.ContactLinks) == 0 {
+		t.Fatal(".github/ISSUE_TEMPLATE/config.yml has no contact_links entries")
+	}
+	return parsed.ContactLinks[0].URL
+}
 
-// TestAlterRunTriggeredAutoMergeTrue verifies that a triggered swatch is
-// deployed when the trigger condition is met (allow_auto_merge: true).
-func TestAlterRunTriggeredAutoMergeTrue(t *testing.T) {
+// TestAlterRunConfigYmlSubstitutedValidYaml verifies that with repo context,
+// the written issue template config is valid YAML whose contact url is the
+// resolved support URL string.
+func TestAlterRunConfigYmlSubstitutedValidYaml(t *testing.T) {
 	configYAML := `license: none
-repository:
-  allow_auto_merge: true
 swatches:
-  - path: .github/workflows/tailor-automerge.yml
-    alteration: triggered
+  - path: .github/ISSUE_TEMPLATE/config.yml
+    alteration: always
 `
-	tc := setupAlterTest(t, configYAML,
-		WithRepoSettings(repoJSON{AllowAutoMerge: true}),
-	)
+	tc := setupAlterTest(t, configYAML)
 	writeOnDisk(t, tc.Dir, "LICENSE", []byte("existing"))
 
 	cfg := loadTestConfig(t, tc.Dir)
-
-	// DryRun: output should indicate the swatch would be deployed.
-	dryOutput := captureAlterRun(t, cfg, tc.Dir, alter.DryRun, tc.Client)
-	requireContains(t, dryOutput, "would deploy")
-	requireContains(t, dryOutput, "tailor-automerge.yml")
-	requireContains(t, dryOutput, "triggered: allow_auto_merge")
-
-	// File must not exist after dry-run.
-	automergeFile := filepath.Join(tc.Dir, ".github/workflows/tailor-automerge.yml")
-	if _, err := os.Stat(automergeFile); err == nil {
-		t.Error("dry run wrote tailor-automerge.yml to disk")
-	}
-
-	// Apply: file should be written.
 	_ = captureAlterRun(t, cfg, tc.Dir, alter.Apply, tc.Client)
 
-	data, err := os.ReadFile(automergeFile)
+	issueData, err := os.ReadFile(filepath.Join(tc.Dir, ".github/ISSUE_TEMPLATE/config.yml"))
 	if err != nil {
-		t.Fatalf("tailor-automerge.yml not written after apply: %v", err)
+		t.Fatalf(".github/ISSUE_TEMPLATE/config.yml not written: %v", err)
 	}
-	raw, err := swatch.Content(".github/workflows/tailor-automerge.yml")
-	if err != nil {
-		t.Fatalf("swatch.Content: %v", err)
-	}
-	// The embedded swatch contains {{MERGE_STRATEGY}} which is substituted
-	// at alter time. With no explicit merge settings, it defaults to --squash.
-	want := bytes.ReplaceAll(raw, []byte("{{MERGE_STRATEGY}}"), []byte("--squash"))
-	if string(data) != string(want) {
-		t.Error("tailor-automerge.yml content does not match substituted swatch")
+	want := "https://github.com/testowner/testrepo/blob/HEAD/SUPPORT.md"
+	if got := issueContactURL(t, issueData); got != want {
+		t.Errorf("contact url = %q, want %q", got, want)
 	}
 }
-
-// TestAlterRunTriggeredAutoMergeFalse verifies that a triggered swatch is not
-// deployed when the trigger condition is not met (allow_auto_merge: false),
-// and that a pre-existing file is removed.
-func TestAlterRunTriggeredAutoMergeFalse(t *testing.T) {
-	configYAML := `license: none
-repository:
-  allow_auto_merge: false
-swatches:
-  - path: .github/workflows/tailor-automerge.yml
-    alteration: triggered
-`
-	tc := setupAlterTest(t, configYAML,
-		WithRepoSettings(repoJSON{AllowAutoMerge: false}),
-	)
-	writeOnDisk(t, tc.Dir, "LICENSE", []byte("existing"))
-
-	cfg := loadTestConfig(t, tc.Dir)
-
-	// Subtest: file absent, trigger not met - should be ignored.
-	t.Run("absent_ignored", func(t *testing.T) {
-		output := captureAlterRun(t, cfg, tc.Dir, alter.DryRun, tc.Client)
-		requireNotContains(t, output, "would copy")
-		requireNotContains(t, output, "would overwrite")
-		requireNotContains(t, output, "would deploy")
-		// The swatch should not appear in actionable output.
-		// It may appear as "skip (never)" or be silently ignored.
-		requireNotContains(t, output, "would remove")
-	})
-
-	// Subtest: file present, trigger not met - should be removed.
-	t.Run("present_removed", func(t *testing.T) {
-		automergeFile := filepath.Join(tc.Dir, ".github/workflows/tailor-automerge.yml")
-		writeOnDisk(t, tc.Dir, ".github/workflows/tailor-automerge.yml", []byte("old automerge content"))
-
-		// DryRun should report "would remove".
-		dryOutput := captureAlterRun(t, cfg, tc.Dir, alter.DryRun, tc.Client)
-		requireContains(t, dryOutput, "would remove")
-		requireContains(t, dryOutput, "tailor-automerge.yml")
-
-		// File must still exist after dry-run.
-		if _, err := os.Stat(automergeFile); err != nil {
-			t.Errorf("dry run removed tailor-automerge.yml from disk: %v", err)
-		}
-
-		// Apply should remove the file.
-		_ = captureAlterRun(t, cfg, tc.Dir, alter.Apply, tc.Client)
-
-		if _, err := os.Stat(automergeFile); err == nil {
-			t.Error("tailor-automerge.yml still exists after apply with trigger not met")
-		}
-	})
-}
-
-// TestAlterRunNeverSuppressesTriggered verifies that setting alteration to
-// "never" suppresses a triggered swatch even when the trigger condition is met.
-func TestAlterRunNeverSuppressesTriggered(t *testing.T) {
-	configYAML := `license: none
-repository:
-  allow_auto_merge: true
-swatches:
-  - path: .github/workflows/tailor-automerge.yml
-    alteration: never
-`
-	tc := setupAlterTest(t, configYAML,
-		WithRepoSettings(repoJSON{AllowAutoMerge: true}),
-	)
-	writeOnDisk(t, tc.Dir, "LICENSE", []byte("existing"))
-
-	cfg := loadTestConfig(t, tc.Dir)
-
-	// DryRun: output should show "skip (never)", not any deploy/copy action.
-	output := captureAlterRun(t, cfg, tc.Dir, alter.DryRun, tc.Client)
-	requireContains(t, output, "skip (never):")
-	requireContains(t, output, "tailor-automerge.yml")
-	requireNotContains(t, output, "would copy")
-	requireNotContains(t, output, "would overwrite")
-	requireNotContains(t, output, "would deploy")
-
-	// Apply: file should not be written.
-	_ = captureAlterRun(t, cfg, tc.Dir, alter.Apply, tc.Client)
-
-	automergeFile := filepath.Join(tc.Dir, ".github/workflows/tailor-automerge.yml")
-	if _, err := os.Stat(automergeFile); err == nil {
-		t.Error("tailor-automerge.yml was deployed despite alteration: never")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Phase 5.2 - Config merge integration tests
-// ---------------------------------------------------------------------------
 
 // allNonConfigSwatchesYAML returns a YAML swatches block containing every
 // registered swatch except .tailor.yml, using each swatch's default
@@ -1858,6 +1976,15 @@ func allDefaultRepoSettingsYAML(t *testing.T) string {
 	if r.WebCommitSignoffRequired != nil {
 		fmt.Fprintf(&sb, "  web_commit_signoff_required: %t\n", *r.WebCommitSignoffRequired)
 	}
+	if r.PrivateVulnerabilityReportEnabled != nil {
+		fmt.Fprintf(&sb, "  private_vulnerability_reporting_enabled: %t\n", *r.PrivateVulnerabilityReportEnabled)
+	}
+	if r.VulnerabilityAlertsEnabled != nil {
+		fmt.Fprintf(&sb, "  vulnerability_alerts_enabled: %t\n", *r.VulnerabilityAlertsEnabled)
+	}
+	if r.AutomatedSecurityFixesEnabled != nil {
+		fmt.Fprintf(&sb, "  automated_security_fixes_enabled: %t\n", *r.AutomatedSecurityFixesEnabled)
+	}
 	if r.DefaultWorkflowPermissions != nil {
 		fmt.Fprintf(&sb, "  default_workflow_permissions: %s\n", *r.DefaultWorkflowPermissions)
 	}
@@ -1865,6 +1992,40 @@ func allDefaultRepoSettingsYAML(t *testing.T) string {
 		fmt.Fprintf(&sb, "  can_approve_pull_request_reviews: %t\n", *r.CanApprovePullRequestReviews)
 	}
 	return sb.String()
+}
+
+func allDefaultActionsYAML(t *testing.T) string {
+	t.Helper()
+	defaults, err := config.DefaultConfig("none")
+	if err != nil {
+		t.Fatalf("loading default config: %v", err)
+	}
+	a := defaults.Actions
+	if a == nil {
+		t.Fatal("default Actions policy is nil")
+	}
+
+	var sb strings.Builder
+	sb.WriteString("actions:\n")
+	fmt.Fprintf(&sb, "  enabled: %t\n", *a.Enabled)
+	fmt.Fprintf(&sb, "  allowed_actions: %s\n", *a.AllowedActions)
+	fmt.Fprintf(&sb, "  sha_pinning_required: %t\n", *a.SHAPinningRequired)
+	fmt.Fprintf(&sb, "  github_owned_allowed: %t\n", *a.GitHubOwnedAllowed)
+	fmt.Fprintf(&sb, "  verified_allowed: %t\n", *a.VerifiedAllowed)
+	writePatternsAllowedYAML(&sb, *a.PatternsAllowed)
+	return sb.String()
+}
+
+func writePatternsAllowedYAML(sb *strings.Builder, patterns []string) {
+	sb.WriteString("  patterns_allowed:")
+	if len(patterns) == 0 {
+		sb.WriteString(" []\n")
+		return
+	}
+	sb.WriteByte('\n')
+	for _, pattern := range patterns {
+		fmt.Fprintf(sb, "    - %q\n", pattern)
+	}
 }
 
 // allDefaultLabelsYAML returns YAML for all default labels.
@@ -1885,12 +2046,11 @@ func allDefaultLabelsYAML(t *testing.T) string {
 
 // TestConfigMergeMissingSwatchesApply verifies that Apply mode with a config
 // missing two swatches merges them into cfg.Swatches so they are processed.
-// The config file on disk is first rewritten with a "Refitted" header by the
-// merge step, then overwritten by swatch processing (which treats config.yml
-// as an always swatch). The net observable effect: the two previously missing
-// swatch files appear on disk.
+// The merge step rewrites the config file on disk with a "Refitted" header
+// (swatch processing skips the .tailor.yml entry). The net observable effect:
+// the two previously missing swatch files appear on disk.
 func TestConfigMergeMissingSwatchesApply(t *testing.T) {
-	// Config includes config.yml swatch (always) but omits SUPPORT.md and justfile.
+	// Config includes the .tailor.yml swatch (always) but omits SUPPORT.md and justfile.
 	configYAML := "license: none\nswatches:\n" +
 		"  - path: .tailor.yml\n    alteration: always\n"
 	for _, s := range swatch.All() {
@@ -1904,33 +2064,34 @@ func TestConfigMergeMissingSwatchesApply(t *testing.T) {
 	writeOnDisk(t, tc.Dir, "LICENSE", []byte("existing"))
 
 	cfg := loadTestConfig(t, tc.Dir)
-	_ = captureAlterRun(t, cfg, tc.Dir, alter.Apply, tc.Client)
+	output := captureAlterRun(t, cfg, tc.Dir, alter.Apply, tc.Client)
+	requireContains(t, output, "updated:                                                       .tailor.yml\n")
 
-	// The two missing swatch files must have been created on disk because
-	// MergeDefaultSwatches appended them to cfg.Swatches before processing.
+	// MergeDefaultSwatches appends the missing entries before swatch processing.
 	for _, dest := range []string{"SUPPORT.md", "justfile"} {
 		if _, err := os.Stat(filepath.Join(tc.Dir, dest)); err != nil {
 			t.Errorf("expected %s to exist after apply (merged swatch): %v", dest, err)
 		}
 	}
 
-	// The config file on disk must exist (swatch processing writes it).
+	// The merge step writes the config file.
 	data, err := os.ReadFile(filepath.Join(tc.Dir, ".tailor.yml"))
 	if err != nil {
-		t.Fatalf("config.yml not found after apply: %v", err)
+		t.Fatalf(".tailor.yml not found after apply: %v", err)
 	}
 	if len(data) == 0 {
-		t.Error("config.yml is empty after apply")
+		t.Error(".tailor.yml is empty after apply")
 	}
 }
 
 // TestConfigMergeAllPresentApply verifies that Apply mode with all swatches,
 // repo settings, and labels already present does not trigger a merge rewrite.
-// The merge step finds no missing entries, so config.Write is not called.
-// Swatch processing then handles config.yml via processAlways (hash comparison).
+// The merge step finds no missing entries, so config.Write is not called and
+// .tailor.yml stays untouched (swatch processing skips the config entry).
 func TestConfigMergeAllPresentApply(t *testing.T) {
 	configYAML := "license: none\n" +
 		allDefaultRepoSettingsYAML(t) +
+		allDefaultActionsYAML(t) +
 		allDefaultLabelsYAML(t) +
 		"swatches:\n" +
 		"  - path: .tailor.yml\n    alteration: always\n" +
@@ -1949,20 +2110,18 @@ func TestConfigMergeAllPresentApply(t *testing.T) {
 		t.Fatalf("reading config after apply: %v", err)
 	}
 
-	// The merge step did not write (no missing entries), so the config.yml
-	// swatch processing determines the file state. If the on-disk content
-	// differs from the embedded template, swatch processing overwrites.
-	// If it matches, no write occurs. Either way, the "Refitted" header
-	// should NOT appear because merge added zero entries.
+	// The merge step added zero entries, so config.Write does not run and
+	// swatch processing skips the .tailor.yml entry. The file keeps its
+	// original content, without a "Refitted" header.
 	if strings.Contains(string(afterData), "Refitted by tailor on") {
-		t.Error("config.yml contains 'Refitted' header despite no entries being merged")
+		t.Error(".tailor.yml contains 'Refitted' header despite no entries being merged")
 	}
 }
 
-// TestConfigMergeFirstFitApplySkips verifies that when the config.yml swatch
+// TestConfigMergeFirstFitApplySkips verifies that when the .tailor.yml swatch
 // entry has alteration: first-fit, Apply mode does not rewrite the config.
 func TestConfigMergeFirstFitApplySkips(t *testing.T) {
-	// Config with first-fit for config.yml, missing SUPPORT.md.
+	// Config with first-fit for .tailor.yml, missing SUPPORT.md.
 	configYAML := "license: none\nswatches:\n" +
 		"  - path: .tailor.yml\n    alteration: first-fit\n" +
 		"  - path: .gitignore\n    alteration: first-fit\n"
@@ -1984,20 +2143,20 @@ func TestConfigMergeFirstFitApplySkips(t *testing.T) {
 	}
 
 	if !bytes.Equal(originalData, afterData) {
-		t.Error("config.yml was rewritten despite first-fit alteration in Apply mode")
+		t.Error(".tailor.yml was rewritten despite first-fit alteration in Apply mode")
 	}
 
-	// SUPPORT.md should NOT appear in the config (merge was skipped).
+	// First-fit config mode skips the merge, so SUPPORT.md remains absent.
 	if strings.Contains(string(afterData), "SUPPORT.md") {
-		t.Error("config.yml contains SUPPORT.md despite first-fit skipping merge")
+		t.Error(".tailor.yml contains SUPPORT.md despite first-fit skipping merge")
 	}
 }
 
 // TestConfigMergeFirstFitRecutAppends verifies that Recut mode with
-// first-fit config.yml overrides to always semantics, appending missing
+// first-fit .tailor.yml overrides to always semantics, appending missing
 // entries. The merged swatch files must appear on disk after processing.
 func TestConfigMergeFirstFitRecutAppends(t *testing.T) {
-	// Config with first-fit for config.yml, missing most swatches.
+	// A first-fit config swatch is promoted to merge behaviour during recut.
 	configYAML := "license: none\nswatches:\n" +
 		"  - path: .tailor.yml\n    alteration: first-fit\n" +
 		"  - path: .gitignore\n    alteration: first-fit\n"
@@ -2006,31 +2165,30 @@ func TestConfigMergeFirstFitRecutAppends(t *testing.T) {
 	writeOnDisk(t, tc.Dir, "LICENSE", []byte("existing"))
 
 	cfg := loadTestConfig(t, tc.Dir)
-	_ = captureAlterRun(t, cfg, tc.Dir, alter.Recut, tc.Client)
+	output := captureAlterRun(t, cfg, tc.Dir, alter.Recut, tc.Client)
+	requireContains(t, output, "updated:                                                       .tailor.yml\n")
 
-	// The missing swatch files must have been created on disk because
-	// recut overrides first-fit to trigger the merge, and ProcessSwatches
-	// then processes all merged entries.
+	// Recut merges defaults, then processes the newly merged swatches.
 	for _, dest := range []string{"SUPPORT.md", "CONTRIBUTING.md", "CODE_OF_CONDUCT.md", "SECURITY.md"} {
 		if _, err := os.Stat(filepath.Join(tc.Dir, dest)); err != nil {
 			t.Errorf("expected %s to exist after recut (merged swatch): %v", dest, err)
 		}
 	}
 
-	// config.yml must exist on disk (recut overwrites it via swatch processing).
+	// Recut rewrites .tailor.yml through the config write step.
 	data, err := os.ReadFile(filepath.Join(tc.Dir, ".tailor.yml"))
 	if err != nil {
-		t.Fatalf("config.yml not found after recut: %v", err)
+		t.Fatalf(".tailor.yml not found after recut: %v", err)
 	}
 	if len(data) == 0 {
-		t.Error("config.yml is empty after recut")
+		t.Error(".tailor.yml is empty after recut")
 	}
 }
 
 // TestConfigMergeDryRunNoRewrite verifies that DryRun mode with missing
 // entries does not rewrite the config file on disk.
 func TestConfigMergeDryRunNoRewrite(t *testing.T) {
-	// Config missing most swatches, config.yml set to always.
+	// Dry-run can detect missing entries without rewriting .tailor.yml.
 	configYAML := "license: none\nswatches:\n" +
 		"  - path: .tailor.yml\n    alteration: always\n" +
 		"  - path: .gitignore\n    alteration: first-fit\n"
@@ -2044,7 +2202,8 @@ func TestConfigMergeDryRunNoRewrite(t *testing.T) {
 	}
 
 	cfg := loadTestConfig(t, tc.Dir)
-	_ = captureAlterRun(t, cfg, tc.Dir, alter.DryRun, tc.Client)
+	output := captureAlterRun(t, cfg, tc.Dir, alter.DryRun, tc.Client)
+	requireContains(t, output, "would update:                                                  .tailor.yml\n")
 
 	afterData, err := os.ReadFile(filepath.Join(tc.Dir, ".tailor.yml"))
 	if err != nil {
@@ -2052,19 +2211,17 @@ func TestConfigMergeDryRunNoRewrite(t *testing.T) {
 	}
 
 	if !bytes.Equal(originalData, afterData) {
-		t.Error("config.yml was rewritten during dry-run despite ShouldWrite() being false")
+		t.Error(".tailor.yml was rewritten during dry-run despite ShouldWrite() being false")
+	}
+	if calls := tc.MutatingCalls(); len(calls) != 0 {
+		t.Fatalf("dry run made mutating calls: %v", calls)
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Phase 2 - Merge integration tests (repo settings + labels)
-// ---------------------------------------------------------------------------
-
-// TestAlterRunMergeRepoSettingsAndLabels verifies that a config missing repo
-// settings fields and the labels section receives defaults during the merge
-// step, and the config file is rewritten with the merged content.
-func TestAlterRunMergeRepoSettingsAndLabels(t *testing.T) {
-	// Config has config.yml swatch set to always (triggers shouldMerge),
+// TestAlterRunMergeDefaults verifies that missing settings and sections receive
+// defaults, the rewritten config validates, and Actions defaults apply at once.
+func TestAlterRunMergeDefaults(t *testing.T) {
+	// Config has the .tailor.yml swatch set to always (triggers shouldMerge),
 	// a partial repository section (only has_wiki), and no labels.
 	configYAML := `license: none
 repository:
@@ -2088,12 +2245,15 @@ swatches:
 	}
 	content := string(data)
 
-	// Verify repo settings fields were merged from defaults.
+	// Repo settings fields are merged from defaults.
 	for _, field := range []string{
 		"has_issues:",
 		"allow_squash_merge:",
 		"delete_branch_on_merge:",
 		"allow_auto_merge:",
+		"private_vulnerability_reporting_enabled: true",
+		"vulnerability_alerts_enabled: true",
+		"automated_security_fixes_enabled: true",
 		"default_workflow_permissions:",
 	} {
 		if !strings.Contains(content, field) {
@@ -2101,12 +2261,12 @@ swatches:
 		}
 	}
 
-	// Verify has_wiki was preserved (not overwritten by default).
+	// Existing has_wiki value is preserved instead of replaced by defaults.
 	if !strings.Contains(content, "has_wiki: false") {
 		t.Errorf("has_wiki was overwritten; expected 'has_wiki: false' to be preserved")
 	}
 
-	// Verify labels were merged from defaults.
+	// Missing labels are merged from defaults.
 	if !strings.Contains(content, "labels:") {
 		t.Error("merged config missing labels section")
 	}
@@ -2115,24 +2275,242 @@ swatches:
 			t.Errorf("merged config missing default label %q", label)
 		}
 	}
+
+	for _, field := range []string{
+		"actions:\n",
+		"  enabled: true\n",
+		"  allowed_actions: selected\n",
+		"  sha_pinning_required: false\n",
+		"  github_owned_allowed: true\n",
+		"  verified_allowed: true\n",
+		"  patterns_allowed:\n",
+		"    - \"freerangebytes/setup-actionlint@*\"\n",
+		"    - \"golang/govulncheck-action@*\"\n",
+		"    - \"golangci/golangci-lint-action@*\"\n",
+		"    - \"nick-fields/retry@*\"\n",
+		"    - \"robherley/go-test-action@*\"\n",
+		"    - \"softprops/action-gh-release@*\"\n",
+	} {
+		if !strings.Contains(content, field) {
+			t.Errorf("merged config missing Actions default %q", field)
+		}
+	}
+	if _, err := config.Load(tc.Dir); err != nil {
+		t.Fatalf("loading merged config: %v", err)
+	}
+
+	writes := map[string]bool{}
+	for _, call := range tc.MutatingCalls() {
+		if strings.Contains(call.Path, "/actions/permissions") {
+			writes[call.Path] = true
+		}
+	}
+	for _, path := range []string{
+		"/repos/testowner/testrepo/actions/permissions",
+		"/repos/testowner/testrepo/actions/permissions/selected-actions",
+	} {
+		if !writes[path] {
+			t.Errorf("missing same-run Actions write to %s", path)
+		}
+	}
+}
+
+func TestAlterRunCompletesPartialSelectedActionsBeforeProcessing(t *testing.T) {
+	configYAML := `license: none
+actions:
+  allowed_actions: selected
+swatches:
+  - path: .tailor.yml
+    alteration: always
+`
+	tc := setupAlterTest(t, configYAML)
+	cfg := loadTestConfig(t, tc.Dir)
+	_ = captureAlterRun(t, cfg, tc.Dir, alter.Apply, tc.Client)
+	if cfg.Actions.GitHubOwnedAllowed == nil || !*cfg.Actions.GitHubOwnedAllowed {
+		t.Fatalf("merged github_owned_allowed = %v, want true", cfg.Actions.GitHubOwnedAllowed)
+	}
+
+	written, err := os.ReadFile(filepath.Join(tc.Dir, ".tailor.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(written)
+	for _, field := range []string{
+		"  enabled: true\n",
+		"  allowed_actions: selected\n",
+		"  sha_pinning_required: false\n",
+		"  github_owned_allowed: true\n",
+		"  verified_allowed: true\n",
+		"  patterns_allowed:\n",
+		"    - \"freerangebytes/setup-actionlint@*\"\n",
+		"    - \"golang/govulncheck-action@*\"\n",
+		"    - \"golangci/golangci-lint-action@*\"\n",
+		"    - \"nick-fields/retry@*\"\n",
+		"    - \"robherley/go-test-action@*\"\n",
+		"    - \"softprops/action-gh-release@*\"\n",
+	} {
+		if !strings.Contains(content, field) {
+			t.Errorf("completed config missing %q", field)
+		}
+	}
+	merged, err := config.Load(tc.Dir)
+	if err != nil {
+		t.Fatalf("loading completed config: %v", err)
+	}
+	if err := config.ValidateCompleteActions(merged); err != nil {
+		t.Fatalf("completed config validation: %v", err)
+	}
+
+	var actionsWrites []apiCall
+	for _, call := range tc.MutatingCalls() {
+		if call.Path == "/repos/testowner/testrepo/actions/permissions" ||
+			call.Path == "/repos/testowner/testrepo/actions/permissions/selected-actions" {
+			actionsWrites = append(actionsWrites, call)
+		}
+	}
+	if len(actionsWrites) != 3 {
+		t.Fatalf("Actions writes = %v, want disable, selected, and final core writes", actionsWrites)
+	}
+	if actionsWrites[0].Path != "/repos/testowner/testrepo/actions/permissions" ||
+		actionsWrites[1].Path != "/repos/testowner/testrepo/actions/permissions/selected-actions" ||
+		actionsWrites[2].Path != "/repos/testowner/testrepo/actions/permissions" {
+		t.Fatalf("Actions write order = %v, want disable, selected, then final core", actionsWrites)
+	}
+	var disableBody map[string]any
+	if err := json.Unmarshal([]byte(actionsWrites[0].Body), &disableBody); err != nil {
+		t.Fatal(err)
+	}
+	if len(disableBody) != 1 || disableBody["enabled"] != false {
+		t.Fatalf("disable body = %v, want enabled false", disableBody)
+	}
+
+	var selectedBody map[string]any
+	if err := json.Unmarshal([]byte(actionsWrites[1].Body), &selectedBody); err != nil {
+		t.Fatal(err)
+	}
+	if len(selectedBody) != 3 || selectedBody["github_owned_allowed"] != true ||
+		selectedBody["verified_allowed"] != true {
+		t.Fatalf("selected body = %v, want complete merged policy", selectedBody)
+	}
+	patterns, ok := selectedBody["patterns_allowed"].([]any)
+	if !ok || len(patterns) != len(approvedDefaultActionPatterns) {
+		t.Fatalf("patterns_allowed = %v, want %v", selectedBody["patterns_allowed"], approvedDefaultActionPatterns)
+	}
+	for i, want := range approvedDefaultActionPatterns {
+		if patterns[i] != want {
+			t.Fatalf("patterns_allowed = %v, want %v", selectedBody["patterns_allowed"], approvedDefaultActionPatterns)
+		}
+	}
+
+	var coreBody map[string]any
+	if err := json.Unmarshal([]byte(actionsWrites[2].Body), &coreBody); err != nil {
+		t.Fatal(err)
+	}
+	if coreBody["enabled"] != true || coreBody["allowed_actions"] != "selected" ||
+		coreBody["sha_pinning_required"] != false {
+		t.Fatalf("core body = %v, want merged policy in the same run", coreBody)
+	}
+}
+
+func TestAlterRunBasteMergedActionsDefaultsIsReadOnly(t *testing.T) {
+	configYAML := `license: none
+swatches:
+  - path: .tailor.yml
+    alteration: always
+`
+	tc := setupAlterTest(t, configYAML)
+	writeOnDisk(t, tc.Dir, "LICENSE", []byte("existing"))
+	before, err := os.ReadFile(filepath.Join(tc.Dir, ".tailor.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := loadTestConfig(t, tc.Dir)
+	output := captureAlterRun(t, cfg, tc.Dir, alter.DryRun, tc.Client)
+	after, err := os.ReadFile(filepath.Join(tc.Dir, ".tailor.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatalf("baste changed .tailor.yml:\n%s", after)
+	}
+	if calls := tc.MutatingCalls(); len(calls) != 0 {
+		t.Fatalf("baste made mutating calls: %v", calls)
+	}
+
+	getCounts := map[string]int{}
+	for _, call := range tc.Calls() {
+		if call.Method == http.MethodGet {
+			getCounts[call.Path]++
+		}
+	}
+	for _, path := range []string{
+		"/repos/testowner/testrepo/actions/permissions",
+		"/repos/testowner/testrepo/actions/permissions/selected-actions",
+	} {
+		if getCounts[path] != 1 {
+			t.Errorf("GET %s count = %d, want 1", path, getCounts[path])
+		}
+	}
+	wantPatterns := "actions.patterns_allowed = " + strings.Join(approvedDefaultActionPatterns, ", ")
+	if !strings.Contains(output, wantPatterns) {
+		t.Fatalf("output does not show the approved default patterns:\n%s", output)
+	}
+}
+
+func TestAlterRunMergeNonSelectedActionsPolicy(t *testing.T) {
+	configYAML := `license: none
+actions:
+  enabled: false
+  allowed_actions: all
+swatches:
+  - path: .tailor.yml
+    alteration: always
+`
+	tc := setupAlterTest(t, configYAML)
+	writeOnDisk(t, tc.Dir, "LICENSE", []byte("existing"))
+
+	cfg := loadTestConfig(t, tc.Dir)
+	_ = captureAlterRun(t, cfg, tc.Dir, alter.Apply, tc.Client)
+
+	written, err := os.ReadFile(filepath.Join(tc.Dir, ".tailor.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(written)
+	if !strings.Contains(content, "  enabled: false\n") || !strings.Contains(content, "  allowed_actions: all\n") || !strings.Contains(content, "  sha_pinning_required: false\n") {
+		t.Fatalf("merged core Actions policy is incomplete:\n%s", content)
+	}
+	for _, field := range []string{"github_owned_allowed:", "verified_allowed:", "patterns_allowed:"} {
+		if strings.Contains(content, field) {
+			t.Errorf("merged non-selected policy contains %s", field)
+		}
+	}
+	if _, err := config.Load(tc.Dir); err != nil {
+		t.Fatalf("loading merged non-selected config: %v", err)
+	}
+	for _, call := range tc.Calls() {
+		if strings.HasSuffix(call.Path, "/actions/permissions/selected-actions") {
+			t.Errorf("non-selected policy called selected-actions endpoint: %v", call)
+		}
+	}
 }
 
 // TestAlterRunMergeCompleteConfigNotRewritten verifies that a config already
 // containing all default repo settings and labels is not rewritten.
 func TestAlterRunMergeCompleteConfigNotRewritten(t *testing.T) {
-	// Build a complete config by loading the embedded default.
+	// Embedded defaults provide the complete config fixture.
 	defaults, err := config.DefaultConfig("none")
 	if err != nil {
 		t.Fatalf("loading default config: %v", err)
 	}
 
-	// Generate YAML for a complete config that includes all repo settings
-	// and labels. Use the embedded defaults as the source of truth.
+	// The generated YAML includes all repo settings and labels from the
+	// embedded defaults.
 	var sb strings.Builder
 	sb.WriteString("license: none\n\nrepository:\n")
 
-	// Write all default repo settings (except description, homepage, topics
-	// which are nil/skipped).
+	// Description, homepage, and topics are nil in the embedded defaults.
 	if defaults.Repository != nil {
 		if defaults.Repository.HasWiki != nil {
 			fmt.Fprintf(&sb, "  has_wiki: %t\n", *defaults.Repository.HasWiki)
@@ -2173,11 +2551,41 @@ func TestAlterRunMergeCompleteConfigNotRewritten(t *testing.T) {
 		if defaults.Repository.WebCommitSignoffRequired != nil {
 			fmt.Fprintf(&sb, "  web_commit_signoff_required: %t\n", *defaults.Repository.WebCommitSignoffRequired)
 		}
+		if defaults.Repository.PrivateVulnerabilityReportEnabled != nil {
+			fmt.Fprintf(&sb, "  private_vulnerability_reporting_enabled: %t\n", *defaults.Repository.PrivateVulnerabilityReportEnabled)
+		}
+		if defaults.Repository.VulnerabilityAlertsEnabled != nil {
+			fmt.Fprintf(&sb, "  vulnerability_alerts_enabled: %t\n", *defaults.Repository.VulnerabilityAlertsEnabled)
+		}
+		if defaults.Repository.AutomatedSecurityFixesEnabled != nil {
+			fmt.Fprintf(&sb, "  automated_security_fixes_enabled: %t\n", *defaults.Repository.AutomatedSecurityFixesEnabled)
+		}
 		if defaults.Repository.DefaultWorkflowPermissions != nil {
 			fmt.Fprintf(&sb, "  default_workflow_permissions: %s\n", *defaults.Repository.DefaultWorkflowPermissions)
 		}
 		if defaults.Repository.CanApprovePullRequestReviews != nil {
 			fmt.Fprintf(&sb, "  can_approve_pull_request_reviews: %t\n", *defaults.Repository.CanApprovePullRequestReviews)
+		}
+	}
+	if defaults.Actions != nil {
+		sb.WriteString("\nactions:\n")
+		if defaults.Actions.Enabled != nil {
+			fmt.Fprintf(&sb, "  enabled: %t\n", *defaults.Actions.Enabled)
+		}
+		if defaults.Actions.AllowedActions != nil {
+			fmt.Fprintf(&sb, "  allowed_actions: %s\n", *defaults.Actions.AllowedActions)
+		}
+		if defaults.Actions.SHAPinningRequired != nil {
+			fmt.Fprintf(&sb, "  sha_pinning_required: %t\n", *defaults.Actions.SHAPinningRequired)
+		}
+		if defaults.Actions.GitHubOwnedAllowed != nil {
+			fmt.Fprintf(&sb, "  github_owned_allowed: %t\n", *defaults.Actions.GitHubOwnedAllowed)
+		}
+		if defaults.Actions.VerifiedAllowed != nil {
+			fmt.Fprintf(&sb, "  verified_allowed: %t\n", *defaults.Actions.VerifiedAllowed)
+		}
+		if defaults.Actions.PatternsAllowed != nil {
+			writePatternsAllowedYAML(&sb, *defaults.Actions.PatternsAllowed)
 		}
 	}
 
@@ -2200,7 +2608,7 @@ func TestAlterRunMergeCompleteConfigNotRewritten(t *testing.T) {
 	tc := setupAlterTest(t, configYAML)
 	writeOnDisk(t, tc.Dir, "LICENSE", []byte("existing"))
 
-	// Record original config content.
+	// Capture original config content.
 	originalData, err := os.ReadFile(filepath.Join(tc.Dir, ".tailor.yml"))
 	if err != nil {
 		t.Fatalf("reading original config: %v", err)
@@ -2249,20 +2657,228 @@ swatches:
 		t.Fatalf("reading config after merge: %v", err)
 	}
 
-	// Config should be rewritten because repo settings were merged.
+	// Merging repo settings rewrites the config.
 	if bytes.Equal(originalData, afterData) {
 		t.Error("config was not rewritten despite missing repo settings fields")
 	}
 
 	content := string(afterData)
 
-	// Verify merged repo settings are present.
+	// Merged repo settings are present.
 	if !strings.Contains(content, "has_issues:") {
 		t.Error("merged config missing default repo setting has_issues")
 	}
 
-	// Verify labels were NOT replaced (already had entries).
+	// Existing labels are preserved.
 	if !strings.Contains(content, "custom-label") {
 		t.Error("existing custom label was lost during merge")
+	}
+}
+
+func TestAlterRunRetiredWorkflowMigrationByMode(t *testing.T) {
+	configYAML := `license: none
+swatches:
+  - path: .github/workflows/tailor.yml
+    alteration: triggered
+  - path: .github/workflows/tailor-automerge.yml
+    alteration: triggered
+`
+	tests := []struct {
+		name       string
+		mode       alter.ApplyMode
+		wantOutput string
+		wantWrite  bool
+	}{
+		{
+			name: "dry run",
+			mode: alter.DryRun,
+			wantOutput: "would update:                        .tailor.yml\n" +
+				"would remove:                        .github/workflows/tailor-automerge.yml\n" +
+				"would remove:                        .github/workflows/tailor.yml\n",
+		},
+		{
+			name:      "apply",
+			mode:      alter.Apply,
+			wantWrite: true,
+			wantOutput: "updated:                             .tailor.yml\n" +
+				"removed:                             .github/workflows/tailor-automerge.yml\n" +
+				"removed:                             .github/workflows/tailor.yml\n",
+		},
+		{
+			name:      "recut",
+			mode:      alter.Recut,
+			wantWrite: true,
+			wantOutput: "updated:                             .tailor.yml\n" +
+				"removed:                             .github/workflows/tailor-automerge.yml\n" +
+				"removed:                             .github/workflows/tailor.yml\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tc := setupAlterTest(t, configYAML)
+			writeOnDisk(t, tc.Dir, "LICENSE", []byte("existing"))
+			for _, path := range config.RetiredWorkflowPaths() {
+				writeOnDisk(t, tc.Dir, path, []byte("retired workflow"))
+			}
+			beforeConfig, err := os.ReadFile(filepath.Join(tc.Dir, ".tailor.yml"))
+			if err != nil {
+				t.Fatalf("reading original config: %v", err)
+			}
+
+			cfg := loadTestConfig(t, tc.Dir)
+			got := captureAlterRun(t, cfg, tc.Dir, tt.mode, tc.Client)
+			if got != tt.wantOutput {
+				t.Errorf("alter.Run() output =\n%s\nwant:\n%s", got, tt.wantOutput)
+			}
+
+			afterConfig, err := os.ReadFile(filepath.Join(tc.Dir, ".tailor.yml"))
+			if err != nil {
+				t.Fatalf("reading config after alter: %v", err)
+			}
+			if !tt.wantWrite {
+				if !bytes.Equal(afterConfig, beforeConfig) {
+					t.Error("dry run changed .tailor.yml on disk")
+				}
+			} else {
+				if bytes.Equal(afterConfig, beforeConfig) {
+					t.Error("write mode did not update .tailor.yml")
+				}
+				afterCfg := loadTestConfig(t, tc.Dir)
+				if len(afterCfg.Swatches) != 0 {
+					t.Errorf("written swatches = %v, want no retired entries", afterCfg.Swatches)
+				}
+			}
+
+			for _, path := range config.RetiredWorkflowPaths() {
+				_, err := os.Lstat(filepath.Join(tc.Dir, path))
+				if !tt.wantWrite && err != nil {
+					t.Errorf("dry run removed %s: %v", path, err)
+				}
+				if tt.wantWrite && !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("write mode left %s on disk: %v", path, err)
+				}
+			}
+		})
+	}
+}
+
+func TestAlterRunCoalescesRetiredCleanupWithDefaultMerge(t *testing.T) {
+	configYAML := `license: none
+swatches:
+  - path: justfile
+    alteration: never
+  - path: .github/workflows/tailor.yml
+    alteration: triggered
+  - path: .tailor.yml
+    alteration: always
+  - path: .github/workflows/tailor-automerge.yml
+    alteration: triggered
+  - path: .github/workflows/tailor.yml
+    alteration: always
+`
+	tc := setupAlterTest(t, configYAML)
+	writeOnDisk(t, tc.Dir, "LICENSE", []byte("existing"))
+	for _, path := range config.RetiredWorkflowPaths() {
+		writeOnDisk(t, tc.Dir, path, []byte("retired workflow"))
+	}
+
+	cfg := loadTestConfig(t, tc.Dir)
+	output := captureAlterRun(t, cfg, tc.Dir, alter.Apply, tc.Client)
+	if count := strings.Count(output, "updated:                                                       .tailor.yml\n"); count != 1 {
+		t.Errorf("config update count = %d, want 1\noutput:\n%s", count, output)
+	}
+
+	written := loadTestConfig(t, tc.Dir)
+	if config.RemoveRetiredWorkflowEntries(written) {
+		t.Errorf("written config still contains a retired workflow: %v", written.Swatches)
+	}
+	if len(written.Swatches) < 3 {
+		t.Fatalf("written config has no merged defaults: %v", written.Swatches)
+	}
+	wantPrefix := []config.SwatchEntry{
+		{Path: "justfile", Alteration: swatch.Never},
+		{Path: ".tailor.yml", Alteration: swatch.Always},
+	}
+	if !slices.Equal(written.Swatches[:2], wantPrefix) {
+		t.Errorf("active swatch prefix = %v, want %v", written.Swatches[:2], wantPrefix)
+	}
+	if !slices.ContainsFunc(written.Swatches, func(entry config.SwatchEntry) bool {
+		return entry.Path == "SUPPORT.md"
+	}) {
+		t.Error("written config does not contain a merged SUPPORT.md entry")
+	}
+}
+
+func TestAlterRunInvalidRemainingConfigChangesNoDiskOrStdout(t *testing.T) {
+	configYAML := `license: none
+swatches:
+  - path: .github/workflows/tailor-automerge.yml
+    alteration: triggered
+  - path: unknown-active-swatch.yml
+    alteration: always
+`
+	tc := setupAlterTest(t, configYAML)
+	writeOnDisk(t, tc.Dir, "LICENSE", []byte("existing"))
+	retiredPath := config.RetiredWorkflowPaths()[0]
+	writeOnDisk(t, tc.Dir, retiredPath, []byte("retired workflow"))
+	beforeConfig, err := os.ReadFile(filepath.Join(tc.Dir, ".tailor.yml"))
+	if err != nil {
+		t.Fatalf("reading original config: %v", err)
+	}
+
+	cfg := loadTestConfig(t, tc.Dir)
+	stdout, _, err := captureAlterRunWithStderr(t, cfg, tc.Dir, alter.Apply, tc.Client)
+	if err == nil {
+		t.Fatal("alter.Run() error = nil, want invalid path error")
+	}
+	if !strings.Contains(err.Error(), "unrecognised swatch path") {
+		t.Errorf("error = %q, want unrecognised swatch path", err)
+	}
+	if stdout != "" {
+		t.Errorf("stdout = %q, want empty output", stdout)
+	}
+	afterConfig, readErr := os.ReadFile(filepath.Join(tc.Dir, ".tailor.yml"))
+	if readErr != nil {
+		t.Fatalf("reading config after failed alter: %v", readErr)
+	}
+	if !bytes.Equal(afterConfig, beforeConfig) {
+		t.Error("failed validation changed .tailor.yml on disk")
+	}
+	if got, readErr := os.ReadFile(filepath.Join(tc.Dir, retiredPath)); readErr != nil || string(got) != "retired workflow" {
+		t.Errorf("failed validation changed retired workflow: content %q, error %v", got, readErr)
+	}
+	if calls := tc.Calls(); len(calls) != 0 {
+		t.Errorf("failed validation made API calls: %v", calls)
+	}
+}
+
+func TestAlterRunRetiredCleanupRetryIsSafe(t *testing.T) {
+	configYAML := `license: none
+swatches:
+  - path: .github/workflows/tailor-automerge.yml
+    alteration: triggered
+  - path: .github/workflows/tailor.yml
+    alteration: triggered
+`
+	tc := setupAlterTest(t, configYAML)
+	writeOnDisk(t, tc.Dir, "LICENSE", []byte("existing"))
+	remaining := config.RetiredWorkflowPaths()[1]
+	writeOnDisk(t, tc.Dir, remaining, []byte("remaining"))
+
+	cfg := loadTestConfig(t, tc.Dir)
+	first := captureAlterRun(t, cfg, tc.Dir, alter.Apply, tc.Client)
+	wantFirst := "updated:                             .tailor.yml\n" +
+		"removed:                             .github/workflows/tailor.yml\n"
+	if first != wantFirst {
+		t.Errorf("first alter.Run() output =\n%s\nwant:\n%s", first, wantFirst)
+	}
+
+	second := captureAlterRun(t, cfg, tc.Dir, alter.Apply, tc.Client)
+	if second != "" {
+		t.Errorf("retry alter.Run() output = %q, want empty output", second)
+	}
+	if _, err := os.Lstat(filepath.Join(tc.Dir, remaining)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("retired workflow exists after retry: %v", err)
 	}
 }

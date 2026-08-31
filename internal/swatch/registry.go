@@ -17,14 +17,19 @@ const (
 type AlterationMode string
 
 const (
-	Always    AlterationMode = "always"
-	FirstFit  AlterationMode = "first-fit"
-	Triggered AlterationMode = "triggered"
-	Never     AlterationMode = "never"
+	// Always compares the embedded content against the on-disk file on
+	// every alter run and overwrites the file when they differ.
+	Always AlterationMode = "always"
+	// FirstFit writes the file only when it does not already exist.
+	FirstFit AlterationMode = "first-fit"
+	// Never skips the swatch. Tailor does not write or compare the
+	// destination.
+	Never AlterationMode = "never"
 )
 
 // LicenseDestination is the destination path for the licence file.
-// Licences are not embedded swatches; they are fetched via gh at alter time.
+// Licences are not embedded swatches. Tailor fetches them via the GitHub
+// REST API at alter time.
 const LicenseDestination = "LICENSE"
 
 // Swatch describes a single template file with its path, default alteration
@@ -51,17 +56,13 @@ var registry = []Swatch{
 	{Path: ".github/ISSUE_TEMPLATE/bug_report.yml", DefaultAlteration: Always, Category: Health},
 	{Path: ".github/ISSUE_TEMPLATE/feature_request.yml", DefaultAlteration: Always, Category: Health},
 	{Path: ".github/ISSUE_TEMPLATE/config.yml", DefaultAlteration: FirstFit, Category: Health},
-	{Path: ".github/pull_request_template.md", DefaultAlteration: Always, Category: Health},
-	{Path: ".github/workflows/tailor.yml", DefaultAlteration: Always, Category: Development},
-	{Path: ".github/workflows/tailor-automerge.yml", DefaultAlteration: Triggered, Category: Development},
+	{Path: ".github/pull_request_template.md", DefaultAlteration: Never, Category: Health},
 	{Path: ".tailor.yml", DefaultAlteration: Always, Category: Development},
 }
 
 // All returns every registered swatch in definition order.
 func All() []Swatch {
-	out := make([]Swatch, len(registry))
-	copy(out, registry)
-	return out
+	return slices.Clone(registry)
 }
 
 // Paths returns the paths of all registered swatches, sorted

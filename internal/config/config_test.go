@@ -7,7 +7,6 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/wimpysworld/tailor/internal/model"
-	"github.com/wimpysworld/tailor/internal/ptr"
 	"github.com/wimpysworld/tailor/internal/swatch"
 	"github.com/wimpysworld/tailor/internal/testutil"
 )
@@ -28,13 +27,13 @@ repository:
   squash_merge_commit_message: PR_BODY
   delete_branch_on_merge: true
   allow_update_branch: true
-  allow_auto_merge: true
+  allow_auto_merge: false
   web_commit_signoff_required: false
+  private_vulnerability_reporting_enabled: true
+  vulnerability_alerts_enabled: true
+  automated_security_fixes_enabled: true
 
 swatches:
-  - path: .github/workflows/tailor.yml
-    alteration: always
-
   - path: .github/dependabot.yml
     alteration: first-fit
 
@@ -77,11 +76,11 @@ swatches:
   - path: .envrc
     alteration: first-fit
 
+  - path: cubic.yaml
+    alteration: first-fit
+
   - path: .tailor.yml
     alteration: always
-
-  - path: .github/workflows/tailor-automerge.yml
-    alteration: triggered
 `
 
 func TestUnmarshalSpecYAML(t *testing.T) {
@@ -99,38 +98,41 @@ func TestUnmarshalSpecYAML(t *testing.T) {
 	}
 
 	r := cfg.Repository
-	testutil.AssertBoolPtr(t, r.HasWiki, false, false, "has_wiki")
-	testutil.AssertBoolPtr(t, r.HasDiscussions, false, false, "has_discussions")
-	testutil.AssertBoolPtr(t, r.HasProjects, false, false, "has_projects")
-	testutil.AssertBoolPtr(t, r.HasIssues, false, true, "has_issues")
-	testutil.AssertBoolPtr(t, r.AllowMergeCommit, false, false, "allow_merge_commit")
-	testutil.AssertBoolPtr(t, r.AllowSquashMerge, false, true, "allow_squash_merge")
-	testutil.AssertBoolPtr(t, r.AllowRebaseMerge, false, true, "allow_rebase_merge")
-	testutil.AssertStringPtr(t, r.SquashMergeCommitTitle, false, "PR_TITLE", "squash_merge_commit_title")
-	testutil.AssertStringPtr(t, r.SquashMergeCommitMessage, false, "PR_BODY", "squash_merge_commit_message")
-	testutil.AssertBoolPtr(t, r.DeleteBranchOnMerge, false, true, "delete_branch_on_merge")
-	testutil.AssertBoolPtr(t, r.AllowUpdateBranch, false, true, "allow_update_branch")
-	testutil.AssertBoolPtr(t, r.AllowAutoMerge, false, true, "allow_auto_merge")
-	testutil.AssertBoolPtr(t, r.WebCommitSignoffRequired, false, false, "web_commit_signoff_required")
+	testutil.AssertPtr(t, r.HasWiki, false, false, "has_wiki")
+	testutil.AssertPtr(t, r.HasDiscussions, false, false, "has_discussions")
+	testutil.AssertPtr(t, r.HasProjects, false, false, "has_projects")
+	testutil.AssertPtr(t, r.HasIssues, false, true, "has_issues")
+	testutil.AssertPtr(t, r.AllowMergeCommit, false, false, "allow_merge_commit")
+	testutil.AssertPtr(t, r.AllowSquashMerge, false, true, "allow_squash_merge")
+	testutil.AssertPtr(t, r.AllowRebaseMerge, false, true, "allow_rebase_merge")
+	testutil.AssertPtr(t, r.SquashMergeCommitTitle, false, "PR_TITLE", "squash_merge_commit_title")
+	testutil.AssertPtr(t, r.SquashMergeCommitMessage, false, "PR_BODY", "squash_merge_commit_message")
+	testutil.AssertPtr(t, r.DeleteBranchOnMerge, false, true, "delete_branch_on_merge")
+	testutil.AssertPtr(t, r.AllowUpdateBranch, false, true, "allow_update_branch")
+	testutil.AssertPtr(t, r.AllowAutoMerge, false, false, "allow_auto_merge")
+	testutil.AssertPtr(t, r.WebCommitSignoffRequired, false, false, "web_commit_signoff_required")
+	testutil.AssertPtr(t, r.PrivateVulnerabilityReportEnabled, false, true, "private_vulnerability_reporting_enabled")
+	testutil.AssertPtr(t, r.VulnerabilityAlertsEnabled, false, true, "vulnerability_alerts_enabled")
+	testutil.AssertPtr(t, r.AutomatedSecurityFixesEnabled, false, true, "automated_security_fixes_enabled")
 
-	if len(cfg.Swatches) != 17 {
-		t.Fatalf("Swatches count = %d, want 17", len(cfg.Swatches))
+	if len(cfg.Swatches) != 16 {
+		t.Fatalf("Swatches count = %d, want 16", len(cfg.Swatches))
 	}
 
 	// Spot-check the first and last swatch entries.
 	first := cfg.Swatches[0]
-	if first.Path != ".github/workflows/tailor.yml" {
+	if first.Path != ".github/dependabot.yml" {
 		t.Errorf("first swatch Path = %q", first.Path)
 	}
-	if first.Alteration != swatch.Always {
+	if first.Alteration != swatch.FirstFit {
 		t.Errorf("first swatch Alteration = %q", first.Alteration)
 	}
 
-	last := cfg.Swatches[16]
-	if last.Path != ".github/workflows/tailor-automerge.yml" {
+	last := cfg.Swatches[15]
+	if last.Path != ".tailor.yml" {
 		t.Errorf("last swatch Path = %q", last.Path)
 	}
-	if last.Alteration != swatch.Triggered {
+	if last.Alteration != swatch.Always {
 		t.Errorf("last swatch Alteration = %q", last.Alteration)
 	}
 }
@@ -172,6 +174,22 @@ func TestMarshalRoundTrip(t *testing.T) {
 	}
 }
 
+func TestUnmarshalOptionalSecuritySettings(t *testing.T) {
+	var cfg Config
+	err := yaml.Unmarshal([]byte(`repository:
+  private_vulnerability_reporting_enabled: true
+  vulnerability_alerts_enabled: false
+  automated_security_fixes_enabled: true
+`), &cfg)
+	if err != nil {
+		t.Fatalf("Unmarshal failed: %v", err)
+	}
+
+	testutil.AssertPtr(t, cfg.Repository.PrivateVulnerabilityReportEnabled, false, true, "private_vulnerability_reporting_enabled")
+	testutil.AssertPtr(t, cfg.Repository.VulnerabilityAlertsEnabled, false, false, "vulnerability_alerts_enabled")
+	testutil.AssertPtr(t, cfg.Repository.AutomatedSecurityFixesEnabled, false, true, "automated_security_fixes_enabled")
+}
+
 func TestRepositoryNilWhenAbsent(t *testing.T) {
 	input := `license: MIT
 swatches:
@@ -210,7 +228,7 @@ func TestOptionalRepositoryFieldsOmitted(t *testing.T) {
 	cfg := Config{
 		License: "MIT",
 		Repository: &model.RepositorySettings{
-			HasWiki: ptr.Ptr(false),
+			HasWiki: new(false),
 		},
 		Swatches: []SwatchEntry{
 			{Path: "justfile", Alteration: swatch.FirstFit},
@@ -247,8 +265,8 @@ swatches: []
 	}
 
 	r := cfg.Repository
-	testutil.AssertStringPtr(t, r.DefaultWorkflowPermissions, false, "read", "default_workflow_permissions")
-	testutil.AssertBoolPtr(t, r.CanApprovePullRequestReviews, false, false, "can_approve_pull_request_reviews")
+	testutil.AssertPtr(t, r.DefaultWorkflowPermissions, false, "read", "default_workflow_permissions")
+	testutil.AssertPtr(t, r.CanApprovePullRequestReviews, false, false, "can_approve_pull_request_reviews")
 
 	if r.Topics == nil {
 		t.Fatal("Topics is nil, want non-nil")
@@ -271,8 +289,8 @@ swatches: []
 	}
 
 	r := cfg.Repository
-	testutil.AssertStringPtr(t, r.DefaultWorkflowPermissions, true, "", "default_workflow_permissions")
-	testutil.AssertBoolPtr(t, r.CanApprovePullRequestReviews, true, false, "can_approve_pull_request_reviews")
+	testutil.AssertPtr(t, r.DefaultWorkflowPermissions, true, "", "default_workflow_permissions")
+	testutil.AssertPtr(t, r.CanApprovePullRequestReviews, true, false, "can_approve_pull_request_reviews")
 
 	if r.Topics != nil {
 		t.Errorf("Topics = %v, want nil when omitted", *r.Topics)
@@ -305,8 +323,8 @@ func TestNewFieldsRoundTrip(t *testing.T) {
 		License: "MIT",
 		Repository: &model.RepositorySettings{
 			Topics:                       &topics,
-			DefaultWorkflowPermissions:   ptr.Ptr("write"),
-			CanApprovePullRequestReviews: ptr.Ptr(true),
+			DefaultWorkflowPermissions:   new("write"),
+			CanApprovePullRequestReviews: new(true),
 		},
 		Swatches: []SwatchEntry{
 			{Path: "justfile", Alteration: swatch.FirstFit},
@@ -324,8 +342,8 @@ func TestNewFieldsRoundTrip(t *testing.T) {
 	}
 
 	r := roundTripped.Repository
-	testutil.AssertStringPtr(t, r.DefaultWorkflowPermissions, false, "write", "default_workflow_permissions")
-	testutil.AssertBoolPtr(t, r.CanApprovePullRequestReviews, false, true, "can_approve_pull_request_reviews")
+	testutil.AssertPtr(t, r.DefaultWorkflowPermissions, false, "write", "default_workflow_permissions")
+	testutil.AssertPtr(t, r.CanApprovePullRequestReviews, false, true, "can_approve_pull_request_reviews")
 
 	if r.Topics == nil {
 		t.Fatal("round-tripped Topics is nil")
@@ -340,7 +358,7 @@ func TestNewFieldsOmittedInMarshal(t *testing.T) {
 	cfg := Config{
 		License: "MIT",
 		Repository: &model.RepositorySettings{
-			HasWiki: ptr.Ptr(false),
+			HasWiki: new(false),
 		},
 		Swatches: []SwatchEntry{
 			{Path: "justfile", Alteration: swatch.FirstFit},
@@ -478,46 +496,6 @@ func TestLabelsOmittedInMarshalWhenNil(t *testing.T) {
 	}
 }
 
-func TestLabelNeedsUpdateCasingDiffers(t *testing.T) {
-	existing := model.LabelEntry{Name: "bug", Color: "d73a4a", Description: "desc"}
-	desired := model.LabelEntry{Name: "Bug", Color: "d73a4a", Description: "desc"}
-	if !model.LabelNeedsUpdate(existing, desired) {
-		t.Error("LabelNeedsUpdate() = false, want true when name casing differs")
-	}
-}
-
-func TestLabelNeedsUpdateExactMatch(t *testing.T) {
-	existing := model.LabelEntry{Name: "bug", Color: "d73a4a", Description: "desc"}
-	desired := model.LabelEntry{Name: "bug", Color: "d73a4a", Description: "desc"}
-	if model.LabelNeedsUpdate(existing, desired) {
-		t.Error("LabelNeedsUpdate() = true, want false when labels are identical")
-	}
-}
-
-func TestLabelNeedsUpdateColourDiffers(t *testing.T) {
-	existing := model.LabelEntry{Name: "bug", Color: "d73a4a", Description: "desc"}
-	desired := model.LabelEntry{Name: "bug", Color: "ff0000", Description: "desc"}
-	if !model.LabelNeedsUpdate(existing, desired) {
-		t.Error("LabelNeedsUpdate() = false, want true when colour differs")
-	}
-}
-
-func TestLabelNeedsUpdateDescriptionDiffers(t *testing.T) {
-	existing := model.LabelEntry{Name: "bug", Color: "d73a4a", Description: "old"}
-	desired := model.LabelEntry{Name: "bug", Color: "d73a4a", Description: "new"}
-	if !model.LabelNeedsUpdate(existing, desired) {
-		t.Error("LabelNeedsUpdate() = false, want true when description differs")
-	}
-}
-
-func TestLabelNeedsUpdateColourCaseInsensitive(t *testing.T) {
-	existing := model.LabelEntry{Name: "bug", Color: "D73A4A", Description: "desc"}
-	desired := model.LabelEntry{Name: "bug", Color: "d73a4a", Description: "desc"}
-	if model.LabelNeedsUpdate(existing, desired) {
-		t.Error("LabelNeedsUpdate() = true, want false when colour differs only in casing")
-	}
-}
-
 func TestRepositoryStringFields(t *testing.T) {
 	input := `license: MIT
 repository:
@@ -533,8 +511,8 @@ swatches: []
 	}
 
 	r := cfg.Repository
-	testutil.AssertStringPtr(t, r.Description, false, "My project", "description")
-	testutil.AssertStringPtr(t, r.Homepage, false, "https://example.com", "homepage")
-	testutil.AssertStringPtr(t, r.MergeCommitTitle, false, "PR_TITLE", "merge_commit_title")
-	testutil.AssertStringPtr(t, r.MergeCommitMessage, false, "PR_BODY", "merge_commit_message")
+	testutil.AssertPtr(t, r.Description, false, "My project", "description")
+	testutil.AssertPtr(t, r.Homepage, false, "https://example.com", "homepage")
+	testutil.AssertPtr(t, r.MergeCommitTitle, false, "PR_TITLE", "merge_commit_title")
+	testutil.AssertPtr(t, r.MergeCommitMessage, false, "PR_BODY", "merge_commit_message")
 }

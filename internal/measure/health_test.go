@@ -3,10 +3,104 @@ package measure
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/wimpysworld/tailor/internal/testutil"
 )
+
+func TestHasUnresolvedPlaceholdersSupportedNames(t *testing.T) {
+	names := []string{
+		"year",
+		"yyyy",
+		"fullname",
+		"name of copyright owner",
+		"name of copyright holder",
+		"software name",
+		"project",
+		"projecturl",
+		"email",
+	}
+	delimiters := []struct {
+		name  string
+		open  string
+		close string
+	}{
+		{name: "square", open: "[", close: "]"},
+		{name: "curly", open: "{", close: "}"},
+	}
+
+	for _, name := range names {
+		for _, delimiter := range delimiters {
+			t.Run(name+"/"+delimiter.name, func(t *testing.T) {
+				variants := []string{
+					name,
+					strings.ToUpper(name),
+					" \t\n\v\f\r" + name + "\r\f\v\n\t ",
+					strings.ReplaceAll(name, " ", " \t\n\v\f\r "),
+				}
+				for _, variant := range variants {
+					token := delimiter.open + variant + delimiter.close
+					if !hasUnresolvedPlaceholders([]byte(token)) {
+						t.Errorf("hasUnresolvedPlaceholders(%q) = false, want true", token)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestHasUnresolvedPlaceholdersRejectsOtherBracketedText(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+	}{
+		{name: "blue oak markdown link", content: "complied with [Notices](#notices)"},
+		{name: "markdown link matching placeholder", content: "see [year](#year)"},
+		{name: "markdown link with plain destination", content: "see [year](unfinished)"},
+		{name: "markdown link with nested destination", content: "see [year](docs/(archive))"},
+		{name: "cecill name fragments", content: "Ce[a] C[nrs] I[nria] L[ogiciel] L[ibre]"},
+		{name: "gpl application example", content: "Copyright (C) <year> <name of author>"},
+		{name: "resolved copyright", content: "Copyright (c) 2026 Jane Smith"},
+		{name: "arbitrary square brackets", content: "[licence terms]"},
+		{name: "arbitrary curly braces", content: "{licence terms}"},
+		{name: "longer name", content: "[yearly]"},
+		{name: "prefixed name", content: "[copyright year]"},
+		{name: "space within projecturl", content: "{project url}"},
+		{name: "punctuation within email", content: "[e-mail]"},
+		{name: "square open curly close", content: "[year}"},
+		{name: "curly open square close", content: "{year]"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if hasUnresolvedPlaceholders([]byte(tt.content)) {
+				t.Errorf("hasUnresolvedPlaceholders(%q) = true, want false", tt.content)
+			}
+		})
+	}
+}
+
+func TestHasUnresolvedPlaceholdersFindsTokenAmongValidText(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+	}{
+		{name: "after valid markdown link", content: "complied with [Notices](#notices)\nCopyright (c) [year] Jane Smith"},
+		{name: "link opening without destination", content: "[year]("},
+		{name: "link destination without closing parenthesis", content: "[year](unfinished"},
+		{name: "after malformed same delimiter", content: "[broken [year]"},
+		{name: "inside mixed delimiters", content: "{text [year]}"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if !hasUnresolvedPlaceholders([]byte(tt.content)) {
+				t.Errorf("hasUnresolvedPlaceholders(%q) = false, want true", tt.content)
+			}
+		})
+	}
+}
 
 func TestCheckHealthEmptyDir(t *testing.T) {
 	dir := t.TempDir()
@@ -111,12 +205,12 @@ func TestCheckHealthMixedPresence(t *testing.T) {
 func TestCheckHealthSortOrder(t *testing.T) {
 	dir := t.TempDir()
 
-	// Create just LICENSE so we get a mix of missing, warning, and present.
+	// A lone LICENSE produces a mix of missing, warning, and present results.
 	testutil.CreateFile(t, dir, "LICENSE")
 
 	results := CheckHealth(dir)
 
-	// Verify group order: all missing, then all warning, then all present.
+	// Group order is all missing, then all warning, then all present.
 	statusOrder := map[HealthStatus]int{Missing: 0, Warning: 1, Present: 2}
 	maxSeen := 0
 	for _, r := range results {
@@ -281,6 +375,201 @@ func TestCheckHealthReadmePresent(t *testing.T) {
 		if r.Path == "README.md" {
 			t.Errorf("README.md should not appear in results when present, got status %q", r.Status)
 		}
+	}
+}
+
+func TestCheckHealthLicenseHardening(t *testing.T) {
+	placeholderContent := "MIT License\n\nCopyright (c) [year] [fullname]\n"
+
+	tests := []struct {
+		name       string
+		setup      func(t *testing.T, dir string)
+		wantStatus HealthStatus
+		wantDetail string
+	}{
+		{
+			name: "symlinked licence is missing",
+			setup: func(t *testing.T, dir string) {
+				target := filepath.Join(dir, "target.txt")
+				if err := os.WriteFile(target, []byte(placeholderContent), 0o644); err != nil {
+					t.Fatalf("WriteFile: %v", err)
+				}
+				if err := os.Symlink(target, filepath.Join(dir, "LICENSE")); err != nil {
+					t.Fatalf("Symlink: %v", err)
+				}
+			},
+			wantStatus: Missing,
+		},
+		{
+			name: "over-limit licence warns as not inspected",
+			setup: func(t *testing.T, dir string) {
+				content := make([]byte, 1<<20+1)
+				copy(content, placeholderContent)
+				if err := os.WriteFile(filepath.Join(dir, "LICENSE"), content, 0o644); err != nil {
+					t.Fatalf("WriteFile: %v", err)
+				}
+			},
+			wantStatus: Warning,
+			wantDetail: "(not inspected: exceeds 1 MiB)",
+		},
+		{
+			name: "licence with placeholders warns",
+			setup: func(t *testing.T, dir string) {
+				if err := os.WriteFile(filepath.Join(dir, "LICENSE"), []byte(placeholderContent), 0o644); err != nil {
+					t.Fatalf("WriteFile: %v", err)
+				}
+			},
+			wantStatus: Warning,
+			wantDetail: "(contains unresolved placeholders)",
+		},
+		{
+			name: "resolved licence is present",
+			setup: func(t *testing.T, dir string) {
+				content := "MIT License\n\nCopyright (c) 2024 Jane Smith\n"
+				if err := os.WriteFile(filepath.Join(dir, "LICENSE"), []byte(content), 0o644); err != nil {
+					t.Fatalf("WriteFile: %v", err)
+				}
+			},
+			wantStatus: Present,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			tt.setup(t, dir)
+
+			results := CheckHealth(dir)
+
+			for _, r := range results {
+				if r.Path == "LICENSE" {
+					if r.Status != tt.wantStatus {
+						t.Errorf("LICENSE status = %q, want %q", r.Status, tt.wantStatus)
+					}
+					if r.Detail != tt.wantDetail {
+						t.Errorf("LICENSE detail = %q, want %q", r.Detail, tt.wantDetail)
+					}
+					return
+				}
+			}
+			t.Error("LICENSE not found in results")
+		})
+	}
+}
+
+func TestReadLicenceRejectsSymlinkOutsideProject(t *testing.T) {
+	base := t.TempDir()
+	target := filepath.Join(base, "target.txt")
+	if err := os.WriteFile(target, []byte("MIT License\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	dir := filepath.Join(base, "project")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	if err := os.Symlink(target, filepath.Join(dir, "LICENSE")); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatalf("OpenRoot: %v", err)
+	}
+	defer root.Close()
+
+	if _, err := readLicence(root, "LICENSE"); err == nil {
+		t.Error("readLicence() error = nil, want error for symlink outside the project")
+	}
+}
+
+func TestCheckHealthSymlinkedParentEscapingProjectIsMissing(t *testing.T) {
+	base := t.TempDir()
+
+	// Populate a directory outside the project with the .github health files.
+	outside := filepath.Join(base, "outside")
+	githubFiles := []string{
+		"FUNDING.yml",
+		"dependabot.yml",
+		"pull_request_template.md",
+		"ISSUE_TEMPLATE/bug_report.yml",
+		"ISSUE_TEMPLATE/feature_request.yml",
+		"ISSUE_TEMPLATE/config.yml",
+	}
+	for _, f := range githubFiles {
+		testutil.CreateFile(t, outside, f)
+	}
+
+	dir := filepath.Join(base, "project")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	if err := os.Symlink(outside, filepath.Join(dir, ".github")); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+
+	results := CheckHealth(dir)
+
+	for _, r := range results {
+		if strings.HasPrefix(r.Path, ".github/") && r.Status != Missing {
+			t.Errorf("%q behind escaping symlinked parent: status = %q, want %q", r.Path, r.Status, Missing)
+		}
+	}
+}
+
+func TestCheckHealthSymlinkedReadmeWarns(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target.md")
+	if err := os.WriteFile(target, []byte("# Project\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := os.Symlink(target, filepath.Join(dir, "README.md")); err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+
+	results := CheckHealth(dir)
+
+	for _, r := range results {
+		if r.Path == "README.md" {
+			if r.Status != Warning {
+				t.Errorf("symlinked README.md: status = %q, want %q", r.Status, Warning)
+			}
+			return
+		}
+	}
+	t.Error("README.md not found in results")
+}
+
+func TestHasUnresolvedPlaceholdersAdversarialContent(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{
+			name:    "many opens before one closer",
+			content: strings.Repeat("[", 1<<19) + "]",
+			want:    false,
+		},
+		{
+			name:    "repeated unbalanced links",
+			content: strings.Repeat("[a](", 1<<17),
+			want:    false,
+		},
+		{
+			name:    "unbalanced links before placeholder",
+			content: strings.Repeat("[a](", 1<<17) + "[year]",
+			want:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := hasUnresolvedPlaceholders([]byte(tt.content))
+			if got != tt.want {
+				t.Errorf("hasUnresolvedPlaceholders() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 

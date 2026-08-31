@@ -12,14 +12,12 @@ import (
 // DiffCategory classifies a config-diff result.
 type DiffCategory string
 
+// Diff categories, in output order.
 const (
 	NotConfigured DiffCategory = "not-configured"
 	ConfigOnly    DiffCategory = "config-only"
 	ModeDiffers   DiffCategory = "mode-differs"
 )
-
-// Label returns the category string with a trailing colon, suitable for formatted output.
-func (c DiffCategory) Label() string { return string(c) + ":" }
 
 // DiffResult describes a single config-diff finding.
 type DiffResult struct {

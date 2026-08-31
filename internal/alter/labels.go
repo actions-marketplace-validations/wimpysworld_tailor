@@ -2,10 +2,8 @@ package alter
 
 import (
 	"fmt"
-	"os"
 	"strings"
 
-	"github.com/cli/go-gh/v2/pkg/api"
 	"github.com/wimpysworld/tailor/internal/config"
 	"github.com/wimpysworld/tailor/internal/gh"
 	"github.com/wimpysworld/tailor/internal/model"
@@ -19,32 +17,32 @@ const (
 	WouldUpdate    LabelCategory = "would update"
 	LabelNoChange  LabelCategory = "no change"
 	LabelSkipScope LabelCategory = "would skip (insufficient scope)"
-	LabelSkipRole  LabelCategory = "would skip (insufficient role)"
 )
 
 // LabelResult records the label name, category, and display value for one
-// label entry. Annotation carries optional context for skip categories,
-// embedded in the label (e.g. "token missing required scope").
+// label entry. Skip results leave Name empty and carry the skipped Operation
+// instead. Annotation carries optional context for skip categories, embedded
+// in the label (e.g. "token missing required scope").
 type LabelResult struct {
 	Name       string
 	Category   LabelCategory
 	Value      string
 	Annotation string
+	Operation  gh.Operation
 }
 
 // ProcessLabels compares declared labels against live labels and optionally
 // applies them. Returns results for output formatting.
-func ProcessLabels(cfg *config.Config, mode ApplyMode, client *api.RESTClient, owner, name string, hasRepo bool) ([]LabelResult, error) {
+func ProcessLabels(cfg *config.Config, mode ApplyMode, target RepoTarget) ([]LabelResult, error) {
 	if len(cfg.Labels) == 0 {
 		return nil, nil
 	}
 
-	if !hasRepo {
-		fmt.Fprintln(os.Stderr, "No GitHub repository context found. Labels will be applied once a remote is configured.")
+	if target.missingRepo("Labels") {
 		return nil, nil
 	}
 
-	current, err := gh.ReadLabels(client, owner, name)
+	current, err := gh.ReadLabels(target.Client, target.Owner, target.Name)
 	if err != nil {
 		return nil, err
 	}
@@ -52,7 +50,7 @@ func ProcessLabels(cfg *config.Config, mode ApplyMode, client *api.RESTClient, o
 	results := compareLabels(cfg.Labels, current)
 
 	if mode.ShouldWrite() && hasLabelChanges(results) {
-		applyResult, err := gh.ApplyLabels(client, owner, name, cfg.Labels, current)
+		applyResult, err := gh.ApplyLabels(target.Client, target.Owner, target.Name, cfg.Labels, current)
 		if err != nil {
 			return nil, err
 		}
@@ -63,19 +61,17 @@ func ProcessLabels(cfg *config.Config, mode ApplyMode, client *api.RESTClient, o
 }
 
 // labelSkippedToResults converts gh.ApplyResult skipped operations into
-// LabelResult entries with LabelSkipScope or LabelSkipRole categories.
+// LabelResult entries with LabelSkipScope categories.
 func labelSkippedToResults(ar *gh.ApplyResult) []LabelResult {
 	if ar == nil {
 		return nil
 	}
 	var results []LabelResult
 	for _, sk := range ar.Skipped {
-		cat := LabelCategory(classifySkipCategory(sk.Err))
 		results = append(results, LabelResult{
-			Name:       sk.Operation,
-			Category:   cat,
-			Value:      sk.Err.Error(),
-			Annotation: skipAnnotation(sk.Err),
+			Operation:  sk.Operation,
+			Category:   LabelSkipScope,
+			Annotation: skipAnnotation,
 		})
 	}
 	return results
@@ -97,27 +93,16 @@ func compareLabels(desired, current []model.LabelEntry) []LabelResult {
 
 		display := formatLabelValue(d)
 
-		if !found {
-			results = append(results, LabelResult{
-				Name:     d.Name,
-				Category: WouldCreate,
-				Value:    display,
-			})
-			continue
+		category := LabelNoChange
+		switch {
+		case !found:
+			category = WouldCreate
+		case model.LabelNeedsUpdate(existing, d):
+			category = WouldUpdate
 		}
-
-		if model.LabelNeedsUpdate(existing, d) {
-			results = append(results, LabelResult{
-				Name:     d.Name,
-				Category: WouldUpdate,
-				Value:    display,
-			})
-			continue
-		}
-
 		results = append(results, LabelResult{
 			Name:     d.Name,
-			Category: LabelNoChange,
+			Category: category,
 			Value:    display,
 		})
 	}

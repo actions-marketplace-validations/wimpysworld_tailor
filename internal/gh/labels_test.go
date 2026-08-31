@@ -6,7 +6,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/wimpysworld/tailor/internal/model"
@@ -59,18 +61,14 @@ func TestReadLabelsSinglePage(t *testing.T) {
 }
 
 func TestReadLabelsPaginated(t *testing.T) {
-	// Build two pages: page 1 has 100 labels, page 2 has 3 labels.
-	page1 := make([]labelResponse, 100)
-	for i := range page1 {
-		page1[i] = labelResponse{
-			Name:  fmt.Sprintf("label-%03d", i),
-			Color: "aabbcc",
-		}
+	page1 := []labelResponse{
+		{Name: "label-000", Color: "aabbcc"},
+		{Name: "label-001", Color: "aabbcc"},
 	}
 	page2 := []labelResponse{
-		{Name: "label-100", Color: "aabbcc"},
-		{Name: "label-101", Color: "aabbcc"},
-		{Name: "label-102", Color: "aabbcc"},
+		{Name: "label-002", Color: "aabbcc"},
+		{Name: "label-003", Color: "aabbcc"},
+		{Name: "label-004", Color: "aabbcc"},
 	}
 
 	page1JSON, _ := json.Marshal(page1)
@@ -96,8 +94,15 @@ func TestReadLabelsPaginated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadLabels() error: %v", err)
 	}
-	if len(labels) != 103 {
-		t.Errorf("ReadLabels() length = %d, want 103", len(labels))
+	want := []model.LabelEntry{
+		{Name: "label-000", Color: "aabbcc"},
+		{Name: "label-001", Color: "aabbcc"},
+		{Name: "label-002", Color: "aabbcc"},
+		{Name: "label-003", Color: "aabbcc"},
+		{Name: "label-004", Color: "aabbcc"},
+	}
+	if !slices.Equal(labels, want) {
+		t.Errorf("ReadLabels() = %+v, want %+v", labels, want)
 	}
 }
 
@@ -256,8 +261,8 @@ func TestApplyLabelsCaseInsensitiveMatch(t *testing.T) {
 }
 
 func TestApplyLabelsCaseInsensitiveSkip(t *testing.T) {
-	// When names match case-insensitively AND case-sensitively, and colour and
-	// description also match, no API call should be made.
+	// A label whose name, colour, and description all match exactly requires
+	// no API call.
 	requestCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestCount++
@@ -558,8 +563,8 @@ func TestApplyLabelsCreate403SkipsAndContinues(t *testing.T) {
 	if len(result.Skipped) != 1 {
 		t.Fatalf("expected 1 skipped, got %d", len(result.Skipped))
 	}
-	if result.Skipped[0].Operation != `create label "alpha"` {
-		t.Errorf("skipped operation = %q, want %q", result.Skipped[0].Operation, `create label "alpha"`)
+	if result.Skipped[0].Operation.String() != `create label "alpha"` {
+		t.Errorf("skipped operation = %q, want %q", result.Skipped[0].Operation.String(), `create label "alpha"`)
 	}
 	if !isAccessError(result.Skipped[0].Err) {
 		t.Errorf("skipped error is not an access error: %v", result.Skipped[0].Err)
@@ -605,11 +610,51 @@ func TestApplyLabelsUpdate403SkipsAndContinues(t *testing.T) {
 	if len(result.Skipped) != 1 {
 		t.Fatalf("expected 1 skipped, got %d", len(result.Skipped))
 	}
-	if result.Skipped[0].Operation != `update label "alpha"` {
-		t.Errorf("skipped operation = %q, want %q", result.Skipped[0].Operation, `update label "alpha"`)
+	if result.Skipped[0].Operation.String() != `update label "alpha"` {
+		t.Errorf("skipped operation = %q, want %q", result.Skipped[0].Operation.String(), `update label "alpha"`)
 	}
 	if !isAccessError(result.Skipped[0].Err) {
 		t.Errorf("skipped error is not an access error: %v", result.Skipped[0].Err)
+	}
+}
+
+func TestApplyLabelsUpdate404Aborts(t *testing.T) {
+	var calls []string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, r.Method+" "+r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		fmt.Fprint(w, `{"message": "Not Found"}`)
+	}))
+	t.Cleanup(server.Close)
+
+	client := newTestClient(t, server)
+	desired := []model.LabelEntry{
+		{Name: "alpha", Color: "ff0000", Description: "changed"},
+		{Name: "beta", Color: "00ff00", Description: "changed"},
+	}
+	current := []model.LabelEntry{
+		{Name: "alpha", Color: "aa0000", Description: "old"},
+		{Name: "beta", Color: "bb0000", Description: "old"},
+	}
+
+	result, err := ApplyLabels(client, "testowner", "testrepo", desired, current)
+	if err == nil {
+		t.Fatal("ApplyLabels() expected hard error from 404, got nil")
+	}
+	if result != nil {
+		t.Errorf("ApplyLabels() result = %+v, want nil", result)
+	}
+	if isAccessError(err) {
+		t.Errorf("ApplyLabels() returned an access error: %v", err)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("expected 1 API call, got %d: %v", len(calls), calls)
+	}
+	wantCall := "PATCH /repos/testowner/testrepo/labels/alpha"
+	if calls[0] != wantCall {
+		t.Errorf("call = %q, want %q", calls[0], wantCall)
 	}
 }
 
@@ -631,6 +676,164 @@ func TestApplyLabelsNon403ErrorStillAborts(t *testing.T) {
 	_, err := ApplyLabels(client, "testowner", "testrepo", desired, nil)
 	if err == nil {
 		t.Fatal("ApplyLabels() expected hard error from 500, got nil")
+	}
+}
+
+func TestApplyLabelsRateLimitStopsLoop(t *testing.T) {
+	// Three new labels: the first POST succeeds, the second returns the
+	// configured error. A rate-limit response must stop the loop before the
+	// third POST; a scope 403 must skip and continue.
+	tests := []struct {
+		name     string
+		status   int
+		headers  map[string]string
+		message  string
+		wantStop bool
+	}{
+		{
+			name:     "403 with X-RateLimit-Remaining zero stops",
+			status:   http.StatusForbidden,
+			headers:  map[string]string{"X-RateLimit-Remaining": "0"},
+			message:  "API rate limit exceeded",
+			wantStop: true,
+		},
+		{
+			name:     "403 with Retry-After stops",
+			status:   http.StatusForbidden,
+			headers:  map[string]string{"Retry-After": "60"},
+			message:  "You have exceeded a secondary rate limit",
+			wantStop: true,
+		},
+		{
+			name:     "403 with rate limit message stops",
+			status:   http.StatusForbidden,
+			message:  "API rate limit exceeded for user",
+			wantStop: true,
+		},
+		{
+			name:     "429 stops",
+			status:   http.StatusTooManyRequests,
+			message:  "Too Many Requests",
+			wantStop: true,
+		},
+		{
+			name:     "scope 403 skips and continues",
+			status:   http.StatusForbidden,
+			message:  "Resource not accessible by integration",
+			wantStop: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			calls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				if calls == 2 {
+					for k, v := range tt.headers {
+						w.Header().Set(k, v)
+					}
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(tt.status)
+					fmt.Fprintf(w, `{"message": %q}`, tt.message)
+					return
+				}
+				w.WriteHeader(http.StatusCreated)
+				fmt.Fprint(w, `{}`)
+			}))
+			t.Cleanup(server.Close)
+
+			client := newTestClient(t, server)
+			desired := []model.LabelEntry{
+				{Name: "alpha", Color: "aa0000", Description: "first"},
+				{Name: "beta", Color: "bb0000", Description: "second"},
+				{Name: "gamma", Color: "cc0000", Description: "third"},
+			}
+
+			result, err := ApplyLabels(client, "testowner", "testrepo", desired, nil)
+			if !tt.wantStop {
+				if err != nil {
+					t.Fatalf("ApplyLabels() returned hard error: %v", err)
+				}
+				if calls != 3 {
+					t.Fatalf("expected 3 API calls, got %d", calls)
+				}
+				if len(result.Skipped) != 1 {
+					t.Fatalf("expected 1 skipped, got %d", len(result.Skipped))
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("ApplyLabels() expected rate-limit error, got nil")
+			}
+			if calls != 2 {
+				t.Fatalf("expected 2 API calls (loop stops), got %d", calls)
+			}
+			want := "rate limited while applying labels: 1 applied, 2 remaining"
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error = %q, want substring %q", err, want)
+			}
+			if !isRateLimitError(err) {
+				t.Errorf("error does not unwrap to *ErrRateLimited: %v", err)
+			}
+		})
+	}
+}
+
+func TestApplyLabelsRateLimitReportsRemainingChanges(t *testing.T) {
+	desired := []model.LabelEntry{
+		{Name: "unchanged-first", Color: "111111", Description: "same"},
+		{Name: "create-first", Color: "222222", Description: "new"},
+		{Name: "unchanged-middle", Color: "333333", Description: "same"},
+		{Name: "update-middle", Color: "444444", Description: "new"},
+		{Name: "create-final", Color: "555555", Description: "new"},
+		{Name: "unchanged-final", Color: "666666", Description: "same"},
+	}
+	current := []model.LabelEntry{
+		{Name: "unchanged-first", Color: "111111", Description: "same"},
+		{Name: "unchanged-middle", Color: "333333", Description: "same"},
+		{Name: "update-middle", Color: "000000", Description: "old"},
+		{Name: "unchanged-final", Color: "666666", Description: "same"},
+	}
+
+	tests := []struct {
+		name          string
+		failAt        int
+		wantApplied   int
+		wantRemaining int
+	}{
+		{name: "first change", failAt: 1, wantApplied: 0, wantRemaining: 3},
+		{name: "middle change", failAt: 2, wantApplied: 1, wantRemaining: 2},
+		{name: "final change", failAt: 3, wantApplied: 2, wantRemaining: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			calls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				calls++
+				if calls == tt.failAt {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusTooManyRequests)
+					fmt.Fprint(w, `{"message": "Too Many Requests"}`)
+					return
+				}
+				w.WriteHeader(http.StatusCreated)
+				fmt.Fprint(w, `{}`)
+			}))
+			t.Cleanup(server.Close)
+
+			client := newTestClient(t, server)
+			_, err := ApplyLabels(client, "testowner", "testrepo", desired, current)
+			if err == nil {
+				t.Fatal("ApplyLabels() expected rate-limit error, got nil")
+			}
+			want := fmt.Sprintf("rate limited while applying labels: %d applied, %d remaining", tt.wantApplied, tt.wantRemaining)
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error = %q, want substring %q", err, want)
+			}
+			if calls != tt.failAt {
+				t.Errorf("API calls = %d, want %d", calls, tt.failAt)
+			}
+		})
 	}
 }
 
@@ -674,7 +877,7 @@ func TestApplyLabelsMixed403AndSuccess(t *testing.T) {
 	if len(result.Skipped) != 1 {
 		t.Fatalf("expected 1 skipped, got %d", len(result.Skipped))
 	}
-	if result.Skipped[0].Operation != `create label "new-label"` {
-		t.Errorf("skipped = %q, want %q", result.Skipped[0].Operation, `create label "new-label"`)
+	if result.Skipped[0].Operation.String() != `create label "new-label"` {
+		t.Errorf("skipped = %q, want %q", result.Skipped[0].Operation.String(), `create label "new-label"`)
 	}
 }

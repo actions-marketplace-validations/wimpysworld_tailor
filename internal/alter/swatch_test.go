@@ -3,13 +3,13 @@ package alter_test
 import (
 	"bytes"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/wimpysworld/tailor/internal/alter"
 	"github.com/wimpysworld/tailor/internal/config"
-	"github.com/wimpysworld/tailor/internal/model"
-	"github.com/wimpysworld/tailor/internal/ptr"
 	"github.com/wimpysworld/tailor/internal/swatch"
 )
 
@@ -30,24 +30,6 @@ func mustContent(t *testing.T, source string) []byte {
 	return data
 }
 
-// captureStderr calls fn while redirecting os.Stderr to a pipe and returns
-// whatever was written.
-func captureStderr(t *testing.T, fn func()) string {
-	t.Helper()
-	oldStderr := os.Stderr
-	r, w, _ := os.Pipe()
-	os.Stderr = w
-
-	fn()
-
-	w.Close()
-	os.Stderr = oldStderr
-
-	var buf bytes.Buffer
-	_, _ = buf.ReadFrom(r)
-	return buf.String()
-}
-
 func writeOnDisk(t *testing.T, dir, rel string, data []byte) {
 	t.Helper()
 	path := filepath.Join(dir, rel)
@@ -56,6 +38,20 @@ func writeOnDisk(t *testing.T, dir, rel string, data []byte) {
 	}
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func symlinkOrSkip(t *testing.T, oldname, newname string) {
+	t.Helper()
+	if err := os.Symlink(oldname, newname); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+}
+
+func mkfifoOrSkip(t *testing.T, path string) {
+	t.Helper()
+	if err := exec.CommandContext(t.Context(), "mkfifo", path).Run(); err != nil {
+		t.Skipf("mkfifo unavailable: %v", err)
 	}
 }
 
@@ -71,8 +67,8 @@ func TestFirstFitSkipWhenExists(t *testing.T) {
 	if len(results) != 1 {
 		t.Fatalf("got %d results, want 1", len(results))
 	}
-	if results[0].Category != alter.SkippedFirstFit {
-		t.Errorf("category = %q, want %q", results[0].Category, alter.SkippedFirstFit)
+	if results[0].Category != alter.Skipped || results[0].Reason != alter.SkipFirstFitExists {
+		t.Errorf("result = %+v, want skipped because first-fit destination exists", results[0])
 	}
 }
 
@@ -87,7 +83,7 @@ func TestFirstFitCopyWhenAbsent(t *testing.T) {
 	if results[0].Category != alter.WouldCopy {
 		t.Errorf("category = %q, want %q", results[0].Category, alter.WouldCopy)
 	}
-	// Dry run: file should not exist.
+	// Dry-run reports the copy without creating the file.
 	if _, err := os.Stat(filepath.Join(dir, ".gitignore")); err == nil {
 		t.Error("dry run wrote file to disk")
 	}
@@ -104,7 +100,7 @@ func TestFirstFitApplyWritesFile(t *testing.T) {
 	if results[0].Category != alter.WouldCopy {
 		t.Errorf("category = %q, want %q", results[0].Category, alter.WouldCopy)
 	}
-	// Apply: file should exist.
+	// Apply writes the missing file.
 	data, err := os.ReadFile(filepath.Join(dir, ".gitignore"))
 	if err != nil {
 		t.Fatalf("file not written: %v", err)
@@ -115,7 +111,43 @@ func TestFirstFitApplyWritesFile(t *testing.T) {
 	}
 }
 
-func TestAlwaysNoChangeWhenMD5Matches(t *testing.T) {
+func TestFirstFitRejectsDirectoryDestination(t *testing.T) {
+	tests := []struct {
+		name string
+		mode alter.ApplyMode
+	}{
+		{name: "dry-run", mode: alter.DryRun},
+		{name: "apply", mode: alter.Apply},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, ".gitignore")
+			if err := os.Mkdir(path, 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			cfg := newConfig(entry(".gitignore", swatch.FirstFit))
+			_, err := alter.ProcessSwatches(cfg, dir, test.mode, &alter.TokenContext{})
+			if err == nil {
+				t.Fatal("ProcessSwatches() error = nil, want directory error")
+			}
+			if !strings.Contains(err.Error(), `swatch destination ".gitignore" is a directory`) {
+				t.Errorf("error = %q, want directory error", err)
+			}
+			info, statErr := os.Stat(path)
+			if statErr != nil {
+				t.Fatal(statErr)
+			}
+			if !info.IsDir() {
+				t.Error("destination is not a directory")
+			}
+		})
+	}
+}
+
+func TestAlwaysNoChangeWhenSHA256Matches(t *testing.T) {
 	dir := t.TempDir()
 	content := mustContent(t, "CODE_OF_CONDUCT.md")
 	writeOnDisk(t, dir, "CODE_OF_CONDUCT.md", content)
@@ -130,7 +162,7 @@ func TestAlwaysNoChangeWhenMD5Matches(t *testing.T) {
 	}
 }
 
-func TestAlwaysWouldOverwriteWhenMD5Differs(t *testing.T) {
+func TestAlwaysWouldOverwriteWhenSHA256Differs(t *testing.T) {
 	dir := t.TempDir()
 	writeOnDisk(t, dir, "CODE_OF_CONDUCT.md", []byte("old content"))
 
@@ -144,9 +176,61 @@ func TestAlwaysWouldOverwriteWhenMD5Differs(t *testing.T) {
 	}
 }
 
+func TestAlwaysRejectsDirectoryDestination(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "CODE_OF_CONDUCT.md"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := newConfig(entry("CODE_OF_CONDUCT.md", swatch.Always))
+	_, err := alter.ProcessSwatches(cfg, dir, alter.DryRun, &alter.TokenContext{})
+	if err == nil {
+		t.Fatal("ProcessSwatches() error = nil, want directory error")
+	}
+	if !strings.Contains(err.Error(), `swatch destination "CODE_OF_CONDUCT.md" is a directory`) {
+		t.Errorf("error = %q, want directory error", err)
+	}
+}
+
+func TestSwatchRejectsNonRegularDestination(t *testing.T) {
+	tests := []struct {
+		name       string
+		alteration swatch.AlterationMode
+		mode       alter.ApplyMode
+	}{
+		{name: "always/dry-run", alteration: swatch.Always, mode: alter.DryRun},
+		{name: "always/apply", alteration: swatch.Always, mode: alter.Apply},
+		{name: "first-fit/dry-run", alteration: swatch.FirstFit, mode: alter.DryRun},
+		{name: "first-fit/apply", alteration: swatch.FirstFit, mode: alter.Apply},
+		{name: "recut", alteration: swatch.FirstFit, mode: alter.Recut},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, ".gitignore")
+			mkfifoOrSkip(t, path)
+
+			cfg := newConfig(entry(".gitignore", test.alteration))
+			_, err := alter.ProcessSwatches(cfg, dir, test.mode, &alter.TokenContext{})
+			if err == nil || !strings.Contains(err.Error(), `swatch destination ".gitignore" is not a regular file`) {
+				t.Fatalf("error = %v, want non-regular destination error", err)
+			}
+
+			info, statErr := os.Lstat(path)
+			if statErr != nil {
+				t.Fatal(statErr)
+			}
+			if info.Mode()&os.ModeNamedPipe == 0 {
+				t.Errorf("destination mode = %v, want named pipe", info.Mode())
+			}
+		})
+	}
+}
+
 func TestAlwaysSubstitutedSourceNoChangeWhenHashMatches(t *testing.T) {
 	dir := t.TempDir()
-	// Write identical resolved content; hash comparison now applies to substituted sources too.
+	// Identical resolved content exercises the substituted-source hash comparison.
 	content := mustContent(t, "SECURITY.md")
 	writeOnDisk(t, dir, "SECURITY.md", content)
 
@@ -162,7 +246,7 @@ func TestAlwaysSubstitutedSourceNoChangeWhenHashMatches(t *testing.T) {
 
 func TestAlwaysSubstitutedSourceOverwritesWhenDifferent(t *testing.T) {
 	dir := t.TempDir()
-	// On-disk content differs from resolved swatch content; expect overwrite.
+	// Different on-disk content reports an overwrite.
 	writeOnDisk(t, dir, "SECURITY.md", []byte("stale on-disk content"))
 
 	cfg := newConfig(entry("SECURITY.md", swatch.Always))
@@ -187,7 +271,6 @@ func TestRecutOverwritesExisting(t *testing.T) {
 	if results[0].Category != alter.WouldOverwrite {
 		t.Errorf("category = %q, want %q", results[0].Category, alter.WouldOverwrite)
 	}
-	// Verify file was actually overwritten.
 	data, err := os.ReadFile(filepath.Join(dir, ".gitignore"))
 	if err != nil {
 		t.Fatalf("file not found: %v", err)
@@ -280,8 +363,8 @@ func TestNeverSkipsRegardlessOfFileExistence(t *testing.T) {
 			if len(results) != 1 {
 				t.Fatalf("got %d results, want 1", len(results))
 			}
-			if results[0].Category != alter.SkippedNever {
-				t.Errorf("category = %q, want %q", results[0].Category, alter.SkippedNever)
+			if results[0].Category != alter.Skipped || results[0].Reason != alter.SkipModeNever {
+				t.Errorf("result = %+v, want skipped because mode is never", results[0])
 			}
 			if _, err := os.Stat(filepath.Join(dir, ".gitignore")); err == nil {
 				t.Error("never mode wrote file to disk")
@@ -299,8 +382,8 @@ func TestNeverSkipsRegardlessOfFileExistence(t *testing.T) {
 			if len(results) != 1 {
 				t.Fatalf("got %d results, want 1", len(results))
 			}
-			if results[0].Category != alter.SkippedNever {
-				t.Errorf("category = %q, want %q", results[0].Category, alter.SkippedNever)
+			if results[0].Category != alter.Skipped || results[0].Reason != alter.SkipModeNever {
+				t.Errorf("result = %+v, want skipped because mode is never", results[0])
 			}
 			data, err := os.ReadFile(filepath.Join(dir, ".gitignore"))
 			if err != nil {
@@ -310,180 +393,6 @@ func TestNeverSkipsRegardlessOfFileExistence(t *testing.T) {
 				t.Error("never mode modified existing file")
 			}
 		})
-	}
-}
-
-// triggeredSource is the swatch path that has a trigger condition.
-const triggeredSource = ".github/workflows/tailor-automerge.yml"
-
-func TestTriggeredMetFileAbsentWouldDeploy(t *testing.T) {
-	dir := t.TempDir()
-
-	cfg := newConfig(entry(triggeredSource, swatch.Triggered))
-	cfg.Repository = &model.RepositorySettings{AllowAutoMerge: ptr.Ptr(true)}
-
-	results, err := alter.ProcessSwatches(cfg, dir, alter.DryRun, &alter.TokenContext{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if results[0].Category != alter.WouldDeploy {
-		t.Errorf("category = %q, want %q", results[0].Category, alter.WouldDeploy)
-	}
-}
-
-func TestTriggeredMetFileExistsDifferentContent(t *testing.T) {
-	dir := t.TempDir()
-	writeOnDisk(t, dir, triggeredSource, []byte("old content"))
-
-	cfg := newConfig(entry(triggeredSource, swatch.Triggered))
-	cfg.Repository = &model.RepositorySettings{AllowAutoMerge: ptr.Ptr(true)}
-
-	results, err := alter.ProcessSwatches(cfg, dir, alter.DryRun, &alter.TokenContext{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if results[0].Category != alter.WouldDeploy {
-		t.Errorf("category = %q, want %q", results[0].Category, alter.WouldDeploy)
-	}
-}
-
-func TestTriggeredMetFileExistsSameContent(t *testing.T) {
-	dir := t.TempDir()
-	// Write resolved content (substitutions applied) so the hash matches.
-	raw := mustContent(t, triggeredSource)
-	resolved := bytes.ReplaceAll(raw, []byte("{{MERGE_STRATEGY}}"), []byte("--squash"))
-	writeOnDisk(t, dir, triggeredSource, resolved)
-
-	cfg := newConfig(entry(triggeredSource, swatch.Triggered))
-	cfg.Repository = &model.RepositorySettings{AllowAutoMerge: ptr.Ptr(true)}
-
-	results, err := alter.ProcessSwatches(cfg, dir, alter.DryRun, &alter.TokenContext{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Resolved content hashes equal; no overwrite needed.
-	if results[0].Category != alter.NoChange {
-		t.Errorf("category = %q, want %q", results[0].Category, alter.NoChange)
-	}
-}
-
-func TestTriggeredNotMetFileExistsDryRun(t *testing.T) {
-	dir := t.TempDir()
-	writeOnDisk(t, dir, triggeredSource, []byte("existing"))
-
-	cfg := newConfig(entry(triggeredSource, swatch.Triggered))
-	cfg.Repository = &model.RepositorySettings{AllowAutoMerge: ptr.Ptr(false)}
-
-	results, err := alter.ProcessSwatches(cfg, dir, alter.DryRun, &alter.TokenContext{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if results[0].Category != alter.WouldRemove {
-		t.Errorf("category = %q, want %q", results[0].Category, alter.WouldRemove)
-	}
-	// Dry run: file should still exist.
-	if _, err := os.Stat(filepath.Join(dir, triggeredSource)); err != nil {
-		t.Error("dry run removed file from disk")
-	}
-}
-
-func TestTriggeredNotMetFileExistsApply(t *testing.T) {
-	dir := t.TempDir()
-	writeOnDisk(t, dir, triggeredSource, []byte("existing"))
-
-	cfg := newConfig(entry(triggeredSource, swatch.Triggered))
-	cfg.Repository = &model.RepositorySettings{AllowAutoMerge: ptr.Ptr(false)}
-
-	results, err := alter.ProcessSwatches(cfg, dir, alter.Apply, &alter.TokenContext{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if results[0].Category != alter.Removed {
-		t.Errorf("category = %q, want %q", results[0].Category, alter.Removed)
-	}
-	// Apply: file should be removed.
-	if _, err := os.Stat(filepath.Join(dir, triggeredSource)); err == nil {
-		t.Error("apply mode did not remove file from disk")
-	}
-}
-
-func TestTriggeredNotMetFileAbsent(t *testing.T) {
-	dir := t.TempDir()
-
-	cfg := newConfig(entry(triggeredSource, swatch.Triggered))
-	cfg.Repository = &model.RepositorySettings{AllowAutoMerge: ptr.Ptr(false)}
-
-	results, err := alter.ProcessSwatches(cfg, dir, alter.DryRun, &alter.TokenContext{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if results[0].Category != alter.SkippedNever {
-		t.Errorf("category = %q, want %q", results[0].Category, alter.SkippedNever)
-	}
-}
-
-func TestRecutTriggeredConditionFalseSkips(t *testing.T) {
-	dir := t.TempDir()
-	writeOnDisk(t, dir, triggeredSource, []byte("existing content"))
-
-	cfg := newConfig(entry(triggeredSource, swatch.Triggered))
-	cfg.Repository = &model.RepositorySettings{AllowAutoMerge: ptr.Ptr(false)}
-
-	results, err := alter.ProcessSwatches(cfg, dir, alter.Recut, &alter.TokenContext{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(results) != 1 {
-		t.Fatalf("got %d results, want 1", len(results))
-	}
-	// When condition is false and file exists, recut should remove (like normal alter).
-	if results[0].Category != alter.Removed {
-		t.Errorf("category = %q, want %q", results[0].Category, alter.Removed)
-	}
-	// File should be removed.
-	if _, err := os.Stat(filepath.Join(dir, triggeredSource)); err == nil {
-		t.Error("recut with false trigger did not remove file")
-	}
-}
-
-func TestRecutTriggeredConditionFalseAbsentSkips(t *testing.T) {
-	dir := t.TempDir()
-
-	cfg := newConfig(entry(triggeredSource, swatch.Triggered))
-	cfg.Repository = &model.RepositorySettings{AllowAutoMerge: ptr.Ptr(false)}
-
-	results, err := alter.ProcessSwatches(cfg, dir, alter.Recut, &alter.TokenContext{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(results) != 1 {
-		t.Fatalf("got %d results, want 1", len(results))
-	}
-	// When condition is false and file absent, skip.
-	if results[0].Category != alter.SkippedNever {
-		t.Errorf("category = %q, want %q", results[0].Category, alter.SkippedNever)
-	}
-}
-
-func TestRecutTriggeredConditionTrueOverwrites(t *testing.T) {
-	dir := t.TempDir()
-	writeOnDisk(t, dir, triggeredSource, []byte("old content"))
-
-	cfg := newConfig(entry(triggeredSource, swatch.Triggered))
-	cfg.Repository = &model.RepositorySettings{AllowAutoMerge: ptr.Ptr(true)}
-
-	results, err := alter.ProcessSwatches(cfg, dir, alter.Recut, &alter.TokenContext{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(results) != 1 {
-		t.Fatalf("got %d results, want 1", len(results))
-	}
-	if results[0].Category != alter.WouldDeploy {
-		t.Errorf("category = %q, want %q", results[0].Category, alter.WouldDeploy)
-	}
-	if results[0].Annotation == "" {
-		t.Error("expected trigger annotation, got empty string")
 	}
 }
 
@@ -498,5 +407,135 @@ func TestNestedDestinationCreatesDirectories(t *testing.T) {
 	path := filepath.Join(dir, ".github/ISSUE_TEMPLATE/bug_report.yml")
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("nested file not created: %v", err)
+	}
+}
+
+func TestSwatchSymlinkParentEscapeRejectsWrite(t *testing.T) {
+	dir := t.TempDir()
+	outside := t.TempDir()
+	writeOnDisk(t, outside, "ISSUE_TEMPLATE/bug_report.yml", []byte("outside"))
+	symlinkOrSkip(t, outside, filepath.Join(dir, ".github"))
+
+	cfg := newConfig(entry(".github/ISSUE_TEMPLATE/bug_report.yml", swatch.Always))
+	_, err := alter.ProcessSwatches(cfg, dir, alter.Apply, &alter.TokenContext{})
+	if err == nil {
+		t.Fatal("expected symlink escape write error, got nil")
+	}
+
+	data, err := os.ReadFile(filepath.Join(outside, "ISSUE_TEMPLATE/bug_report.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "outside" {
+		t.Fatalf("outside file changed to %q", string(data))
+	}
+}
+
+func TestSwatchRejectsInRootRelativeParentSymlink(t *testing.T) {
+	tests := []struct {
+		name       string
+		alteration swatch.AlterationMode
+		mode       alter.ApplyMode
+	}{
+		{name: "always", alteration: swatch.Always, mode: alter.Apply},
+		{name: "first-fit", alteration: swatch.FirstFit, mode: alter.Apply},
+		{name: "recut", alteration: swatch.FirstFit, mode: alter.Recut},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			target := "managed/ISSUE_TEMPLATE/bug_report.yml"
+			writeOnDisk(t, dir, target, []byte("unchanged"))
+			symlinkOrSkip(t, "managed", filepath.Join(dir, ".github"))
+
+			cfg := newConfig(entry(".github/ISSUE_TEMPLATE/bug_report.yml", test.alteration))
+			_, err := alter.ProcessSwatches(cfg, dir, test.mode, &alter.TokenContext{})
+			if err == nil {
+				t.Fatal("ProcessSwatches() error = nil, want parent symlink error")
+			}
+			if !strings.Contains(err.Error(), `swatch parent ".github" is a symlink`) {
+				t.Errorf("error = %q, want parent symlink error", err)
+			}
+
+			data, readErr := os.ReadFile(filepath.Join(dir, target))
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if string(data) != "unchanged" {
+				t.Fatalf("target file changed to %q", data)
+			}
+		})
+	}
+}
+
+func TestSwatchReplacesDestinationSymlinkWithoutFollowingIt(t *testing.T) {
+	modes := []struct {
+		name       string
+		alteration swatch.AlterationMode
+		mode       alter.ApplyMode
+	}{
+		{name: "always", alteration: swatch.Always, mode: alter.Apply},
+		{name: "first-fit", alteration: swatch.FirstFit, mode: alter.Apply},
+		{name: "recut", alteration: swatch.FirstFit, mode: alter.Recut},
+	}
+	targets := []struct {
+		name   string
+		exists bool
+	}{
+		{name: "existing", exists: true},
+		{name: "dangling", exists: false},
+	}
+
+	for _, mode := range modes {
+		for _, target := range targets {
+			t.Run(mode.name+"/"+target.name, func(t *testing.T) {
+				dir := t.TempDir()
+				managed := ".github/ISSUE_TEMPLATE/bug_report.yml"
+				targetPath := ".github/ISSUE_TEMPLATE/target.yml"
+				if target.exists {
+					writeOnDisk(t, dir, targetPath, []byte("unchanged"))
+				} else if err := os.MkdirAll(filepath.Join(dir, filepath.Dir(managed)), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				symlinkOrSkip(t, filepath.Base(targetPath), filepath.Join(dir, managed))
+
+				cfg := newConfig(entry(managed, mode.alteration))
+				results, err := alter.ProcessSwatches(cfg, dir, mode.mode, &alter.TokenContext{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(results) != 1 || results[0].Category != alter.WouldCopy {
+					t.Errorf("results = %+v, want one would-copy result", results)
+				}
+
+				info, err := os.Lstat(filepath.Join(dir, managed))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !info.Mode().IsRegular() {
+					t.Errorf("managed path mode = %v, want regular file", info.Mode())
+				}
+				data, err := os.ReadFile(filepath.Join(dir, managed))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if want := mustContent(t, managed); !bytes.Equal(data, want) {
+					t.Error("managed path content does not match embedded swatch")
+				}
+
+				if target.exists {
+					data, err := os.ReadFile(filepath.Join(dir, targetPath))
+					if err != nil {
+						t.Fatal(err)
+					}
+					if string(data) != "unchanged" {
+						t.Errorf("target content = %q, want unchanged", data)
+					}
+				} else if _, err := os.Lstat(filepath.Join(dir, targetPath)); !os.IsNotExist(err) {
+					t.Errorf("dangling target exists or returned an unexpected error: %v", err)
+				}
+			})
+		}
 	}
 }

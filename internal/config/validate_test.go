@@ -1,13 +1,13 @@
 package config
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
 
 	"github.com/wimpysworld/tailor/internal/model"
-	"github.com/wimpysworld/tailor/internal/ptr"
 	"github.com/wimpysworld/tailor/internal/swatch"
 )
 
@@ -38,6 +38,24 @@ func TestValidatePathsRejectsUnknownPath(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "valid paths:") {
 		t.Errorf("error = %q, want it to list valid paths", err)
+	}
+}
+
+func TestValidatePathsRejectsRetiredAutomergeWorkflow(t *testing.T) {
+	const path = ".github/workflows/tailor-automerge.yml"
+	cfg := &Config{
+		Swatches: []SwatchEntry{
+			{Path: path, Alteration: swatch.Always},
+		},
+	}
+
+	err := ValidatePaths(cfg)
+	if err == nil {
+		t.Fatal("ValidatePaths() expected error for retired automerge workflow, got nil")
+	}
+	want := fmt.Sprintf("unrecognised swatch path %q in config; valid paths: %s", path, strings.Join(swatch.Paths(), ", "))
+	if err.Error() != want {
+		t.Errorf("error = %q, want %q", err, want)
 	}
 }
 
@@ -79,9 +97,9 @@ func TestValidateDuplicatePathsRejectsDuplicate(t *testing.T) {
 func TestValidateRepoSettingsAcceptsValidConfig(t *testing.T) {
 	cfg := &Config{
 		Repository: &model.RepositorySettings{
-			HasWiki:   ptr.Ptr(false),
-			HasIssues: ptr.Ptr(true),
-			Homepage:  ptr.Ptr("https://example.com"),
+			HasWiki:   new(false),
+			HasIssues: new(true),
+			Homepage:  new("https://example.com"),
 		},
 	}
 	if err := ValidateRepoSettings(cfg); err != nil {
@@ -96,11 +114,22 @@ func TestValidateRepoSettingsAcceptsNilRepository(t *testing.T) {
 	}
 }
 
+func TestValidateRepoSettingsAcceptsNormalisableSecuritySettings(t *testing.T) {
+	cfg := &Config{Repository: &model.RepositorySettings{
+		VulnerabilityAlertsEnabled:    new(false),
+		AutomatedSecurityFixesEnabled: new(true),
+	}}
+	if err := ValidateRepoSettings(cfg); err != nil {
+		t.Fatalf("ValidateRepoSettings() returned unexpected error: %v", err)
+	}
+}
+
 func TestValidateRepoSettingsRejectsUnknownSetting(t *testing.T) {
 	// Unmarshal YAML with an unknown key to populate the Extra map.
 	input := `repository:
   has_wiki: false
   bogus_setting: true
+  zzz_setting: false
 swatches: []
 `
 	var cfg Config
@@ -111,11 +140,10 @@ swatches: []
 	if err == nil {
 		t.Fatal("ValidateRepoSettings() expected error for unknown setting, got nil")
 	}
-	if !strings.Contains(err.Error(), `unrecognised repository setting "bogus_setting"`) {
-		t.Errorf("error = %q, want it to identify bogus_setting", err)
-	}
-	if !strings.Contains(err.Error(), "valid settings:") {
-		t.Errorf("error = %q, want it to list valid settings", err)
+	want := fmt.Sprintf("unrecognised repository setting %q in config; valid settings: %s",
+		"bogus_setting", strings.Join(repoSettingNames(), ", "))
+	if err.Error() != want {
+		t.Errorf("error = %q, want %q", err, want)
 	}
 }
 
@@ -127,6 +155,7 @@ func TestRepoSettingNamesContainsExpectedFields(t *testing.T) {
 		"allow_rebase_merge",
 		"allow_squash_merge",
 		"allow_update_branch",
+		"automated_security_fixes_enabled",
 		"can_approve_pull_request_reviews",
 		"default_workflow_permissions",
 		"delete_branch_on_merge",
@@ -138,9 +167,11 @@ func TestRepoSettingNamesContainsExpectedFields(t *testing.T) {
 		"homepage",
 		"merge_commit_message",
 		"merge_commit_title",
+		"private_vulnerability_reporting_enabled",
 		"squash_merge_commit_message",
 		"squash_merge_commit_title",
 		"topics",
+		"vulnerability_alerts_enabled",
 		"web_commit_signoff_required",
 	}
 	if len(names) != len(expected) {
@@ -153,42 +184,34 @@ func TestRepoSettingNamesContainsExpectedFields(t *testing.T) {
 	}
 }
 
-func TestValidateWorkflowPermissionsAcceptsRead(t *testing.T) {
-	cfg := &Config{Repository: &model.RepositorySettings{DefaultWorkflowPermissions: ptr.Ptr("read")}}
-	if err := ValidateWorkflowPermissions(cfg); err != nil {
-		t.Fatalf("ValidateWorkflowPermissions(read): %v", err)
+func TestValidateWorkflowPermissions(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     *Config
+		wantErr string
+	}{
+		{name: "accepts read", cfg: &Config{Repository: &model.RepositorySettings{DefaultWorkflowPermissions: new("read")}}},
+		{name: "accepts write", cfg: &Config{Repository: &model.RepositorySettings{DefaultWorkflowPermissions: new("write")}}},
+		{name: "accepts nil", cfg: &Config{Repository: &model.RepositorySettings{}}},
+		{name: "accepts nil repository", cfg: &Config{}},
+		{name: "rejects invalid", cfg: &Config{Repository: &model.RepositorySettings{DefaultWorkflowPermissions: new("admin")}}, wantErr: `"admin"`},
 	}
-}
-
-func TestValidateWorkflowPermissionsAcceptsWrite(t *testing.T) {
-	cfg := &Config{Repository: &model.RepositorySettings{DefaultWorkflowPermissions: ptr.Ptr("write")}}
-	if err := ValidateWorkflowPermissions(cfg); err != nil {
-		t.Fatalf("ValidateWorkflowPermissions(write): %v", err)
-	}
-}
-
-func TestValidateWorkflowPermissionsAcceptsNil(t *testing.T) {
-	cfg := &Config{Repository: &model.RepositorySettings{}}
-	if err := ValidateWorkflowPermissions(cfg); err != nil {
-		t.Fatalf("ValidateWorkflowPermissions(nil): %v", err)
-	}
-}
-
-func TestValidateWorkflowPermissionsAcceptsNilRepository(t *testing.T) {
-	cfg := &Config{}
-	if err := ValidateWorkflowPermissions(cfg); err != nil {
-		t.Fatalf("ValidateWorkflowPermissions(nil repo): %v", err)
-	}
-}
-
-func TestValidateWorkflowPermissionsRejectsInvalid(t *testing.T) {
-	cfg := &Config{Repository: &model.RepositorySettings{DefaultWorkflowPermissions: ptr.Ptr("admin")}}
-	err := ValidateWorkflowPermissions(cfg)
-	if err == nil {
-		t.Fatal("ValidateWorkflowPermissions(admin) expected error, got nil")
-	}
-	if !strings.Contains(err.Error(), `"admin"`) {
-		t.Errorf("error = %q, want it to mention the invalid value", err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateWorkflowPermissions(tt.cfg)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("ValidateWorkflowPermissions() returned unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("ValidateWorkflowPermissions() returned nil, want error")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("error = %q, want it to contain %q", err, tt.wantErr)
+			}
+		})
 	}
 }
 
@@ -236,6 +259,18 @@ func TestValidateTopicsRejectsStartingWithHyphen(t *testing.T) {
 	}
 }
 
+func TestValidateTopicsRejectsDuplicate(t *testing.T) {
+	topics := []string{"go", "cli", "go"}
+	cfg := &Config{Repository: &model.RepositorySettings{Topics: &topics}}
+	err := ValidateTopics(cfg)
+	if err == nil {
+		t.Fatal("ValidateTopics(duplicate) expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), `duplicate topic "go"`) {
+		t.Errorf("error = %q, want it to mention the duplicate topic", err)
+	}
+}
+
 func TestValidateTopicsRejectsTooLong(t *testing.T) {
 	topics := []string{strings.Repeat("a", 51)}
 	cfg := &Config{Repository: &model.RepositorySettings{Topics: &topics}}
@@ -280,6 +315,47 @@ func TestValidateLabelsAcceptsEmpty(t *testing.T) {
 	cfg := &Config{Labels: []model.LabelEntry{}}
 	if err := ValidateLabels(cfg); err != nil {
 		t.Fatalf("ValidateLabels(empty): %v", err)
+	}
+}
+
+func TestValidateLabelsCollectionLimit(t *testing.T) {
+	makeLabels := func(count int) []model.LabelEntry {
+		labels := make([]model.LabelEntry, 0, count)
+		for i := range count {
+			labels = append(labels, model.LabelEntry{
+				Name:        fmt.Sprintf("label-%d", i),
+				Color:       "d73a4a",
+				Description: "desc",
+			})
+		}
+		return labels
+	}
+
+	tests := []struct {
+		name    string
+		count   int
+		wantErr string
+	}{
+		{name: "at limit", count: 1000, wantErr: ""},
+		{name: "over limit", count: 1001, wantErr: "1001 entries exceed the maximum of 1000"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{Labels: makeLabels(tt.count)}
+			err := ValidateLabels(cfg)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("ValidateLabels(%d labels): %v", tt.count, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("ValidateLabels(%d labels) expected error, got nil", tt.count)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("error = %q, want %q", err, tt.wantErr)
+			}
+		})
 	}
 }
 
@@ -436,6 +512,51 @@ func TestValidateLabelsAcceptsMaxDescription(t *testing.T) {
 	}
 }
 
+func TestValidateLabelsMultibyteLimits(t *testing.T) {
+	tests := []struct {
+		name    string
+		label   model.LabelEntry
+		wantErr string
+	}{
+		{
+			name:  "multibyte name at limit",
+			label: model.LabelEntry{Name: strings.Repeat("é", 50), Color: "d73a4a", Description: "desc"},
+		},
+		{
+			name:    "multibyte name over limit",
+			label:   model.LabelEntry{Name: strings.Repeat("é", 51), Color: "d73a4a", Description: "desc"},
+			wantErr: "exceeds 50 characters",
+		},
+		{
+			name:  "multibyte description at limit",
+			label: model.LabelEntry{Name: "bug", Color: "d73a4a", Description: strings.Repeat("界", 100)},
+		},
+		{
+			name:    "multibyte description over limit",
+			label:   model.LabelEntry{Name: "bug", Color: "d73a4a", Description: strings.Repeat("界", 101)},
+			wantErr: "description exceeds 100 characters",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{Labels: []model.LabelEntry{tt.label}}
+			err := ValidateLabels(cfg)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("ValidateLabels(%s): %v", tt.name, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("ValidateLabels(%s) expected error, got nil", tt.name)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("error = %q, want %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestValidateLabelsRejectsDuplicateNames(t *testing.T) {
 	cfg := &Config{
 		Labels: []model.LabelEntry{
@@ -481,5 +602,149 @@ func TestValidateAllPassesSpecYAML(t *testing.T) {
 	}
 	if err := ValidateRepoSettings(&cfg); err != nil {
 		t.Errorf("ValidateRepoSettings: %v", err)
+	}
+}
+
+func TestValidateLabelsRejectsControlCharacters(t *testing.T) {
+	tests := []struct {
+		name  string
+		label model.LabelEntry
+		want  string
+	}{
+		{
+			name:  "ANSI CSI in name",
+			label: model.LabelEntry{Name: "\x1b[31mbug", Color: "d73a4a", Description: "Something is broken"},
+			want:  "name",
+		},
+		{
+			name:  "OSC 8 hyperlink in name",
+			label: model.LabelEntry{Name: "\x1b]8;;https://evil.example\x07bug", Color: "d73a4a", Description: "Something is broken"},
+			want:  "name",
+		},
+		{
+			name:  "OSC 52 clipboard write in name",
+			label: model.LabelEntry{Name: "\x1b]52;c;Zm9v\x07bug", Color: "d73a4a", Description: "Something is broken"},
+			want:  "name",
+		},
+		{
+			name:  "C1 CSI in name",
+			label: model.LabelEntry{Name: "\u009b31mbug", Color: "d73a4a", Description: "Something is broken"},
+			want:  "name",
+		},
+		{
+			name:  "carriage return in description",
+			label: model.LabelEntry{Name: "bug", Color: "d73a4a", Description: "safe\rspoofed"},
+			want:  "description",
+		},
+		{
+			name:  "line feed in description",
+			label: model.LabelEntry{Name: "bug", Color: "d73a4a", Description: "safe\ninjected"},
+			want:  "description",
+		},
+		{
+			name:  "C1 control in description",
+			label: model.LabelEntry{Name: "bug", Color: "d73a4a", Description: "safe\u009bspoofed"},
+			want:  "description",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{Labels: []model.LabelEntry{tt.label}}
+			err := ValidateLabels(cfg)
+			if err == nil {
+				t.Fatal("ValidateLabels() returned nil, want error")
+			}
+			if !strings.Contains(err.Error(), tt.want) || !strings.Contains(err.Error(), "control characters") {
+				t.Errorf("error = %q, want mention of %s control characters", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestValidateRepoStringSettingsRejectsControlCharacters(t *testing.T) {
+	tests := []struct {
+		name        string
+		description string
+	}{
+		{"ANSI CSI", "\x1b[31mred\x1b[0m"},
+		{"OSC 8 hyperlink", "\x1b]8;;https://evil.example\x07link"},
+		{"OSC 52 clipboard write", "\x1b]52;c;Zm9v\x07"},
+		{"carriage return", "safe\rspoofed"},
+		{"line feed", "safe\ninjected"},
+		{"C1 CSI", "safe\u009b31m"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{Repository: &model.RepositorySettings{Description: &tt.description}}
+			err := ValidateRepoStringSettings(cfg)
+			if err == nil {
+				t.Fatal("ValidateRepoStringSettings() returned nil, want error")
+			}
+			if !strings.Contains(err.Error(), "description") || !strings.Contains(err.Error(), "control characters") {
+				t.Errorf("error = %q, want mention of description control characters", err)
+			}
+		})
+	}
+}
+
+func TestValidateRepoStringSettingsAcceptsBenignValues(t *testing.T) {
+	description := "A CLI for managing project templates"
+	homepage := "https://example.com"
+	cfg := &Config{Repository: &model.RepositorySettings{
+		Description: &description,
+		Homepage:    &homepage,
+	}}
+	if err := ValidateRepoStringSettings(cfg); err != nil {
+		t.Fatalf("ValidateRepoStringSettings() returned unexpected error: %v", err)
+	}
+}
+
+func TestValidateRepoStringSettingsMergeEnums(t *testing.T) {
+	tests := []struct {
+		name    string
+		value   string
+		set     func(*model.RepositorySettings, *string)
+		wantErr string
+	}{
+		{name: "squash title PR_TITLE", value: "PR_TITLE", set: func(r *model.RepositorySettings, v *string) { r.SquashMergeCommitTitle = v }},
+		{name: "squash title COMMIT_OR_PR_TITLE", value: "COMMIT_OR_PR_TITLE", set: func(r *model.RepositorySettings, v *string) { r.SquashMergeCommitTitle = v }},
+		{name: "squash title invalid", value: "MERGE_MESSAGE", set: func(r *model.RepositorySettings, v *string) { r.SquashMergeCommitTitle = v }, wantErr: `invalid squash_merge_commit_title "MERGE_MESSAGE"; must be "PR_TITLE" or "COMMIT_OR_PR_TITLE"`},
+		{name: "squash message PR_BODY", value: "PR_BODY", set: func(r *model.RepositorySettings, v *string) { r.SquashMergeCommitMessage = v }},
+		{name: "squash message COMMIT_MESSAGES", value: "COMMIT_MESSAGES", set: func(r *model.RepositorySettings, v *string) { r.SquashMergeCommitMessage = v }},
+		{name: "squash message BLANK", value: "BLANK", set: func(r *model.RepositorySettings, v *string) { r.SquashMergeCommitMessage = v }},
+		{name: "squash message invalid", value: "PR_TITLE", set: func(r *model.RepositorySettings, v *string) { r.SquashMergeCommitMessage = v }, wantErr: `invalid squash_merge_commit_message "PR_TITLE"; must be "PR_BODY", "COMMIT_MESSAGES", or "BLANK"`},
+		{name: "merge title PR_TITLE", value: "PR_TITLE", set: func(r *model.RepositorySettings, v *string) { r.MergeCommitTitle = v }},
+		{name: "merge title MERGE_MESSAGE", value: "MERGE_MESSAGE", set: func(r *model.RepositorySettings, v *string) { r.MergeCommitTitle = v }},
+		{name: "merge title invalid", value: "COMMIT_OR_PR_TITLE", set: func(r *model.RepositorySettings, v *string) { r.MergeCommitTitle = v }, wantErr: `invalid merge_commit_title "COMMIT_OR_PR_TITLE"; must be "PR_TITLE" or "MERGE_MESSAGE"`},
+		{name: "merge message PR_TITLE", value: "PR_TITLE", set: func(r *model.RepositorySettings, v *string) { r.MergeCommitMessage = v }},
+		{name: "merge message PR_BODY", value: "PR_BODY", set: func(r *model.RepositorySettings, v *string) { r.MergeCommitMessage = v }},
+		{name: "merge message BLANK", value: "BLANK", set: func(r *model.RepositorySettings, v *string) { r.MergeCommitMessage = v }},
+		{name: "merge message invalid", value: "COMMIT_MESSAGES", set: func(r *model.RepositorySettings, v *string) { r.MergeCommitMessage = v }, wantErr: `invalid merge_commit_message "COMMIT_MESSAGES"; must be "PR_TITLE", "PR_BODY", or "BLANK"`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repository := &model.RepositorySettings{}
+			tt.set(repository, &tt.value)
+			err := ValidateRepoStringSettings(&Config{Repository: repository})
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("ValidateRepoStringSettings() returned unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("ValidateRepoStringSettings() returned nil, want error")
+			}
+			if err.Error() != tt.wantErr {
+				t.Errorf("error = %q, want %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateRepoStringSettingsAcceptsNilRepository(t *testing.T) {
+	if err := ValidateRepoStringSettings(&Config{}); err != nil {
+		t.Fatalf("ValidateRepoStringSettings() returned unexpected error: %v", err)
 	}
 }

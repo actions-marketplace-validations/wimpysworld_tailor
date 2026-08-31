@@ -7,7 +7,7 @@ on:
   pull_request:
     branches: [main]
   schedule:
-    - cron: "0 9 * * 0" # Weekly
+    - cron: "0 9 * * 0" # Sundays at 09:00 UTC
   workflow_dispatch:
 
 permissions: {}
@@ -23,20 +23,15 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      - run: go vet ./...
       - name: Check cyclomatic complexity
         run: |
-          go install github.com/fzipp/gocyclo/cmd/gocyclo@latest
-          gocyclo -top 20 -ignore '_test\.go$' -avg .
-      - name: Check ineffectual assignments
-        run: |
-          go install github.com/gordonklaus/ineffassign@latest
-          ineffassign ./...
-      - uses: golangci/golangci-lint-action@v9
+          go install github.com/fzipp/gocyclo/cmd/gocyclo@v0.6.0
+          gocyclo -over 30 -top 20 -avg -ignore '_test\.go$' .
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
 
   lint-actions:
     name: Lint Action ⚙️
@@ -44,8 +39,8 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
-      - uses: freerangebytes/setup-actionlint@v0.1.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: freerangebytes/setup-actionlint@32c8a5082cfc12c6aa71aeb22496372ea6ea15df # v0.1.2
       - name: Run actionlint
         run: |
           echo "::add-matcher::.github/actionlint-matcher.json"
@@ -57,11 +52,11 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      - uses: robherley/go-test-action@v0
+      - uses: robherley/go-test-action@2f859e0c8769d755d3174eecb9af8f64660827f3 # v1.1.0
         with:
           testArguments: -coverprofile=coverage.out -covermode=atomic ./...
           omit: untested
@@ -71,36 +66,25 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: linux
-            arch: amd64
-            runner: ubuntu-24.04
-          - os: linux
-            arch: arm64
-            runner: ubuntu-24.04-arm
-          - os: darwin
-            arch: amd64
-            runner: macos-15-intel
-          - os: darwin
-            arch: arm64
-            runner: macos-15
+        runner:
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+          - macos-15-intel
+          - macos-15
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
-      pull-requests: write
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
       - name: Test
         run: go test ./...
       - name: Build tailor
         run: go build -o tailor ./cmd/tailor
-      - name: Baste
-        run: ./tailor baste
-        env:
-          GH_TOKEN: ${{ secrets.TAILOR_TOKEN || secrets.GITHUB_TOKEN }}
+      - name: Measure
+        run: ./tailor measure
 
   security:
     name: Security 🔒
@@ -110,24 +94,25 @@ jobs:
       pull-requests: write
       security-events: write
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/dependency-review-action@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
         if: github.event_name == 'pull_request'
         with:
           fail-on-severity: moderate
-          allow-licenses: 0BSD, AFL-2.0, AFL-2.1, AFL-3.0, ANTLR-PD, ANTLR-PD-fallback, Apache-1.0, Apache-1.1, Apache-2.0, Artistic-2.0, BlueOak-1.0.0, BSD-1-Clause, BSD-2-Clause, BSD-2-Clause-FreeBSD, BSD-2-Clause-NetBSD, BSD-2-Clause-Patent, BSD-2-Clause-Views, BSD-3-Clause, BSD-3-Clause-Attribution, BSD-3-Clause-Clear, BSD-3-Clause-HP, BSD-3-Clause-LBNL, BSD-3-Clause-Modification, BSD-3-Clause-No-Nuclear-License-2014, BSD-3-Clause-No-Nuclear-Warranty, BSD-3-Clause-Open-MPI, BSD-3-Clause-Sun, BSD-4-Clause, BSD-4-Clause-Shortened, BSD-4-Clause-UC, BSD-Source-Code, BSL-1.0, bzip2-1.0.5, bzip2-1.0.6, CC0-1.0, CNRI-Python, CNRI-Python-GPL-Compatible, curl, ECL-2.0, FTL, HPND-Fenneberg-Livingston, HPND-sell-regexpr, HTMLTIDY, ICU, ImageMagick, Info-ZIP, Intel, Intel-ACPI, ISC, JasPer-2.0, Libpng, libpng-2.0, libtiff, Linux-OpenIB, LZMA-SDK-9.22, MIT, MIT-0, MIT-advertising, MIT-CMU, MIT-Modern-Variant, MIT-open-group, MITNFA, MS-PL, MulanPSL-1.0, MulanPSL-2.0, Multics, NCSA, Net-SNMP, NetCDF, NIST-Software, NTP, OLDAP-2.7, OLDAP-2.8, OpenSSL, PostgreSQL, PSF-2.0, SGI-B-2.0, SHL-0.5, Spencer-99, SunPro, TCL, TCP-wrappers, UCAR, Unicode-DFS-2015, Unicode-DFS-2016, UnixCrypt, Unlicense, UPL-1.0, W3C, X11, XFree86-1.1, Xnet, Zlib, zlib-acknowledgement, ZPL-2.0, ZPL-2.1
+          allow-licenses: 0BSD, AFL-2.0, AFL-2.1, AFL-3.0, ANTLR-PD, ANTLR-PD-fallback, Apache-1.0, Apache-1.1, Apache-2.0, Artistic-2.0, BlueOak-1.0.0, BSD-1-Clause, BSD-2-Clause, BSD-2-Clause-FreeBSD, BSD-2-Clause-NetBSD, BSD-2-Clause-Patent, BSD-2-Clause-Views, BSD-3-Clause, BSD-3-Clause-Attribution, BSD-3-Clause-Clear, BSD-3-Clause-HP, BSD-3-Clause-LBNL, BSD-3-Clause-Modification, BSD-3-Clause-No-Nuclear-License-2014, BSD-3-Clause-No-Nuclear-Warranty, BSD-3-Clause-Open-MPI, BSD-3-Clause-Sun, BSD-4-Clause, BSD-4-Clause-Shortened, BSD-4-Clause-UC, BSD-Source-Code, BSL-1.0, bzip2-1.0.5, bzip2-1.0.6, CC0-1.0, CNRI-Python, CNRI-Python-GPL-Compatible, curl, ECL-2.0, FTL, HPND-Fenneberg-Livingston, HPND-sell-regexpr, HTMLTIDY, ICU, ImageMagick, Info-ZIP, Intel, Intel-ACPI, ISC, JasPer-2.0, Libpng, libpng-2.0, libtiff, LicenseRef-scancode-google-patent-license-golang, Linux-OpenIB, LZMA-SDK-9.22, MIT, MIT-0, MIT-advertising, MIT-CMU, MIT-Modern-Variant, MIT-open-group, MITNFA, MS-PL, MulanPSL-1.0, MulanPSL-2.0, Multics, NCSA, Net-SNMP, NetCDF, NIST-Software, NTP, OLDAP-2.7, OLDAP-2.8, OpenSSL, PostgreSQL, PSF-2.0, SGI-B-2.0, SHL-0.5, Spencer-99, SunPro, TCL, TCP-wrappers, UCAR, Unicode-DFS-2015, Unicode-DFS-2016, UnixCrypt, Unlicense, UPL-1.0, W3C, X11, XFree86-1.1, Xnet, Zlib, zlib-acknowledgement, ZPL-2.0, ZPL-2.1
+          allow-dependencies-licenses: pkg:githubactions/DeterminateSystems/nix-installer-action
           fail-on-scopes: runtime
           comment-summary-in-pr: on-failure
 
       - name: Run govulncheck
-        uses: golang/govulncheck-action@master
+        uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1.1.0
         with:
           go-version-file: go.mod
           output-format: sarif
           output-file: govulncheck.sarif
 
       - name: Upload SARIF
-        uses: github/codeql-action/upload-sarif@v4.32.6
+        uses: github/codeql-action/upload-sarif@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
         if: always()
         with:
           sarif_file: govulncheck.sarif
@@ -150,25 +135,49 @@ jobs:
           fi
           echo "All jobs passed"
 
-  release:
-    name: Release 📦 (${{ matrix.mode }})
+  snapshot:
+    name: Snapshot 📦
     needs: [sentinel]
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - mode: release
-            args: release --clean
-            cosign: true
-          - mode: snapshot
-            args: release --snapshot --clean --skip=sign
-            cosign: false
     if: >-
       always()
       && needs.sentinel.result == 'success'
       && github.repository_owner == 'wimpysworld'
       && github.event_name != 'schedule'
-      && (startsWith(github.ref, 'refs/tags/') || github.ref == 'refs/heads/main' || github.event_name == 'pull_request')
+      && (github.ref == 'refs/heads/main' || github.event_name == 'pull_request')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          version: "v2.18.0"
+          args: release --snapshot --clean --skip=sign
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release:
+    name: Release 📦
+    needs: [sentinel]
+    if: >-
+      always()
+      && needs.sentinel.result == 'success'
+      && github.repository_owner == 'wimpysworld'
+      && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -176,31 +185,19 @@ jobs:
       pull-requests: write
       id-token: write
     steps:
-      - name: Check variant applies
-        id: guard
-        run: |
-          echo "run=true" >> "$GITHUB_OUTPUT"
-        if: >-
-          (matrix.mode == 'release' && startsWith(github.ref, 'refs/tags/'))
-          || (matrix.mode == 'snapshot' && (github.ref == 'refs/heads/main' || github.event_name == 'pull_request'))
-
-      - uses: actions/checkout@v6
-        if: steps.guard.outputs.run == 'true'
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-go@v6
-        if: steps.guard.outputs.run == 'true'
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
 
       - name: Set up Docker Buildx
-        if: steps.guard.outputs.run == 'true'
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       - name: Log in to GHCR
-        if: steps.guard.outputs.run == 'true'
-        uses: nick-fields/retry@v3
+        uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4.0.0
         with:
           timeout_seconds: 30
           max_attempts: 3
@@ -210,48 +207,21 @@ jobs:
             echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
       - name: Install Nix
-        if: steps.guard.outputs.run == 'true'
-        uses: DeterminateSystems/nix-installer-action@v21
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
 
       - name: Install cosign
-        if: steps.guard.outputs.run == 'true' && matrix.cosign
-        uses: sigstore/cosign-installer@v4.1.0
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Run GoReleaser
-        if: steps.guard.outputs.run == 'true'
-        uses: goreleaser/goreleaser-action@v7
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
-          version: "~> v2"
-          args: ${{ matrix.args }}
+          version: "v2.18.0"
+          args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAP_GITHUB_TOKEN: ${{ matrix.mode == 'release' && secrets.TAP_GITHUB_TOKEN || '' }}
-          AUR_KEY: ${{ matrix.mode == 'release' && secrets.AUR_KEY || '' }}
-
-      - name: Update floating major version tag
-        if: steps.guard.outputs.run == 'true' && matrix.mode == 'release' && !contains(github.ref_name, '-')
-        run: |
-          tag="${{ github.ref_name }}"
-          major="${tag%%.*}"
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -fa "${major}" -m "Update ${major} tag to ${tag}"
-          git push origin "${major}" --force
-
-      - name: Update flake.lock
-        if: steps.guard.outputs.run == 'true' && matrix.mode == 'release' && !contains(github.ref_name, '-')
-        uses: DeterminateSystems/update-flake-lock@v28
-        with:
-          inputs: nix-packages
-          base: main
-          branch: update_flake_lock_nix-packages
-          commit-msg: "flake.lock: update nix-packages"
-          pr-title: "chore(flake): update nix-packages input"
-          pr-body: |
-            Automated `flake.lock` update after a new Tailor release.
-
-            Updates the `nix-packages` flake input to pick up the latest Nix derivation published by GoReleaser.
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+          AUR_KEY: ${{ secrets.AUR_KEY }}
 
       - name: Update Go Report Card
-        if: steps.guard.outputs.run == 'true' && matrix.mode == 'release' && !contains(github.ref_name, '-')
+        if: ${{ !contains(github.ref_name, '-') }}
         run: curl -X POST -F "repo=github.com/$GITHUB_REPOSITORY" https://goreportcard.com/checks || true

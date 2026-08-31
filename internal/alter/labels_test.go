@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -52,7 +53,7 @@ func labelsServer(current []model.LabelEntry, writeCalled *atomic.Int32) *httpte
 // pathIsLabel reports whether the path matches /repos/testowner/testrepo/labels/*.
 func pathIsLabel(path string) bool {
 	const prefix = "/repos/testowner/testrepo/labels/"
-	return len(path) > len(prefix) && path[:len(prefix)] == prefix
+	return len(path) > len(prefix) && strings.HasPrefix(path, prefix)
 }
 
 func failingLabelsServer() *httptest.Server {
@@ -64,7 +65,7 @@ func failingLabelsServer() *httptest.Server {
 
 func TestProcessLabelsNoLabels(t *testing.T) {
 	cfg := &config.Config{}
-	results, err := alter.ProcessLabels(cfg, alter.DryRun, nil, "", "", false)
+	results, err := alter.ProcessLabels(cfg, alter.DryRun, repoTarget(nil, "", "", false))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -82,13 +83,10 @@ func TestProcessLabelsNoRepoContext(t *testing.T) {
 		},
 	}
 
-	var results []alter.LabelResult
-	var err error
-
-	output := captureStderr(t, func() {
-		results, err = alter.ProcessLabels(cfg, alter.DryRun, nil, "", "", false)
-	})
-
+	var stderr strings.Builder
+	target := repoTarget(nil, "", "", false)
+	target.Stderr = &stderr
+	results, err := alter.ProcessLabels(cfg, alter.DryRun, target)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -97,8 +95,8 @@ func TestProcessLabelsNoRepoContext(t *testing.T) {
 	}
 
 	want := "No GitHub repository context found."
-	if output == "" || !containsSubstring(output, want) {
-		t.Errorf("stderr = %q, want substring %q", output, want)
+	if stderr.Len() == 0 || !strings.Contains(stderr.String(), want) {
+		t.Errorf("stderr = %q, want substring %q", stderr.String(), want)
 	}
 }
 
@@ -116,7 +114,7 @@ func TestProcessLabelsWouldCreate(t *testing.T) {
 		},
 	}
 
-	results, err := alter.ProcessLabels(cfg, alter.DryRun, client, "testowner", "testrepo", true)
+	results, err := alter.ProcessLabels(cfg, alter.DryRun, repoTarget(client, "testowner", "testrepo", true))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -147,7 +145,7 @@ func TestProcessLabelsWouldUpdate(t *testing.T) {
 		},
 	}
 
-	results, err := alter.ProcessLabels(cfg, alter.DryRun, client, "testowner", "testrepo", true)
+	results, err := alter.ProcessLabels(cfg, alter.DryRun, repoTarget(client, "testowner", "testrepo", true))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -175,7 +173,7 @@ func TestProcessLabelsNoChange(t *testing.T) {
 		},
 	}
 
-	results, err := alter.ProcessLabels(cfg, alter.DryRun, client, "testowner", "testrepo", true)
+	results, err := alter.ProcessLabels(cfg, alter.DryRun, repoTarget(client, "testowner", "testrepo", true))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -203,7 +201,7 @@ func TestProcessLabelsCaseInsensitiveMatch(t *testing.T) {
 		},
 	}
 
-	results, err := alter.ProcessLabels(cfg, alter.DryRun, client, "testowner", "testrepo", true)
+	results, err := alter.ProcessLabels(cfg, alter.DryRun, repoTarget(client, "testowner", "testrepo", true))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -230,7 +228,7 @@ func TestProcessLabelsApplyCallsAPI(t *testing.T) {
 		},
 	}
 
-	_, err := alter.ProcessLabels(cfg, alter.Apply, client, "testowner", "testrepo", true)
+	_, err := alter.ProcessLabels(cfg, alter.Apply, repoTarget(client, "testowner", "testrepo", true))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -254,7 +252,7 @@ func TestProcessLabelsRecutCallsAPI(t *testing.T) {
 		},
 	}
 
-	_, err := alter.ProcessLabels(cfg, alter.Recut, client, "testowner", "testrepo", true)
+	_, err := alter.ProcessLabels(cfg, alter.Recut, repoTarget(client, "testowner", "testrepo", true))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -278,7 +276,7 @@ func TestProcessLabelsDryRunDoesNotCallAPI(t *testing.T) {
 		},
 	}
 
-	_, err := alter.ProcessLabels(cfg, alter.DryRun, client, "testowner", "testrepo", true)
+	_, err := alter.ProcessLabels(cfg, alter.DryRun, repoTarget(client, "testowner", "testrepo", true))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -306,7 +304,7 @@ func TestProcessLabelsNoApplyWhenAllMatch(t *testing.T) {
 		},
 	}
 
-	_, err := alter.ProcessLabels(cfg, alter.Apply, client, "testowner", "testrepo", true)
+	_, err := alter.ProcessLabels(cfg, alter.Apply, repoTarget(client, "testowner", "testrepo", true))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -328,7 +326,7 @@ func TestProcessLabelsErrorPropagated(t *testing.T) {
 		},
 	}
 
-	_, err := alter.ProcessLabels(cfg, alter.DryRun, client, "testowner", "testrepo", true)
+	_, err := alter.ProcessLabels(cfg, alter.DryRun, repoTarget(client, "testowner", "testrepo", true))
 	if err == nil {
 		t.Fatal("expected error from API failure, got nil")
 	}
@@ -353,26 +351,22 @@ func TestProcessLabelsMixedResults(t *testing.T) {
 		},
 	}
 
-	results, err := alter.ProcessLabels(cfg, alter.DryRun, client, "testowner", "testrepo", true)
+	results, err := alter.ProcessLabels(cfg, alter.DryRun, repoTarget(client, "testowner", "testrepo", true))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(results) != 3 {
-		t.Fatalf("got %d results, want 3", len(results))
+	want := []alter.LabelResult{
+		{Name: "bug", Category: alter.LabelNoChange, Value: "#d73a4a \"Something isn't working\""},
+		{Name: "enhancement", Category: alter.WouldUpdate, Value: "#a2eeef \"New feature\""},
+		{Name: "documentation", Category: alter.WouldCreate, Value: "#0075ca \"Docs improvements\""},
 	}
-
-	counts := map[alter.LabelCategory]int{}
-	for _, r := range results {
-		counts[r.Category]++
+	if len(results) != len(want) {
+		t.Fatalf("got %d results, want %d", len(results), len(want))
 	}
-	if counts[alter.LabelNoChange] != 1 {
-		t.Errorf("LabelNoChange count = %d, want 1", counts[alter.LabelNoChange])
-	}
-	if counts[alter.WouldUpdate] != 1 {
-		t.Errorf("WouldUpdate count = %d, want 1", counts[alter.WouldUpdate])
-	}
-	if counts[alter.WouldCreate] != 1 {
-		t.Errorf("WouldCreate count = %d, want 1", counts[alter.WouldCreate])
+	for i := range want {
+		if results[i] != want[i] {
+			t.Errorf("result %d = %#v, want %#v", i, results[i], want[i])
+		}
 	}
 }
 
@@ -392,7 +386,7 @@ func TestProcessLabelsUpdateDescriptionOnly(t *testing.T) {
 		},
 	}
 
-	results, err := alter.ProcessLabels(cfg, alter.DryRun, client, "testowner", "testrepo", true)
+	results, err := alter.ProcessLabels(cfg, alter.DryRun, repoTarget(client, "testowner", "testrepo", true))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -420,7 +414,7 @@ func TestProcessLabelsColorCaseInsensitive(t *testing.T) {
 		},
 	}
 
-	results, err := alter.ProcessLabels(cfg, alter.DryRun, client, "testowner", "testrepo", true)
+	results, err := alter.ProcessLabels(cfg, alter.DryRun, repoTarget(client, "testowner", "testrepo", true))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -449,7 +443,7 @@ func TestProcessLabelsCasingOnlyApplyCallsAPI(t *testing.T) {
 		},
 	}
 
-	_, err := alter.ProcessLabels(cfg, alter.Apply, client, "testowner", "testrepo", true)
+	_, err := alter.ProcessLabels(cfg, alter.Apply, repoTarget(client, "testowner", "testrepo", true))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -475,7 +469,7 @@ func TestProcessLabelsExactNameNoChange(t *testing.T) {
 		},
 	}
 
-	results, err := alter.ProcessLabels(cfg, alter.Apply, client, "testowner", "testrepo", true)
+	results, err := alter.ProcessLabels(cfg, alter.Apply, repoTarget(client, "testowner", "testrepo", true))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -527,7 +521,7 @@ func partialLabelsServer(current []model.LabelEntry) *httptest.Server {
 func TestProcessLabelsPartialApplicationWithSkipped(t *testing.T) {
 	ghfake.FakeRepo(t, "testowner", "testrepo")
 
-	// No current labels: both will be created. First POST returns 403.
+	// With no current labels, both desired labels need create requests. The first POST returns 403.
 	current := []model.LabelEntry{}
 	server := partialLabelsServer(current)
 	t.Cleanup(server.Close)
@@ -540,7 +534,7 @@ func TestProcessLabelsPartialApplicationWithSkipped(t *testing.T) {
 		},
 	}
 
-	results, err := alter.ProcessLabels(cfg, alter.Apply, client, "testowner", "testrepo", true)
+	results, err := alter.ProcessLabels(cfg, alter.Apply, repoTarget(client, "testowner", "testrepo", true))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -608,12 +602,12 @@ func TestProcessLabelsSkipDoesNotAbort(t *testing.T) {
 		},
 	}
 
-	results, err := alter.ProcessLabels(cfg, alter.Apply, client, "testowner", "testrepo", true)
+	results, err := alter.ProcessLabels(cfg, alter.Apply, repoTarget(client, "testowner", "testrepo", true))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// The PATCH for beta should still have been called despite alpha's 403.
+	// Beta is still patched despite alpha's 403.
 	if patchCalled.Load() == 0 {
 		t.Error("expected PATCH call for beta, but none received")
 	}
@@ -628,18 +622,4 @@ func TestProcessLabelsSkipDoesNotAbort(t *testing.T) {
 	if !hasSkip {
 		t.Error("expected at least one LabelSkipScope result")
 	}
-}
-
-// containsSubstring is a test helper for substring matching.
-func containsSubstring(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsSubstringSearch(s, substr))
-}
-
-func containsSubstringSearch(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }

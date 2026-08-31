@@ -6,40 +6,14 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
-	"github.com/cli/go-gh/v2/pkg/api"
 	"github.com/wimpysworld/tailor/internal/model"
-	"github.com/wimpysworld/tailor/internal/ptr"
 	"github.com/wimpysworld/tailor/internal/testutil"
 )
 
-// testTransport redirects all requests to the test server, preserving the
-// original request path so the test handler can route by path.
-type testTransport struct {
-	server *httptest.Server
-}
-
-func (t *testTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	req.URL.Scheme = "http"
-	req.URL.Host = t.server.Listener.Addr().String()
-	return http.DefaultTransport.RoundTrip(req)
-}
-
-// newTestClient creates an api.RESTClient that sends all requests to the
-// given test server.
-func newTestClient(t *testing.T, server *httptest.Server) *api.RESTClient {
-	t.Helper()
-	client, err := api.NewRESTClient(api.ClientOptions{
-		Host:      "github.com",
-		AuthToken: "test-token",
-		Transport: &testTransport{server: server},
-	})
-	if err != nil {
-		t.Fatalf("NewRESTClient: %v", err)
-	}
-	return client
-}
+var newTestClient = testutil.NewTestClient
 
 const fullRepoJSON = `{
 	"description": "A tailor for your repos",
@@ -59,7 +33,8 @@ const fullRepoJSON = `{
 	"allow_update_branch": true,
 	"allow_auto_merge": true,
 	"web_commit_signoff_required": false,
-	"topics": ["go", "cli-tool"]
+	"topics": ["go", "cli-tool"],
+	"permissions": {"admin": true}
 }`
 
 const (
@@ -68,9 +43,6 @@ const (
 )
 
 func TestReadRepoSettings(t *testing.T) {
-	ResetTokenProbe()
-	t.Cleanup(ResetTokenProbe)
-
 	tests := []struct {
 		name        string
 		repoJSON    string
@@ -183,36 +155,36 @@ func TestReadRepoSettings(t *testing.T) {
 			}))
 			t.Cleanup(server.Close)
 
-			client := newTestClient(t, server)
+			client := testutil.NewTestClient(t, server)
 			settings, _, err := ReadRepoSettings(client, "testowner", "testrepo")
 			if err != nil {
 				t.Fatalf("ReadRepoSettings() error: %v", err)
 			}
 
 			// description and homepage
-			testutil.AssertStringPtr(t, settings.Description, tt.wantDescNil, tt.wantDesc, "description")
-			testutil.AssertStringPtr(t, settings.Homepage, tt.wantHomeNil, tt.wantHome, "homepage")
+			testutil.AssertPtr(t, settings.Description, tt.wantDescNil, tt.wantDesc, "description")
+			testutil.AssertPtr(t, settings.Homepage, tt.wantHomeNil, tt.wantHome, "homepage")
 
 			// bool fields
-			testutil.AssertBoolPtr(t, settings.HasWiki, false, tt.wantWiki, "has_wiki")
-			testutil.AssertBoolPtr(t, settings.HasDiscussions, false, tt.wantDisc, "has_discussions")
-			testutil.AssertBoolPtr(t, settings.HasProjects, false, tt.wantProj, "has_projects")
-			testutil.AssertBoolPtr(t, settings.HasIssues, false, tt.wantIssues, "has_issues")
-			testutil.AssertBoolPtr(t, settings.AllowMergeCommit, false, tt.wantMerge, "allow_merge_commit")
-			testutil.AssertBoolPtr(t, settings.AllowSquashMerge, false, tt.wantSquash, "allow_squash_merge")
-			testutil.AssertBoolPtr(t, settings.AllowRebaseMerge, false, tt.wantRebase, "allow_rebase_merge")
-			testutil.AssertBoolPtr(t, settings.DeleteBranchOnMerge, false, tt.wantDelete, "delete_branch_on_merge")
-			testutil.AssertBoolPtr(t, settings.AllowUpdateBranch, false, tt.wantUpdate, "allow_update_branch")
-			testutil.AssertBoolPtr(t, settings.AllowAutoMerge, false, tt.wantAuto, "allow_auto_merge")
-			testutil.AssertBoolPtr(t, settings.WebCommitSignoffRequired, false, tt.wantSignoff, "web_commit_signoff_required")
-			testutil.AssertBoolPtr(t, settings.CanApprovePullRequestReviews, false, tt.wantCanApprove, "can_approve_pull_request_reviews")
+			testutil.AssertPtr(t, settings.HasWiki, false, tt.wantWiki, "has_wiki")
+			testutil.AssertPtr(t, settings.HasDiscussions, false, tt.wantDisc, "has_discussions")
+			testutil.AssertPtr(t, settings.HasProjects, false, tt.wantProj, "has_projects")
+			testutil.AssertPtr(t, settings.HasIssues, false, tt.wantIssues, "has_issues")
+			testutil.AssertPtr(t, settings.AllowMergeCommit, false, tt.wantMerge, "allow_merge_commit")
+			testutil.AssertPtr(t, settings.AllowSquashMerge, false, tt.wantSquash, "allow_squash_merge")
+			testutil.AssertPtr(t, settings.AllowRebaseMerge, false, tt.wantRebase, "allow_rebase_merge")
+			testutil.AssertPtr(t, settings.DeleteBranchOnMerge, false, tt.wantDelete, "delete_branch_on_merge")
+			testutil.AssertPtr(t, settings.AllowUpdateBranch, false, tt.wantUpdate, "allow_update_branch")
+			testutil.AssertPtr(t, settings.AllowAutoMerge, false, tt.wantAuto, "allow_auto_merge")
+			testutil.AssertPtr(t, settings.WebCommitSignoffRequired, false, tt.wantSignoff, "web_commit_signoff_required")
+			testutil.AssertPtr(t, settings.CanApprovePullRequestReviews, false, tt.wantCanApprove, "can_approve_pull_request_reviews")
 
 			// string fields (always non-nil)
-			testutil.AssertStringPtr(t, settings.DefaultWorkflowPermissions, false, tt.wantWfPerms, "default_workflow_permissions")
-			testutil.AssertStringPtr(t, settings.SquashMergeCommitTitle, false, tt.wantSqTitle, "squash_merge_commit_title")
-			testutil.AssertStringPtr(t, settings.SquashMergeCommitMessage, false, tt.wantSqMsg, "squash_merge_commit_message")
-			testutil.AssertStringPtr(t, settings.MergeCommitTitle, false, tt.wantMcTitle, "merge_commit_title")
-			testutil.AssertStringPtr(t, settings.MergeCommitMessage, false, tt.wantMcMsg, "merge_commit_message")
+			testutil.AssertPtr(t, settings.DefaultWorkflowPermissions, false, tt.wantWfPerms, "default_workflow_permissions")
+			testutil.AssertPtr(t, settings.SquashMergeCommitTitle, false, tt.wantSqTitle, "squash_merge_commit_title")
+			testutil.AssertPtr(t, settings.SquashMergeCommitMessage, false, tt.wantSqMsg, "squash_merge_commit_message")
+			testutil.AssertPtr(t, settings.MergeCommitTitle, false, tt.wantMcTitle, "merge_commit_title")
+			testutil.AssertPtr(t, settings.MergeCommitMessage, false, tt.wantMcMsg, "merge_commit_message")
 
 			// topics
 			if tt.wantTopics == nil {
@@ -237,17 +209,62 @@ func TestReadRepoSettings(t *testing.T) {
 	}
 }
 
-func TestReadRepoSettingsRepoAPIError(t *testing.T) {
-	ResetTokenProbe()
-	t.Cleanup(ResetTokenProbe)
+func TestReadRepoSettingsIgnoresGitHubActionsEnvironment(t *testing.T) {
+	t.Setenv("GITHUB_ACTIONS", "true")
+	t.Setenv("GITHUB_REPOSITORY_OWNER", "actions-owner")
 
+	var userRequests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/user":
+			userRequests.Add(1)
+			w.WriteHeader(http.StatusForbidden)
+			fmt.Fprint(w, `{"message": "Resource not accessible by integration"}`)
+		case "/repos/testowner/testrepo":
+			fmt.Fprint(w, `{"permissions":{"admin":true}}`)
+		case "/repos/testowner/testrepo/actions/permissions/workflow":
+			fmt.Fprint(w, wfPermsReadJSON)
+		case "/repos/testowner/testrepo/private-vulnerability-reporting":
+			fmt.Fprint(w, `{"enabled":false}`)
+		case "/repos/testowner/testrepo/vulnerability-alerts":
+			w.WriteHeader(http.StatusNoContent)
+		case "/repos/testowner/testrepo/automated-security-fixes":
+			fmt.Fprint(w, `{"enabled":false,"paused":false}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	client := testutil.NewTestClient(t, server)
+	settings, warnings, err := ReadRepoSettings(client, "testowner", "testrepo")
+	if err != nil {
+		t.Fatalf("ReadRepoSettings() error: %v", err)
+	}
+	if got := userRequests.Load(); got != 0 {
+		t.Errorf("ReadRepoSettings() made %d /user requests, want 0", got)
+	}
+	if len(warnings) != 0 {
+		t.Errorf("ReadRepoSettings() warnings = %v, want none", warnings)
+	}
+
+	testutil.AssertPtr(t, settings.AllowAutoMerge, false, false, "allow_auto_merge")
+	testutil.AssertPtr(t, settings.AllowRebaseMerge, false, false, "allow_rebase_merge")
+	testutil.AssertPtr(t, settings.AllowSquashMerge, false, false, "allow_squash_merge")
+	testutil.AssertPtr(t, settings.AllowUpdateBranch, false, false, "allow_update_branch")
+	testutil.AssertPtr(t, settings.DeleteBranchOnMerge, false, false, "delete_branch_on_merge")
+	testutil.AssertPtr(t, settings.SquashMergeCommitMessage, false, "", "squash_merge_commit_message")
+	testutil.AssertPtr(t, settings.SquashMergeCommitTitle, false, "", "squash_merge_commit_title")
+}
+
+func TestReadRepoSettingsRepoAPIError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 		fmt.Fprint(w, `{"message": "Not Found"}`)
 	}))
 	t.Cleanup(server.Close)
 
-	client := newTestClient(t, server)
+	client := testutil.NewTestClient(t, server)
 	_, _, err := ReadRepoSettings(client, "testowner", "testrepo")
 	if err == nil {
 		t.Fatal("ReadRepoSettings() expected error, got nil")
@@ -255,9 +272,6 @@ func TestReadRepoSettingsRepoAPIError(t *testing.T) {
 }
 
 func TestReadRepoSettingsWFPerms403GracefulDegradation(t *testing.T) {
-	ResetTokenProbe()
-	t.Cleanup(ResetTokenProbe)
-
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/repos/testowner/testrepo":
@@ -271,7 +285,7 @@ func TestReadRepoSettingsWFPerms403GracefulDegradation(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	client := newTestClient(t, server)
+	client := testutil.NewTestClient(t, server)
 	settings, _, err := ReadRepoSettings(client, "testowner", "testrepo")
 	if err != nil {
 		t.Fatalf("ReadRepoSettings() unexpected error: %v", err)
@@ -285,18 +299,12 @@ func TestReadRepoSettingsWFPerms403GracefulDegradation(t *testing.T) {
 		t.Errorf("CanApprovePullRequestReviews = %v, want nil", *settings.CanApprovePullRequestReviews)
 	}
 	// Other fields should be populated.
-	testutil.AssertStringPtr(t, settings.Description, false, "A tailor for your repos", "description")
+	testutil.AssertPtr(t, settings.Description, false, "A tailor for your repos", "description")
 }
 
 func TestReadRepoSettingsAll403GracefulDegradation(t *testing.T) {
-	ResetTokenProbe()
-	t.Cleanup(ResetTokenProbe)
-
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/user":
-			// Return 200 so IsInstallationToken detects a PAT.
-			fmt.Fprint(w, `{"login": "testuser"}`)
 		case "/repos/testowner/testrepo":
 			fmt.Fprint(w, fullRepoJSON)
 		default:
@@ -306,7 +314,7 @@ func TestReadRepoSettingsAll403GracefulDegradation(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	client := newTestClient(t, server)
+	client := testutil.NewTestClient(t, server)
 	settings, warnings, err := ReadRepoSettings(client, "testowner", "testrepo")
 	if err != nil {
 		t.Fatalf("ReadRepoSettings() unexpected error: %v", err)
@@ -319,19 +327,19 @@ func TestReadRepoSettingsAll403GracefulDegradation(t *testing.T) {
 	if settings.CanApprovePullRequestReviews != nil {
 		t.Errorf("CanApprovePullRequestReviews = %v, want nil", *settings.CanApprovePullRequestReviews)
 	}
-	// One warning: workflow permissions.
-	if len(warnings) != 1 {
-		t.Errorf("expected 1 warning, got %d", len(warnings))
+	if settings.PrivateVulnerabilityReportEnabled != nil || settings.VulnerabilityAlertsEnabled != nil || settings.AutomatedSecurityFixesEnabled != nil {
+		t.Error("security settings are non-nil after access failures")
+	}
+	// Four warnings: three security settings and workflow permissions.
+	if len(warnings) != 4 {
+		t.Errorf("expected 4 warnings, got %d", len(warnings))
 	}
 	// Core repo fields should still be populated.
-	testutil.AssertStringPtr(t, settings.Description, false, "A tailor for your repos", "description")
-	testutil.AssertBoolPtr(t, settings.HasWiki, false, false, "has_wiki")
+	testutil.AssertPtr(t, settings.Description, false, "A tailor for your repos", "description")
+	testutil.AssertPtr(t, settings.HasWiki, false, false, "has_wiki")
 }
 
 func TestReadRepoSettingsNon403StillFails(t *testing.T) {
-	ResetTokenProbe()
-	t.Cleanup(ResetTokenProbe)
-
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/repos/testowner/testrepo":
@@ -345,10 +353,144 @@ func TestReadRepoSettingsNon403StillFails(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	client := newTestClient(t, server)
+	client := testutil.NewTestClient(t, server)
 	_, _, err := ReadRepoSettings(client, "testowner", "testrepo")
 	if err == nil {
 		t.Fatal("ReadRepoSettings() expected error for 500, got nil")
+	}
+}
+
+func TestReadRepoSettingsSecurityFeatures(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/testowner/testrepo":
+			fmt.Fprint(w, fullRepoJSON)
+		case "/repos/testowner/testrepo/private-vulnerability-reporting":
+			fmt.Fprint(w, `{"enabled":true}`)
+		case "/repos/testowner/testrepo/vulnerability-alerts":
+			w.WriteHeader(http.StatusNoContent)
+		case "/repos/testowner/testrepo/automated-security-fixes":
+			fmt.Fprint(w, `{"enabled":false,"paused":true}`)
+		case "/repos/testowner/testrepo/actions/permissions/workflow":
+			fmt.Fprint(w, wfPermsReadJSON)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	settings, warnings, err := ReadRepoSettings(testutil.NewTestClient(t, server), "testowner", "testrepo")
+	if err != nil {
+		t.Fatalf("ReadRepoSettings() error: %v", err)
+	}
+	if len(warnings) != 0 {
+		t.Fatalf("warnings = %v, want none", warnings)
+	}
+	testutil.AssertPtr(t, settings.PrivateVulnerabilityReportEnabled, false, true, "private_vulnerability_reporting_enabled")
+	testutil.AssertPtr(t, settings.VulnerabilityAlertsEnabled, false, true, "vulnerability_alerts_enabled")
+	testutil.AssertPtr(t, settings.AutomatedSecurityFixesEnabled, false, false, "automated_security_fixes_enabled")
+}
+
+func TestReadRepoSettingsSecurityFeature404HandlingForAdmin(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/testowner/testrepo":
+			fmt.Fprint(w, fullRepoJSON)
+		case "/repos/testowner/testrepo/actions/permissions/workflow":
+			fmt.Fprint(w, wfPermsReadJSON)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			fmt.Fprint(w, `{"message":"Not Found"}`)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	settings, warnings, err := ReadRepoSettings(testutil.NewTestClient(t, server), "testowner", "testrepo")
+	if err != nil {
+		t.Fatalf("ReadRepoSettings() error: %v", err)
+	}
+	if len(warnings) != 1 {
+		t.Fatalf("warnings = %v, want private reporting access warning", warnings)
+	}
+	testutil.AssertPtr(t, settings.PrivateVulnerabilityReportEnabled, true, false, "private_vulnerability_reporting_enabled")
+	testutil.AssertPtr(t, settings.VulnerabilityAlertsEnabled, false, false, "vulnerability_alerts_enabled")
+	testutil.AssertPtr(t, settings.AutomatedSecurityFixesEnabled, false, false, "automated_security_fixes_enabled")
+}
+
+func TestReadRepoSettingsSecurityFeature404UnknownWithoutConfirmedAdminAccess(t *testing.T) {
+	tests := []struct {
+		name           string
+		repo           string
+		workflowStatus int
+		wantWarnings   int
+	}{
+		{name: "non-admin", repo: `{"permissions":{"admin":false}}`, workflowStatus: http.StatusOK, wantWarnings: 3},
+		{name: "administration read denied", repo: `{"permissions":{"admin":true}}`, workflowStatus: http.StatusForbidden, wantWarnings: 4},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/repos/testowner/testrepo" {
+					fmt.Fprint(w, tt.repo)
+					return
+				}
+				if r.URL.Path == "/repos/testowner/testrepo/actions/permissions/workflow" && tt.workflowStatus != http.StatusOK {
+					w.WriteHeader(tt.workflowStatus)
+					fmt.Fprint(w, `{"message":"Forbidden"}`)
+					return
+				}
+				if r.URL.Path == "/repos/testowner/testrepo/actions/permissions/workflow" {
+					fmt.Fprint(w, wfPermsReadJSON)
+					return
+				}
+				w.WriteHeader(http.StatusNotFound)
+				fmt.Fprint(w, `{"message":"Not Found"}`)
+			}))
+			t.Cleanup(server.Close)
+
+			settings, warnings, err := ReadRepoSettings(testutil.NewTestClient(t, server), "testowner", "testrepo")
+			if err != nil {
+				t.Fatalf("ReadRepoSettings() error: %v", err)
+			}
+			if len(warnings) != tt.wantWarnings {
+				t.Fatalf("warnings = %v, want %d", warnings, tt.wantWarnings)
+			}
+			if settings.PrivateVulnerabilityReportEnabled != nil || settings.VulnerabilityAlertsEnabled != nil || settings.AutomatedSecurityFixesEnabled != nil {
+				t.Fatalf("security settings = %+v, want unknown", settings)
+			}
+		})
+	}
+}
+
+func TestReadRepoSettingsSecurityFeatureHardError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/repos/testowner/testrepo" {
+			fmt.Fprint(w, fullRepoJSON)
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprint(w, `{"message":"Internal Server Error"}`)
+	}))
+	t.Cleanup(server.Close)
+
+	if _, _, err := ReadRepoSettings(testutil.NewTestClient(t, server), "testowner", "testrepo"); err == nil {
+		t.Fatal("ReadRepoSettings() error = nil, want hard error")
+	}
+}
+
+func TestReadSecurityFeatureRejectsEmptyJSONSuccess(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(server.Close)
+
+	for _, feature := range []string{"private vulnerability reporting", "automated security fixes"} {
+		t.Run(feature, func(t *testing.T) {
+			_, known, err := readSecurityFeature(testutil.NewTestClient(t, server), "feature", false, false)
+			if err == nil || known {
+				t.Fatalf("readSecurityFeature() known = %t, error = %v, want protocol error", known, err)
+			}
+		})
 	}
 }
 
@@ -366,11 +508,11 @@ func TestApplyRepoSettingsPatchBody(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	client := newTestClient(t, server)
+	client := testutil.NewTestClient(t, server)
 	settings := &model.RepositorySettings{
-		Description:    ptr.Ptr("new desc"),
-		HasWiki:        ptr.Ptr(true),
-		AllowAutoMerge: ptr.Ptr(false),
+		Description:    new("new desc"),
+		HasWiki:        new(true),
+		AllowAutoMerge: new(false),
 	}
 
 	_, err := ApplyRepoSettings(client, "testowner", "testrepo", settings)
@@ -385,7 +527,7 @@ func TestApplyRepoSettingsPatchBody(t *testing.T) {
 		t.Errorf("path = %s, want /repos/testowner/testrepo", gotPath)
 	}
 
-	// Verify non-nil fields present with correct values.
+	// Non-nil fields appear with their declared values.
 	if gotBody["description"] != "new desc" {
 		t.Errorf("description = %v, want %q", gotBody["description"], "new desc")
 	}
@@ -396,13 +538,16 @@ func TestApplyRepoSettingsPatchBody(t *testing.T) {
 		t.Errorf("allow_auto_merge = %v, want false", gotBody["allow_auto_merge"])
 	}
 
-	// Verify nil fields excluded.
+	// Nil fields are excluded.
 	if _, ok := gotBody["homepage"]; ok {
 		t.Error("homepage should not be in PATCH body when nil")
 	}
 
-	// Verify all three non-PATCH fields excluded from body.
+	// Fields managed by separate endpoints are excluded from the PATCH body.
 	for _, key := range []string{
+		"private_vulnerability_reporting_enabled",
+		"vulnerability_alerts_enabled",
+		"automated_security_fixes_enabled",
 		"topics",
 		"default_workflow_permissions",
 		"can_approve_pull_request_reviews",
@@ -416,11 +561,14 @@ func TestApplyRepoSettingsPatchBody(t *testing.T) {
 func TestBuildSettingsPayloadExtractsAllNonPatchFields(t *testing.T) {
 	topics := []string{"go", "cli"}
 	settings := &model.RepositorySettings{
-		Description:                  ptr.Ptr("desc"),
-		HasWiki:                      ptr.Ptr(true),
-		Topics:                       &topics,
-		DefaultWorkflowPermissions:   ptr.Ptr("read"),
-		CanApprovePullRequestReviews: ptr.Ptr(true),
+		Description:                       new("desc"),
+		HasWiki:                           new(true),
+		PrivateVulnerabilityReportEnabled: new(true),
+		VulnerabilityAlertsEnabled:        new(false),
+		AutomatedSecurityFixesEnabled:     new(true),
+		Topics:                            &topics,
+		DefaultWorkflowPermissions:        new("read"),
+		CanApprovePullRequestReviews:      new(true),
 	}
 
 	p := buildSettingsPayload(settings)
@@ -435,6 +583,9 @@ func TestBuildSettingsPayloadExtractsAllNonPatchFields(t *testing.T) {
 
 	// Non-PATCH fields must not appear in the body.
 	for _, key := range []string{
+		"private_vulnerability_reporting_enabled",
+		"vulnerability_alerts_enabled",
+		"automated_security_fixes_enabled",
 		"topics",
 		"default_workflow_permissions",
 		"can_approve_pull_request_reviews",
@@ -444,9 +595,18 @@ func TestBuildSettingsPayloadExtractsAllNonPatchFields(t *testing.T) {
 		}
 	}
 
-	// Verify extracted fields.
+	// Non-PATCH fields are extracted into their endpoint-specific payloads.
 	if p.Topics == nil {
 		t.Fatal("Topics is nil, want non-nil")
+	}
+	if p.PrivateVulnerabilityReporting == nil || !*p.PrivateVulnerabilityReporting {
+		t.Errorf("PrivateVulnerabilityReporting = %v, want ptr(true)", p.PrivateVulnerabilityReporting)
+	}
+	if p.VulnerabilityAlerts == nil || *p.VulnerabilityAlerts {
+		t.Errorf("VulnerabilityAlerts = %v, want ptr(false)", p.VulnerabilityAlerts)
+	}
+	if p.AutomatedSecurityFixes == nil || !*p.AutomatedSecurityFixes {
+		t.Errorf("AutomatedSecurityFixes = %v, want ptr(true)", p.AutomatedSecurityFixes)
 	}
 	if len(*p.Topics) != 2 || (*p.Topics)[0] != "go" || (*p.Topics)[1] != "cli" {
 		t.Errorf("Topics = %v, want [go cli]", *p.Topics)
@@ -461,13 +621,16 @@ func TestBuildSettingsPayloadExtractsAllNonPatchFields(t *testing.T) {
 
 func TestBuildSettingsPayloadNilFieldsStayNil(t *testing.T) {
 	settings := &model.RepositorySettings{
-		HasWiki: ptr.Ptr(true),
+		HasWiki: new(true),
 	}
 
 	p := buildSettingsPayload(settings)
 
 	if p.Topics != nil {
 		t.Errorf("Topics = %v, want nil", p.Topics)
+	}
+	if p.PrivateVulnerabilityReporting != nil || p.VulnerabilityAlerts != nil || p.AutomatedSecurityFixes != nil {
+		t.Error("security feature payloads are non-nil for absent settings")
 	}
 	if p.DefaultWorkflowPermissions != nil {
 		t.Errorf("DefaultWorkflowPermissions = %v, want nil", p.DefaultWorkflowPermissions)
@@ -478,6 +641,20 @@ func TestBuildSettingsPayloadNilFieldsStayNil(t *testing.T) {
 
 	if _, ok := p.Body["has_wiki"]; !ok {
 		t.Error("has_wiki missing from PATCH body")
+	}
+}
+
+func TestBuildSettingsPayloadNilSettings(t *testing.T) {
+	p := buildSettingsPayload(nil)
+
+	if p.Body == nil || len(p.Body) != 0 {
+		t.Errorf("Body = %v, want non-nil empty map", p.Body)
+	}
+	if p.PrivateVulnerabilityReporting != nil || p.VulnerabilityAlerts != nil || p.AutomatedSecurityFixes != nil {
+		t.Error("security feature payloads are non-nil for nil settings")
+	}
+	if p.Topics != nil || p.DefaultWorkflowPermissions != nil || p.CanApprovePullRequestReviews != nil {
+		t.Error("dedicated endpoint payloads are non-nil for nil settings")
 	}
 }
 
@@ -507,9 +684,9 @@ func TestApplyRepoSettingsPatchError(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	client := newTestClient(t, server)
+	client := testutil.NewTestClient(t, server)
 	settings := &model.RepositorySettings{
-		HasWiki: ptr.Ptr(true),
+		HasWiki: new(true),
 	}
 
 	_, err := ApplyRepoSettings(client, "testowner", "testrepo", settings)
@@ -525,9 +702,9 @@ func TestApplyRepoSettingsPatch403Skipped(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	client := newTestClient(t, server)
+	client := testutil.NewTestClient(t, server)
 	settings := &model.RepositorySettings{
-		HasWiki: ptr.Ptr(true),
+		HasWiki: new(true),
 	}
 
 	result, err := ApplyRepoSettings(client, "testowner", "testrepo", settings)
@@ -537,8 +714,8 @@ func TestApplyRepoSettingsPatch403Skipped(t *testing.T) {
 	if len(result.Skipped) != 1 {
 		t.Fatalf("expected 1 skipped operation, got %d", len(result.Skipped))
 	}
-	if result.Skipped[0].Operation != "patch repo settings" {
-		t.Errorf("skipped operation = %q, want %q", result.Skipped[0].Operation, "patch repo settings")
+	if result.Skipped[0].Operation.String() != "patch repo settings" {
+		t.Errorf("skipped operation = %q, want %q", result.Skipped[0].Operation.String(), "patch repo settings")
 	}
 }
 
@@ -556,10 +733,10 @@ func TestApplyRepoSettingsWorkflowPermsBothFields(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	client := newTestClient(t, server)
+	client := testutil.NewTestClient(t, server)
 	settings := &model.RepositorySettings{
-		DefaultWorkflowPermissions:   ptr.Ptr("read"),
-		CanApprovePullRequestReviews: ptr.Ptr(false),
+		DefaultWorkflowPermissions:   new("read"),
+		CanApprovePullRequestReviews: new(false),
 	}
 
 	_, err := ApplyRepoSettings(client, "testowner", "testrepo", settings)
@@ -590,7 +767,7 @@ func TestApplyRepoSettingsWorkflowPermsPartialFetchesCurrent(t *testing.T) {
 			fmt.Fprint(w, `{"default_workflow_permissions": "write", "can_approve_pull_request_reviews": true}`)
 			return
 		}
-		// Verify the PUT body contains both fields.
+		// The PUT body contains both workflow-permission fields.
 		body, _ := io.ReadAll(r.Body)
 		var gotBody map[string]any
 		_ = json.Unmarshal(body, &gotBody)
@@ -604,9 +781,9 @@ func TestApplyRepoSettingsWorkflowPermsPartialFetchesCurrent(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	client := newTestClient(t, server)
+	client := testutil.NewTestClient(t, server)
 	settings := &model.RepositorySettings{
-		DefaultWorkflowPermissions: ptr.Ptr("read"),
+		DefaultWorkflowPermissions: new("read"),
 	}
 
 	_, err := ApplyRepoSettings(client, "testowner", "testrepo", settings)
@@ -634,9 +811,9 @@ func TestApplyRepoSettingsWorkflowPermsSkippedWhenBothNil(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	client := newTestClient(t, server)
+	client := testutil.NewTestClient(t, server)
 	settings := &model.RepositorySettings{
-		HasWiki: ptr.Ptr(true),
+		HasWiki: new(true),
 	}
 
 	_, err := ApplyRepoSettings(client, "testowner", "testrepo", settings)
@@ -664,9 +841,9 @@ func TestApplyRepoSettingsWorkflowPermsGetError(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	client := newTestClient(t, server)
+	client := testutil.NewTestClient(t, server)
 	settings := &model.RepositorySettings{
-		CanApprovePullRequestReviews: ptr.Ptr(true),
+		CanApprovePullRequestReviews: new(true),
 	}
 
 	result, err := ApplyRepoSettings(client, "testowner", "testrepo", settings)
@@ -676,8 +853,8 @@ func TestApplyRepoSettingsWorkflowPermsGetError(t *testing.T) {
 	if len(result.Skipped) != 1 {
 		t.Fatalf("expected 1 skipped operation, got %d", len(result.Skipped))
 	}
-	if result.Skipped[0].Operation != "set workflow permissions" {
-		t.Errorf("skipped operation = %q, want %q", result.Skipped[0].Operation, "set workflow permissions")
+	if result.Skipped[0].Operation.String() != "set workflow permissions" {
+		t.Errorf("skipped operation = %q, want %q", result.Skipped[0].Operation.String(), "set workflow permissions")
 	}
 }
 
@@ -688,10 +865,10 @@ func TestApplyRepoSettingsWorkflowPermsPutError(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	client := newTestClient(t, server)
+	client := testutil.NewTestClient(t, server)
 	settings := &model.RepositorySettings{
-		DefaultWorkflowPermissions:   ptr.Ptr("read"),
-		CanApprovePullRequestReviews: ptr.Ptr(false),
+		DefaultWorkflowPermissions:   new("read"),
+		CanApprovePullRequestReviews: new(false),
 	}
 
 	_, err := ApplyRepoSettings(client, "testowner", "testrepo", settings)
@@ -714,7 +891,7 @@ func TestApplyRepoSettingsTopicsPut(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	client := newTestClient(t, server)
+	client := testutil.NewTestClient(t, server)
 	topics := []string{"go", "cli-tool"}
 	settings := &model.RepositorySettings{
 		Topics: &topics,
@@ -758,7 +935,7 @@ func TestApplyRepoSettingsTopicsPutEmpty(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	client := newTestClient(t, server)
+	client := testutil.NewTestClient(t, server)
 	topics := []string{}
 	settings := &model.RepositorySettings{
 		Topics: &topics,
@@ -794,9 +971,9 @@ func TestApplyRepoSettingsTopicsSkippedWhenNil(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	client := newTestClient(t, server)
+	client := testutil.NewTestClient(t, server)
 	settings := &model.RepositorySettings{
-		HasWiki: ptr.Ptr(true),
+		HasWiki: new(true),
 	}
 
 	_, err := ApplyRepoSettings(client, "testowner", "testrepo", settings)
@@ -820,7 +997,7 @@ func TestApplyRepoSettingsTopicsError(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	client := newTestClient(t, server)
+	client := testutil.NewTestClient(t, server)
 	topics := []string{"go"}
 	settings := &model.RepositorySettings{
 		Topics: &topics,
@@ -831,8 +1008,6 @@ func TestApplyRepoSettingsTopicsError(t *testing.T) {
 		t.Fatal("ApplyRepoSettings() expected error from topics PUT, got nil")
 	}
 }
-
-// --- Task 2.2: partial application tests ---
 
 func TestApplyRepoSettingsPartialTopics403(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -845,10 +1020,10 @@ func TestApplyRepoSettingsPartialTopics403(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	client := newTestClient(t, server)
+	client := testutil.NewTestClient(t, server)
 	topics := []string{"go"}
 	settings := &model.RepositorySettings{
-		HasWiki: ptr.Ptr(true),
+		HasWiki: new(true),
 		Topics:  &topics,
 	}
 
@@ -856,7 +1031,7 @@ func TestApplyRepoSettingsPartialTopics403(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected hard error: %v", err)
 	}
-	if len(result.Skipped) != 1 || result.Skipped[0].Operation != "set topics" {
+	if len(result.Skipped) != 1 || result.Skipped[0].Operation.String() != "set topics" {
 		t.Errorf("Skipped = %v, want [{set topics ...}]", result.Skipped)
 	}
 }
@@ -868,9 +1043,9 @@ func TestApplyRepoSettingsAllSkipped(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	client := newTestClient(t, server)
+	client := testutil.NewTestClient(t, server)
 	settings := &model.RepositorySettings{
-		HasWiki: ptr.Ptr(true),
+		HasWiki: new(true),
 	}
 
 	result, err := ApplyRepoSettings(client, "testowner", "testrepo", settings)
@@ -888,9 +1063,9 @@ func TestApplyRepoSettingsApplyResultPopulatedOnSuccess(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	client := newTestClient(t, server)
+	client := testutil.NewTestClient(t, server)
 	settings := &model.RepositorySettings{
-		HasWiki: ptr.Ptr(true),
+		HasWiki: new(true),
 	}
 
 	result, err := ApplyRepoSettings(client, "testowner", "testrepo", settings)
@@ -899,5 +1074,170 @@ func TestApplyRepoSettingsApplyResultPopulatedOnSuccess(t *testing.T) {
 	}
 	if len(result.Skipped) != 0 {
 		t.Errorf("Skipped = %v, want empty", result.Skipped)
+	}
+}
+
+func TestApplyRepoSettingsSecurityFeatureMethodsAndEnableOrder(t *testing.T) {
+	type call struct {
+		method string
+		path   string
+	}
+	var calls []call
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, call{method: r.Method, path: r.URL.Path})
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(server.Close)
+
+	settings := &model.RepositorySettings{
+		PrivateVulnerabilityReportEnabled: new(true),
+		VulnerabilityAlertsEnabled:        new(true),
+		AutomatedSecurityFixesEnabled:     new(true),
+	}
+	if _, err := ApplyRepoSettings(testutil.NewTestClient(t, server), "testowner", "testrepo", settings); err != nil {
+		t.Fatalf("ApplyRepoSettings() error: %v", err)
+	}
+
+	want := []call{
+		{http.MethodPut, "/repos/testowner/testrepo/private-vulnerability-reporting"},
+		{http.MethodPut, "/repos/testowner/testrepo/vulnerability-alerts"},
+		{http.MethodPut, "/repos/testowner/testrepo/automated-security-fixes"},
+	}
+	if len(calls) != len(want) {
+		t.Fatalf("calls = %v, want %v", calls, want)
+	}
+	for i := range want {
+		if calls[i] != want[i] {
+			t.Errorf("call[%d] = %v, want %v", i, calls[i], want[i])
+		}
+	}
+}
+
+func TestApplyRepoSettingsSecurityFeatureDisableOrder(t *testing.T) {
+	var paths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			t.Errorf("method = %s, want DELETE", r.Method)
+		}
+		paths = append(paths, r.URL.Path)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(server.Close)
+
+	settings := &model.RepositorySettings{
+		VulnerabilityAlertsEnabled:    new(false),
+		AutomatedSecurityFixesEnabled: new(false),
+	}
+	if _, err := ApplyRepoSettings(testutil.NewTestClient(t, server), "testowner", "testrepo", settings); err != nil {
+		t.Fatalf("ApplyRepoSettings() error: %v", err)
+	}
+
+	want := []string{
+		"/repos/testowner/testrepo/automated-security-fixes",
+		"/repos/testowner/testrepo/vulnerability-alerts",
+	}
+	if fmt.Sprint(paths) != fmt.Sprint(want) {
+		t.Errorf("paths = %v, want %v", paths, want)
+	}
+}
+
+func TestApplyRepoSettingsDoesNotDisableAlertsWhenFixesAreUnmanaged(t *testing.T) {
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(server.Close)
+
+	settings := &model.RepositorySettings{VulnerabilityAlertsEnabled: new(false)}
+	_, err := ApplyRepoSettings(testutil.NewTestClient(t, server), "testowner", "testrepo", settings)
+	if err == nil || err.Error() != "cannot disable vulnerability alerts while automated security fixes are unmanaged" {
+		t.Fatalf("ApplyRepoSettings() error = %v, want unmanaged fixes error", err)
+	}
+	if calls != 0 {
+		t.Fatalf("calls = %d, want 0", calls)
+	}
+}
+
+func TestApplyRepoSettingsSecurityFeatureAccessErrorIsSkipped(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		fmt.Fprint(w, `{"message":"Forbidden"}`)
+	}))
+	t.Cleanup(server.Close)
+
+	settings := &model.RepositorySettings{VulnerabilityAlertsEnabled: new(true)}
+	result, err := ApplyRepoSettings(testutil.NewTestClient(t, server), "testowner", "testrepo", settings)
+	if err != nil {
+		t.Fatalf("ApplyRepoSettings() error: %v", err)
+	}
+	if len(result.Skipped) != 1 || result.Skipped[0].Operation.String() != "enable vulnerability alerts" {
+		t.Errorf("Skipped = %v, want enable vulnerability alerts", result.Skipped)
+	}
+}
+
+func TestApplyRepoSettingsSecurityPrerequisiteStopsDependentWrite(t *testing.T) {
+	tests := []struct {
+		name     string
+		settings *model.RepositorySettings
+		first    string
+	}{
+		{
+			name: "enable alerts before fixes",
+			settings: &model.RepositorySettings{
+				VulnerabilityAlertsEnabled:    new(true),
+				AutomatedSecurityFixesEnabled: new(true),
+			},
+			first: "/repos/testowner/testrepo/vulnerability-alerts",
+		},
+		{
+			name: "disable fixes before alerts",
+			settings: &model.RepositorySettings{
+				VulnerabilityAlertsEnabled:    new(false),
+				AutomatedSecurityFixesEnabled: new(false),
+			},
+			first: "/repos/testowner/testrepo/automated-security-fixes",
+		},
+	}
+	for _, tt := range tests {
+		for _, status := range []int{http.StatusForbidden, http.StatusInternalServerError} {
+			t.Run(fmt.Sprintf("%s status %d", tt.name, status), func(t *testing.T) {
+				var calls []string
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					calls = append(calls, r.URL.Path)
+					w.WriteHeader(status)
+					fmt.Fprint(w, `{"message":"failed"}`)
+				}))
+				t.Cleanup(server.Close)
+
+				result, err := ApplyRepoSettings(testutil.NewTestClient(t, server), "testowner", "testrepo", tt.settings)
+				if status == http.StatusForbidden {
+					if err != nil || len(result.Skipped) != 2 {
+						t.Fatalf("ApplyRepoSettings() = %+v, %v, want skipped prerequisite and dependent", result, err)
+					}
+					if result.Skipped[1].Operation == result.Skipped[0].Operation {
+						t.Fatalf("Skipped = %+v, want distinct dependent operation", result.Skipped)
+					}
+				} else if err == nil {
+					t.Fatal("ApplyRepoSettings() error = nil, want prerequisite failure")
+				}
+				if len(calls) != 1 || calls[0] != tt.first {
+					t.Fatalf("calls = %v, want only %s", calls, tt.first)
+				}
+			})
+		}
+	}
+}
+
+func TestApplyRepoSettingsSecurityFeatureHardErrorStops(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprint(w, `{"message":"Internal Server Error"}`)
+	}))
+	t.Cleanup(server.Close)
+
+	settings := &model.RepositorySettings{AutomatedSecurityFixesEnabled: new(true)}
+	if _, err := ApplyRepoSettings(testutil.NewTestClient(t, server), "testowner", "testrepo", settings); err == nil {
+		t.Fatal("ApplyRepoSettings() error = nil, want hard error")
 	}
 }

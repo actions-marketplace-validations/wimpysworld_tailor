@@ -14,7 +14,7 @@ import (
 	"github.com/wimpysworld/tailor/internal/model"
 )
 
-// labelResponse holds the subset of GitHub label fields we read.
+// labelResponse holds the subset of GitHub label fields read from the API.
 type labelResponse struct {
 	Name        string `json:"name"`
 	Color       string `json:"color"`
@@ -30,7 +30,7 @@ func ReadLabels(client *api.RESTClient, owner, repo string) ([]model.LabelEntry,
 		path := fmt.Sprintf("repos/%s/%s/labels?per_page=100&page=%d", owner, repo, page)
 		resp, err := client.RequestWithContext(context.Background(), http.MethodGet, path, nil)
 		if err != nil {
-			return nil, fmt.Errorf("fetching labels page %d: %w", page, err)
+			return nil, fmt.Errorf("fetching labels page %d: %w", page, boundedHTTPError(err))
 		}
 
 		body, err := io.ReadAll(resp.Body)
@@ -52,7 +52,7 @@ func ReadLabels(client *api.RESTClient, owner, repo string) ([]model.LabelEntry,
 			})
 		}
 
-		if len(labels) < 100 || !hasNextPage(resp.Header.Get("Link")) {
+		if !hasNextPage(resp.Header.Get("Link")) {
 			break
 		}
 	}
@@ -78,7 +78,9 @@ func hasNextPage(link string) bool {
 //
 // Access errors (insufficient scope or role) on individual labels are collected
 // in the returned ApplyResult rather than aborting, so a 403 on one label does
-// not prevent others from being applied.
+// not prevent others from being applied. Rate-limit errors abort immediately
+// with a partial-completion error, so the loop does not burn the remaining
+// API budget.
 func ApplyLabels(client *api.RESTClient, owner, repo string, desired, current []model.LabelEntry) (*ApplyResult, error) {
 	result := &ApplyResult{}
 
@@ -87,37 +89,64 @@ func ApplyLabels(client *api.RESTClient, owner, repo string, desired, current []
 		currentMap[strings.ToLower(l.Name)] = l
 	}
 
-	for _, d := range desired {
+	applied := 0
+	for i, d := range desired {
 		key := strings.ToLower(d.Name)
 		existing, found := currentMap[key]
 
 		if !found {
 			if err := createLabel(client, owner, repo, d); err != nil {
-				opName := fmt.Sprintf("create label %q", d.Name)
-				classified := classifyHTTPError(err, opName)
-				if isAccessError(classified) {
-					result.Skipped = append(result.Skipped, SkippedOperation{Operation: opName, Err: classified})
+				opName := CreateLabelOp(d.Name)
+				if limitErr := labelRateLimitError(err, opName, applied, remainingLabelChanges(desired[i:], currentMap)); limitErr != nil {
+					return nil, limitErr
+				}
+				if recordAccessError(result, opName, err) {
 					continue
 				}
 				return nil, err
 			}
+			applied++
 			continue
 		}
 
 		if model.LabelNeedsUpdate(existing, d) {
 			if err := updateLabel(client, owner, repo, existing.Name, d); err != nil {
-				opName := fmt.Sprintf("update label %q", d.Name)
-				classified := classifyHTTPError(err, opName)
-				if isAccessError(classified) {
-					result.Skipped = append(result.Skipped, SkippedOperation{Operation: opName, Err: classified})
+				opName := UpdateLabelOp(d.Name)
+				if limitErr := labelRateLimitError(err, opName, applied, remainingLabelChanges(desired[i:], currentMap)); limitErr != nil {
+					return nil, limitErr
+				}
+				if recordAccessError(result, opName, err) {
 					continue
 				}
 				return nil, err
 			}
+			applied++
 		}
 	}
 
 	return result, nil
+}
+
+func remainingLabelChanges(desired []model.LabelEntry, current map[string]model.LabelEntry) int {
+	remaining := 0
+	for _, label := range desired {
+		existing, found := current[strings.ToLower(label.Name)]
+		if !found || model.LabelNeedsUpdate(existing, label) {
+			remaining++
+		}
+	}
+	return remaining
+}
+
+// labelRateLimitError classifies err and, when it is a rate-limit error,
+// wraps it with a partial-completion report. Returns nil for every other
+// error, leaving the caller's access-error and hard-error handling intact.
+func labelRateLimitError(err error, operation Operation, applied, remaining int) error {
+	classified := classifyHTTPError(err, operation)
+	if !isRateLimitError(classified) {
+		return nil
+	}
+	return fmt.Errorf("rate limited while applying labels: %d applied, %d remaining: %w", applied, remaining, classified)
 }
 
 // createLabel sends a POST to create a new label.
@@ -133,7 +162,7 @@ func createLabel(client *api.RESTClient, owner, repo string, label model.LabelEn
 	}
 
 	path := fmt.Sprintf("repos/%s/%s/labels", owner, repo)
-	if err := client.Post(path, bytes.NewReader(payload), nil); err != nil {
+	if err := boundedHTTPError(client.Post(path, bytes.NewReader(payload), nil)); err != nil {
 		return fmt.Errorf("creating label %q: %w", label.Name, err)
 	}
 	return nil
@@ -153,7 +182,7 @@ func updateLabel(client *api.RESTClient, owner, repo, name string, label model.L
 	}
 
 	path := fmt.Sprintf("repos/%s/%s/labels/%s", owner, repo, url.PathEscape(name))
-	if err := client.Patch(path, bytes.NewReader(payload), nil); err != nil {
+	if err := boundedHTTPError(client.Patch(path, bytes.NewReader(payload), nil)); err != nil {
 		return fmt.Errorf("updating label %q: %w", name, err)
 	}
 	return nil

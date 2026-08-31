@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"reflect"
 	"slices"
 
@@ -8,46 +9,42 @@ import (
 	"github.com/wimpysworld/tailor/internal/swatch"
 )
 
-// repoSettingsSkipFields lists RepositorySettings field names excluded from
+// repoSettingsSkipFields lists RepositorySettings YAML keys excluded from
 // default merging. Description and Homepage are project-specific (nil'd by
 // DefaultConfig). Topics are project-specific per spec.
 var repoSettingsSkipFields = map[string]bool{
-	"Description": true,
-	"Homepage":    true,
-	"Topics":      true,
+	"description": true,
+	"homepage":    true,
+	"topics":      true,
 }
 
-// MergeDefaults calls DefaultConfig once and delegates to the three merge
-// functions, avoiding redundant YAML parses. Returns the newly added swatch
-// entries and whether repo settings or labels were merged.
-func MergeDefaults(cfg *Config) (swatchesAdded []SwatchEntry, repoMerged bool, labelsMerged bool) {
-	swatchesAdded = MergeDefaultSwatches(cfg)
+// MergeDefaults merges missing swatch entries, repository settings, Actions
+// policy fields, and labels from the embedded defaults into cfg. It reports
+// whether anything changed.
+func MergeDefaults(cfg *Config) (bool, error) {
+	swatchesChanged := len(MergeDefaultSwatches(cfg)) > 0
 
 	defaults, err := DefaultConfig("_")
 	if err != nil {
-		return swatchesAdded, false, false
+		return swatchesChanged, fmt.Errorf("loading default config: %w", err)
 	}
 
-	repoMerged = mergeRepoSettingsFrom(cfg, defaults)
-	labelsMerged = mergeLabelsFrom(cfg, defaults)
-	return swatchesAdded, repoMerged, labelsMerged
+	repoChanged := mergeRepoSettingsFrom(cfg, defaults)
+	actionsChanged := mergeActionsFrom(cfg, defaults)
+	labelsChanged := mergeLabelsFrom(cfg, defaults)
+	return swatchesChanged || repoChanged || actionsChanged || labelsChanged, nil
 }
 
-// MergeDefaultRepoSettings fills nil pointer fields in cfg.Repository from the
-// embedded default configuration. It skips Description, Homepage, and Topics.
-// If cfg.Repository is nil, it allocates a new RepositorySettings. Returns true
-// when at least one field was added.
-func MergeDefaultRepoSettings(cfg *Config) bool {
-	defaults, err := DefaultConfig("_")
-	if err != nil || defaults.Repository == nil {
-		return false
-	}
-	return mergeRepoSettingsFrom(cfg, defaults)
+// actionsSelectedOnlyFields lists ActionsSettings YAML keys merged only when
+// the effective allowed_actions policy is "selected".
+var actionsSelectedOnlyFields = map[string]bool{
+	"github_owned_allowed": true,
+	"verified_allowed":     true,
+	"patterns_allowed":     true,
 }
 
 // mergeRepoSettingsFrom fills nil pointer fields in cfg.Repository from the
-// provided defaults. Shared implementation for MergeDefaultRepoSettings and
-// MergeDefaults.
+// provided defaults.
 func mergeRepoSettingsFrom(cfg *Config, defaults *Config) bool {
 	if defaults.Repository == nil {
 		return false
@@ -57,59 +54,76 @@ func mergeRepoSettingsFrom(cfg *Config, defaults *Config) bool {
 		cfg.Repository = &model.RepositorySettings{}
 	}
 
-	dv := reflect.ValueOf(defaults.Repository).Elem()
 	cv := reflect.ValueOf(cfg.Repository).Elem()
-	dt := dv.Type()
 
 	changed := false
 
-	for i := range dt.NumField() {
-		field := dt.Field(i)
-
-		if repoSettingsSkipFields[field.Name] {
+	for _, field := range model.RepositorySettingFields(defaults.Repository) {
+		if repoSettingsSkipFields[field.YAMLKey] {
 			continue
 		}
-
-		// Only process pointer fields; skip the Extra inline map.
-		if field.Tag.Get("yaml") == "" || field.Tag.Get("yaml") == ",inline" {
-			continue
+		if mergeSettingField(cv.Field(field.Index), field) {
+			changed = true
 		}
-
-		dfv := dv.Field(i)
-		if dfv.Kind() != reflect.Pointer || dfv.IsNil() {
-			continue
-		}
-
-		cfv := cv.Field(i)
-		if !cfv.IsNil() {
-			continue
-		}
-
-		// Allocate a new value and copy from the default.
-		newVal := reflect.New(dfv.Elem().Type())
-		newVal.Elem().Set(dfv.Elem())
-		cfv.Set(newVal)
-		changed = true
 	}
 
 	return changed
 }
 
-// MergeDefaultLabels populates cfg.Labels from the embedded default
-// configuration when the slice is empty. Both present-but-empty (labels: [])
-// and absent (no labels key) result in len==0 after YAML unmarshalling, so
-// both cases receive the default labels. If cfg.Labels already contains
-// entries, the function leaves them unchanged and returns false.
-func MergeDefaultLabels(cfg *Config) bool {
-	defaults, err := DefaultConfig("_")
-	if err != nil || len(defaults.Labels) == 0 {
+// mergeActionsFrom fills missing Actions policy fields from the defaults.
+// Selected-action fields apply only when the effective policy is selected;
+// allowed_actions precedes them in struct order, so the policy check sees
+// the merged value.
+func mergeActionsFrom(cfg *Config, defaults *Config) bool {
+	if defaults.Actions == nil {
 		return false
 	}
-	return mergeLabelsFrom(cfg, defaults)
+	if cfg.Actions == nil {
+		cfg.Actions = &model.ActionsSettings{}
+	}
+
+	cv := reflect.ValueOf(cfg.Actions).Elem()
+
+	changed := false
+
+	for _, field := range model.ActionsSettingFields(defaults.Actions) {
+		if actionsSelectedOnlyFields[field.YAMLKey] {
+			policy := cfg.Actions.AllowedActions
+			if policy == nil || *policy != "selected" {
+				continue
+			}
+		}
+		if mergeSettingField(cv.Field(field.Index), field) {
+			changed = true
+		}
+	}
+
+	return changed
+}
+
+// mergeSettingField copies a set default field into cfv when cfv is nil,
+// reporting whether it changed anything. Slice values are cloned so cfg does
+// not share a backing array with the defaults.
+func mergeSettingField(cfv reflect.Value, field model.SettingField) bool {
+	if !field.Set || !cfv.IsNil() {
+		return false
+	}
+
+	dfv := field.Value.Elem()
+	newVal := reflect.New(dfv.Type())
+	if dfv.Kind() == reflect.Slice {
+		cloned := reflect.MakeSlice(dfv.Type(), dfv.Len(), dfv.Len())
+		reflect.Copy(cloned, dfv)
+		newVal.Elem().Set(cloned)
+	} else {
+		newVal.Elem().Set(dfv)
+	}
+	cfv.Set(newVal)
+	return true
 }
 
 // mergeLabelsFrom populates cfg.Labels from the provided defaults when the
-// slice is empty. Shared implementation for MergeDefaultLabels and MergeDefaults.
+// slice is empty.
 func mergeLabelsFrom(cfg *Config, defaults *Config) bool {
 	if len(cfg.Labels) > 0 {
 		return false

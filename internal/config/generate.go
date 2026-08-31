@@ -29,11 +29,8 @@ func DefaultConfig(license string) (*Config, error) {
 		return nil, fmt.Errorf("license must not be empty")
 	}
 
-	// Nil out description and homepage parsed from the embedded swatch.
-	// The swatch carries placeholder values ("" and "{{HOMEPAGE_URL}}")
-	// that are only meaningful after token substitution (alter path) or
-	// live GitHub data overlay (MergeRepoSettings). Leaving them set
-	// would leak raw tokens into fit output.
+	// Nil out the project-specific description and homepage defaults.
+	// MergeRepoSettings replaces them with live GitHub values when available.
 	if cfg.Repository != nil {
 		cfg.Repository.Description = nil
 		cfg.Repository.Homepage = nil
@@ -42,10 +39,26 @@ func DefaultConfig(license string) (*Config, error) {
 	return cfg, nil
 }
 
-// MergeRepoSettings replaces cfg.Repository with the live settings retrieved
-// from the GitHub API. The description flag, when non-empty, overrides
-// whatever the live settings carried. Empty string pointer fields for
-// Description and Homepage are normalised to nil so they are omitted from YAML.
+// ApplyRepoDefaults fills an absent description and homepage so the generated
+// config always carries both keys. The description falls back to name and the
+// homepage to url. An empty url leaves the homepage omitted, which covers a
+// project without repository context.
+func ApplyRepoDefaults(cfg *Config, name, url string) {
+	if cfg.Repository == nil {
+		cfg.Repository = &model.RepositorySettings{}
+	}
+	if cfg.Repository.Description == nil && name != "" {
+		cfg.Repository.Description = &name
+	}
+	if cfg.Repository.Homepage == nil && url != "" {
+		cfg.Repository.Homepage = &url
+	}
+}
+
+// MergeRepoSettings assigns live to cfg.Repository and mutates live in place.
+// The description flag, when non-empty, overrides whatever the live settings
+// carried. Empty string pointer fields for Description and Homepage are
+// normalised to nil so they are omitted from YAML.
 func MergeRepoSettings(cfg *Config, live *model.RepositorySettings, description string) {
 	cfg.Repository = live
 

@@ -3,108 +3,255 @@ package gh
 import (
 	"errors"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"testing"
 
 	"github.com/cli/go-gh/v2/pkg/repository"
 )
 
 func TestRepoContext(t *testing.T) {
+	restore := SetCurrentRepoFunc(func(dir string) (repository.Repository, error) {
+		if dir != "." {
+			t.Errorf("repository discovery directory = %q, want %q", dir, ".")
+		}
+		return repository.Repository{Host: "github.com", Owner: "wimpysworld", Name: "tailor"}, nil
+	})
+	t.Cleanup(restore)
+
+	repo, ok := RepoContext()
+
+	want := Repo{Host: "github.com", Owner: "wimpysworld", Name: "tailor"}
+	if repo != want || !ok {
+		t.Errorf("RepoContext() = %+v, %v, want %+v, true", repo, ok, want)
+	}
+}
+
+func TestRepoContextError(t *testing.T) {
+	restore := SetCurrentRepoFunc(func(string) (repository.Repository, error) {
+		return repository.Repository{}, errors.New("no repo")
+	})
+	t.Cleanup(restore)
+
+	repo, ok := RepoContext()
+
+	if repo != (Repo{}) || ok {
+		t.Errorf("RepoContext() = %+v, %v, want empty context", repo, ok)
+	}
+}
+
+func TestRepoContextAtUsesSuppliedDirectory(t *testing.T) {
+	configureGitHubHost(t)
+	dir := initGitRepository(t, "https://github.com/supplied/project.git")
+
+	repo, ok, err := RepoContextAt(dir)
+	if err != nil {
+		t.Fatalf("RepoContextAt() error = %v", err)
+	}
+	want := Repo{Host: "github.com", Owner: "supplied", Name: "project"}
+	if repo != want || !ok {
+		t.Errorf("RepoContextAt() = %+v, %v, want %+v, true", repo, ok, want)
+	}
+}
+
+func TestRepoContextAtIgnoresGHRepo(t *testing.T) {
+	configureGitHubHost(t)
+	t.Setenv("GH_REPO", "wrong/override")
+	dir := initGitRepository(t, "https://github.com/remote/checkout.git")
+
+	repo, ok, err := RepoContextAt(dir)
+	if err != nil {
+		t.Fatalf("RepoContextAt() error = %v", err)
+	}
+	want := Repo{Host: "github.com", Owner: "remote", Name: "checkout"}
+	if repo != want || !ok {
+		t.Errorf("RepoContextAt() = %+v, %v, want %+v, true", repo, ok, want)
+	}
+}
+
+func TestRepoContextAtParsesRemoteURLs(t *testing.T) {
+	configureGitHubHost(t)
 	tests := []struct {
-		name      string
-		repo      repository.Repository
-		repoErr   error
-		wantOwner string
-		wantName  string
-		wantOK    bool
+		name   string
+		remote string
 	}{
-		{
-			name: "detects repo from remote",
-			repo: repository.Repository{
-				Host:  "github.com",
-				Owner: "wimpysworld",
-				Name:  "tailor",
-			},
-			wantOwner: "wimpysworld",
-			wantName:  "tailor",
-			wantOK:    true,
-		},
-		{
-			name:    "no remote returns ok false",
-			repoErr: errors.New("unable to determine current repository"),
-		},
+		{name: "HTTPS", remote: "https://github.com/wimpysworld/tailor.git"},
+		{name: "scp with user", remote: "git@github.com:wimpysworld/tailor.git"},
+		{name: "scp without user", remote: "github.com:wimpysworld/tailor.git"},
+		{name: "git+ssh", remote: "git+ssh://git@github.com/wimpysworld/tailor.git"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			restore := SetCurrentRepoFunc(func() (repository.Repository, error) {
-				return tt.repo, tt.repoErr
-			})
-			t.Cleanup(restore)
+			dir := initGitRepository(t, tt.remote)
 
-			owner, name, ok := RepoContext()
-
-			if owner != tt.wantOwner {
-				t.Errorf("RepoContext() owner = %q, want %q", owner, tt.wantOwner)
+			repo, ok, err := RepoContextAt(dir)
+			if err != nil {
+				t.Fatalf("RepoContextAt() error = %v", err)
 			}
-			if name != tt.wantName {
-				t.Errorf("RepoContext() name = %q, want %q", name, tt.wantName)
-			}
-			if ok != tt.wantOK {
-				t.Errorf("RepoContext() ok = %v, want %v", ok, tt.wantOK)
+			want := Repo{Host: "github.com", Owner: "wimpysworld", Name: "tailor"}
+			if repo != want || !ok {
+				t.Errorf("RepoContextAt() = %+v, %v, want %+v, true", repo, ok, want)
 			}
 		})
 	}
 }
 
-func TestRepoContextAt(t *testing.T) {
-	restore := SetCurrentRepoFunc(func() (repository.Repository, error) {
-		return repository.Repository{Host: "github.com", Owner: "testowner", Name: "testrepo"}, nil
-	})
-	t.Cleanup(restore)
+func TestRepoContextAtReturnsEnterpriseHost(t *testing.T) {
+	t.Setenv("GH_CONFIG_DIR", t.TempDir())
+	t.Setenv("GH_HOST", "ghe.example.com")
+	t.Setenv("GH_TOKEN", "test-token")
+	dir := initGitRepository(t, "https://ghe.example.com/acme/widgets.git")
 
-	dir := t.TempDir()
-
-	owner, name, ok, err := RepoContextAt(dir)
+	repo, ok, err := RepoContextAt(dir)
 	if err != nil {
 		t.Fatalf("RepoContextAt() error = %v", err)
 	}
-	if !ok {
-		t.Fatal("RepoContextAt() ok = false, want true")
-	}
-	if owner != "testowner" {
-		t.Errorf("RepoContextAt() owner = %q, want %q", owner, "testowner")
-	}
-	if name != "testrepo" {
-		t.Errorf("RepoContextAt() name = %q, want %q", name, "testrepo")
-	}
-
-	// Verify working directory is restored.
-	cwd, _ := os.Getwd()
-	if cwd == dir {
-		t.Error("RepoContextAt() did not restore working directory")
+	want := Repo{Host: "ghe.example.com", Owner: "acme", Name: "widgets"}
+	if repo != want || !ok {
+		t.Errorf("RepoContextAt() = %+v, %v, want %+v, true", repo, ok, want)
 	}
 }
 
-func TestRepoContextAtNoRepo(t *testing.T) {
-	restore := SetCurrentRepoFunc(func() (repository.Repository, error) {
-		return repository.Repository{}, errors.New("no repo")
-	})
-	t.Cleanup(restore)
+func TestRepoContextAtResolvesSSHAlias(t *testing.T) {
+	configureGitHubHost(t)
+	binDir := t.TempDir()
+	sshPath := filepath.Join(binDir, "ssh")
+	if err := os.WriteFile(sshPath, []byte("#!/bin/sh\nprintf 'hostname github.com\\n'\n"), 0o755); err != nil {
+		t.Fatalf("writing fake ssh: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	dir := initGitRepository(t, "git@github-work:wimpysworld/tailor.git")
 
-	dir := t.TempDir()
-
-	_, _, ok, err := RepoContextAt(dir)
+	repo, ok, err := RepoContextAt(dir)
 	if err != nil {
 		t.Fatalf("RepoContextAt() error = %v", err)
 	}
-	if ok {
-		t.Error("RepoContextAt() ok = true, want false")
+	want := Repo{Host: "github.com", Owner: "wimpysworld", Name: "tailor"}
+	if repo != want || !ok {
+		t.Errorf("RepoContextAt() = %+v, %v, want %+v, true", repo, ok, want)
+	}
+}
+
+func TestRepoContextAtNoAuthenticatedHosts(t *testing.T) {
+	t.Setenv("GH_CONFIG_DIR", t.TempDir())
+	t.Setenv("GH_HOST", "")
+	t.Setenv("GH_TOKEN", "")
+	t.Setenv("GITHUB_TOKEN", "")
+	dir := initGitRepository(t, "https://github.com/no-auth/project.git")
+
+	repo, ok, err := RepoContextAt(dir)
+	if err != nil {
+		t.Fatalf("RepoContextAt() error = %v", err)
+	}
+	want := Repo{Host: "github.com", Owner: "no-auth", Name: "project"}
+	if repo != want || !ok {
+		t.Errorf("RepoContextAt() = %+v, %v, want %+v, true", repo, ok, want)
+	}
+}
+
+func TestRepoContextAtPrefersOriginOverUpstream(t *testing.T) {
+	configureGitHubHost(t)
+	dir := initGitRepository(t, "https://github.com/wimpysworld/vecdecor.git")
+	runGit(t, dir, "remote", "add", "upstream", "https://github.com/soreau/pixdecor.git")
+
+	repo, ok, err := RepoContextAt(dir)
+	if err != nil {
+		t.Fatalf("RepoContextAt() error = %v", err)
+	}
+	want := Repo{Host: "github.com", Owner: "wimpysworld", Name: "vecdecor"}
+	if repo != want || !ok {
+		t.Errorf("RepoContextAt() = %+v, %v, want %+v, true", repo, ok, want)
+	}
+}
+
+func TestRepoContextAtHonoursSetDefaultBase(t *testing.T) {
+	configureGitHubHost(t)
+	dir := initGitRepository(t, "https://github.com/wimpysworld/vecdecor.git")
+	runGit(t, dir, "remote", "add", "upstream", "https://github.com/soreau/pixdecor.git")
+	runGit(t, dir, "config", "remote.upstream.gh-resolved", "base")
+
+	repo, ok, err := RepoContextAt(dir)
+	if err != nil {
+		t.Fatalf("RepoContextAt() error = %v", err)
+	}
+	want := Repo{Host: "github.com", Owner: "soreau", Name: "pixdecor"}
+	if repo != want || !ok {
+		t.Errorf("RepoContextAt() = %+v, %v, want %+v, true", repo, ok, want)
+	}
+}
+
+func TestRepoContextAtHonoursSetDefaultNamed(t *testing.T) {
+	configureGitHubHost(t)
+	dir := initGitRepository(t, "https://github.com/wimpysworld/vecdecor.git")
+	runGit(t, dir, "config", "remote.origin.gh-resolved", "another/project")
+
+	repo, ok, err := RepoContextAt(dir)
+	if err != nil {
+		t.Fatalf("RepoContextAt() error = %v", err)
+	}
+	want := Repo{Host: "github.com", Owner: "another", Name: "project"}
+	if repo != want || !ok {
+		t.Errorf("RepoContextAt() = %+v, %v, want %+v, true", repo, ok, want)
+	}
+}
+
+func TestRepoContextAtIgnoresSetDefaultUnacceptedHost(t *testing.T) {
+	configureGitHubHost(t)
+	dir := initGitRepository(t, "https://github.com/wimpysworld/vecdecor.git")
+	runGit(t, dir, "config", "remote.origin.gh-resolved", "evil.example.com/owner/name")
+
+	repo, ok, err := RepoContextAt(dir)
+	if err != nil {
+		t.Fatalf("RepoContextAt() error = %v", err)
+	}
+	want := Repo{Host: "github.com", Owner: "wimpysworld", Name: "vecdecor"}
+	if repo != want || !ok {
+		t.Errorf("RepoContextAt() = %+v, %v, want %+v, true", repo, ok, want)
+	}
+}
+
+func TestRepoContextAtNoRemote(t *testing.T) {
+	configureGitHubHost(t)
+	dir := initGitRepository(t, "")
+
+	repo, ok, err := RepoContextAt(dir)
+	if err != nil {
+		t.Fatalf("RepoContextAt() error = %v", err)
+	}
+	if repo != (Repo{}) || ok {
+		t.Errorf("RepoContextAt() = %+v, %v, want empty context", repo, ok)
 	}
 }
 
 func TestRepoContextAtBadDir(t *testing.T) {
-	_, _, _, err := RepoContextAt("/nonexistent/path/that/does/not/exist")
+	_, _, err := RepoContextAt(filepath.Join(t.TempDir(), "missing"))
 	if err == nil {
-		t.Fatal("RepoContextAt() expected error for non-existent dir, got nil")
+		t.Fatal("RepoContextAt() error = nil, want an error")
+	}
+}
+
+func configureGitHubHost(t *testing.T) {
+	t.Helper()
+	t.Setenv("GH_CONFIG_DIR", t.TempDir())
+	t.Setenv("GH_TOKEN", "test-token")
+}
+
+func initGitRepository(t *testing.T, remote string) string {
+	t.Helper()
+	dir := t.TempDir()
+	runGit(t, dir, "init", "--quiet")
+	if remote != "" {
+		runGit(t, dir, "remote", "add", "origin", remote)
+	}
+	return dir
+}
+
+func runGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	commandArgs := append([]string{"-C", dir}, args...)
+	output, err := exec.CommandContext(t.Context(), "git", commandArgs...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, output)
 	}
 }

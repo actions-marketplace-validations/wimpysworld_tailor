@@ -3,10 +3,13 @@ package alter_test
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/wimpysworld/tailor/internal/alter"
@@ -35,7 +38,7 @@ func TestProcessLicenceWrittenWhenAbsent(t *testing.T) {
 	client := testutil.NewTestClient(t, server)
 
 	cfg := &config.Config{License: "mit"}
-	result, err := alter.ProcessLicence(cfg, dir, alter.Apply, client)
+	result, err := alter.ProcessLicence(cfg, dir, alter.Apply, client, io.Discard)
 	if err != nil {
 		t.Fatalf("ProcessLicence() error: %v", err)
 	}
@@ -62,7 +65,7 @@ func TestProcessLicenceDryRunDoesNotWrite(t *testing.T) {
 	client := testutil.NewTestClient(t, server)
 
 	cfg := &config.Config{License: "mit"}
-	result, err := alter.ProcessLicence(cfg, dir, alter.DryRun, client)
+	result, err := alter.ProcessLicence(cfg, dir, alter.DryRun, client, io.Discard)
 	if err != nil {
 		t.Fatalf("ProcessLicence() error: %v", err)
 	}
@@ -88,18 +91,18 @@ func TestProcessLicenceSkippedWhenPresent(t *testing.T) {
 	client := testutil.NewTestClient(t, server)
 
 	cfg := &config.Config{License: "mit"}
-	result, err := alter.ProcessLicence(cfg, dir, alter.Apply, client)
+	result, err := alter.ProcessLicence(cfg, dir, alter.Apply, client, io.Discard)
 	if err != nil {
 		t.Fatalf("ProcessLicence() error: %v", err)
 	}
 	if result == nil {
 		t.Fatal("expected non-nil result")
 	}
-	if result.Category != alter.SkippedFirstFit {
-		t.Errorf("category = %q, want %q", result.Category, alter.SkippedFirstFit)
+	if result.Category != alter.Skipped || result.Reason != alter.SkipFirstFitExists {
+		t.Errorf("result = %+v, want skipped because first-fit destination exists", result)
 	}
 
-	// Verify file was not modified.
+	// Apply leaves the existing file unchanged.
 	data, err := os.ReadFile(filepath.Join(dir, "LICENSE"))
 	if err != nil {
 		t.Fatal(err)
@@ -119,15 +122,15 @@ func TestProcessLicenceExemptFromRecut(t *testing.T) {
 	client := testutil.NewTestClient(t, server)
 
 	cfg := &config.Config{License: "mit"}
-	result, err := alter.ProcessLicence(cfg, dir, alter.Recut, client)
+	result, err := alter.ProcessLicence(cfg, dir, alter.Recut, client, io.Discard)
 	if err != nil {
 		t.Fatalf("ProcessLicence() error: %v", err)
 	}
 	if result == nil {
 		t.Fatal("expected non-nil result")
 	}
-	if result.Category != alter.SkippedFirstFit {
-		t.Errorf("category = %q, want %q", result.Category, alter.SkippedFirstFit)
+	if result.Category != alter.Skipped || result.Reason != alter.SkipFirstFitExists {
+		t.Errorf("result = %+v, want skipped because first-fit destination exists", result)
 	}
 
 	data, err := os.ReadFile(filepath.Join(dir, "LICENSE"))
@@ -145,26 +148,22 @@ func TestProcessLicenceWarningWhenNoneAndNoFile(t *testing.T) {
 	t.Cleanup(server.Close)
 	client := testutil.NewTestClient(t, server)
 
-	var result *alter.SwatchResult
-	var err error
 	cfg := &config.Config{License: "none"}
 
-	output := captureStderr(t, func() {
-		result, err = alter.ProcessLicence(cfg, dir, alter.DryRun, client)
-	})
-
+	var stderr strings.Builder
+	result, err := alter.ProcessLicence(cfg, dir, alter.DryRun, client, &stderr)
 	if err != nil {
 		t.Fatalf("ProcessLicence() error: %v", err)
 	}
 	if result != nil {
 		t.Errorf("expected nil result, got %+v", result)
 	}
-	if output == "" {
+	if stderr.Len() == 0 {
 		t.Error("expected warning on stderr, got nothing")
 	}
 	want := "No licence file found and no licence configured."
-	if !bytes.Contains([]byte(output), []byte(want)) {
-		t.Errorf("stderr = %q, want substring %q", output, want)
+	if !strings.Contains(stderr.String(), want) {
+		t.Errorf("stderr = %q, want substring %q", stderr.String(), want)
 	}
 }
 
@@ -174,21 +173,17 @@ func TestProcessLicenceWarningWhenEmptyAndNoFile(t *testing.T) {
 	t.Cleanup(server.Close)
 	client := testutil.NewTestClient(t, server)
 
-	var result *alter.SwatchResult
-	var err error
 	cfg := &config.Config{License: ""}
 
-	output := captureStderr(t, func() {
-		result, err = alter.ProcessLicence(cfg, dir, alter.DryRun, client)
-	})
-
+	var stderr strings.Builder
+	result, err := alter.ProcessLicence(cfg, dir, alter.DryRun, client, &stderr)
 	if err != nil {
 		t.Fatalf("ProcessLicence() error: %v", err)
 	}
 	if result != nil {
 		t.Errorf("expected nil result, got %+v", result)
 	}
-	if output == "" {
+	if stderr.Len() == 0 {
 		t.Error("expected warning on stderr for empty licence, got nothing")
 	}
 }
@@ -199,18 +194,15 @@ func TestProcessLicenceNoWarningWhenConfigured(t *testing.T) {
 	t.Cleanup(server.Close)
 	client := testutil.NewTestClient(t, server)
 
-	var err error
 	cfg := &config.Config{License: "mit"}
 
-	output := captureStderr(t, func() {
-		_, err = alter.ProcessLicence(cfg, dir, alter.DryRun, client)
-	})
-
+	var stderr strings.Builder
+	_, err := alter.ProcessLicence(cfg, dir, alter.DryRun, client, &stderr)
 	if err != nil {
 		t.Fatalf("ProcessLicence() error: %v", err)
 	}
-	if output != "" {
-		t.Errorf("expected no stderr output, got %q", output)
+	if stderr.Len() != 0 {
+		t.Errorf("expected no stderr output, got %q", stderr.String())
 	}
 }
 
@@ -222,22 +214,69 @@ func TestProcessLicenceNoWarningWhenFileExistsAndNone(t *testing.T) {
 	t.Cleanup(server.Close)
 	client := testutil.NewTestClient(t, server)
 
-	var result *alter.SwatchResult
-	var err error
 	cfg := &config.Config{License: "none"}
 
-	output := captureStderr(t, func() {
-		result, err = alter.ProcessLicence(cfg, dir, alter.DryRun, client)
-	})
-
+	var stderr strings.Builder
+	result, err := alter.ProcessLicence(cfg, dir, alter.DryRun, client, &stderr)
 	if err != nil {
 		t.Fatalf("ProcessLicence() error: %v", err)
 	}
 	if result != nil {
 		t.Errorf("expected nil result, got %+v", result)
 	}
-	if output != "" {
-		t.Errorf("expected no stderr when LICENSE exists, got %q", output)
+	if stderr.Len() != 0 {
+		t.Errorf("expected no stderr when LICENSE exists, got %q", stderr.String())
+	}
+}
+
+func TestProcessLicenceWarningForNonRegularEntry(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(t *testing.T, dir string)
+	}{
+		{
+			name: "directory",
+			setup: func(t *testing.T, dir string) {
+				if err := os.Mkdir(filepath.Join(dir, "LICENSE"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "symlink",
+			setup: func(t *testing.T, dir string) {
+				symlinkOrSkip(t, "missing", filepath.Join(dir, "LICENSE"))
+			},
+		},
+		{
+			name: "special file",
+			setup: func(t *testing.T, dir string) {
+				if err := syscall.Mkfifo(filepath.Join(dir, "LICENSE"), 0o644); err != nil {
+					t.Skipf("mkfifo unavailable: %v", err)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		for _, licence := range []string{"", "none"} {
+			t.Run(fmt.Sprintf("%s/license=%q", tt.name, licence), func(t *testing.T) {
+				dir := t.TempDir()
+				tt.setup(t, dir)
+
+				var stderr strings.Builder
+				result, err := alter.ProcessLicence(&config.Config{License: licence}, dir, alter.DryRun, nil, &stderr)
+				if err != nil {
+					t.Fatalf("ProcessLicence() error: %v", err)
+				}
+				if result != nil {
+					t.Errorf("expected nil result, got %+v", result)
+				}
+				if !strings.Contains(stderr.String(), "No licence file found and no licence configured.") {
+					t.Errorf("expected warning for non-regular LICENSE, got %q", stderr.String())
+				}
+			})
+		}
 	}
 }
 
@@ -248,9 +287,40 @@ func TestProcessLicenceAPIErrorPropagated(t *testing.T) {
 	client := testutil.NewTestClient(t, server)
 
 	cfg := &config.Config{License: "mit"}
-	_, err := alter.ProcessLicence(cfg, dir, alter.Apply, client)
+	_, err := alter.ProcessLicence(cfg, dir, alter.Apply, client, io.Discard)
 	if err == nil {
 		t.Fatal("expected error from API failure, got nil")
+	}
+}
+
+func TestProcessLicenceAPIErrorPreservesSymlink(t *testing.T) {
+	dir := t.TempDir()
+	link := filepath.Join(dir, "LICENSE")
+	symlinkOrSkip(t, "target", link)
+
+	server := failingLicenceServer()
+	t.Cleanup(server.Close)
+	client := testutil.NewTestClient(t, server)
+
+	cfg := &config.Config{License: "mit"}
+	_, err := alter.ProcessLicence(cfg, dir, alter.Apply, client, io.Discard)
+	if err == nil {
+		t.Fatal("expected error from API failure, got nil")
+	}
+
+	info, err := os.Lstat(link)
+	if err != nil {
+		t.Fatalf("Lstat() error: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("LICENSE mode = %v, want symlink", info.Mode())
+	}
+	target, err := os.Readlink(link)
+	if err != nil {
+		t.Fatalf("Readlink() error: %v", err)
+	}
+	if target != "target" {
+		t.Errorf("symlink target = %q, want %q", target, "target")
 	}
 }
 
@@ -266,12 +336,158 @@ func TestProcessLicenceNilResultWhenNone(t *testing.T) {
 	for _, licence := range []string{"", "none"} {
 		t.Run(fmt.Sprintf("license=%q", licence), func(t *testing.T) {
 			cfg := &config.Config{License: licence}
-			result, err := alter.ProcessLicence(cfg, dir, alter.DryRun, client)
+			result, err := alter.ProcessLicence(cfg, dir, alter.DryRun, client, io.Discard)
 			if err != nil {
 				t.Fatalf("ProcessLicence() error: %v", err)
 			}
 			if result != nil {
 				t.Errorf("expected nil result for licence %q, got %+v", licence, result)
+			}
+		})
+	}
+}
+
+func TestProcessLicenceDestinationPolicy(t *testing.T) {
+	body := "new licence"
+	tests := []struct {
+		name     string
+		setup    func(t *testing.T, dir string)
+		wantErr  string
+		wantSkip bool
+		check    func(t *testing.T, dir string)
+	}{
+		{
+			name: "regular file skipped",
+			setup: func(t *testing.T, dir string) {
+				writeOnDisk(t, dir, "LICENSE", []byte("existing"))
+			},
+			wantSkip: true,
+			check: func(t *testing.T, dir string) {
+				data, err := os.ReadFile(filepath.Join(dir, "LICENSE"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(data) != "existing" {
+					t.Errorf("existing LICENSE changed to %q", data)
+				}
+			},
+		},
+		{
+			name: "directory rejected",
+			setup: func(t *testing.T, dir string) {
+				if err := os.Mkdir(filepath.Join(dir, "LICENSE"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantErr: `licence destination "LICENSE" is a directory`,
+		},
+		{
+			name: "dangling symlink replaced",
+			setup: func(t *testing.T, dir string) {
+				symlinkOrSkip(t, "missing", filepath.Join(dir, "LICENSE"))
+			},
+			check: func(t *testing.T, dir string) {
+				if _, err := os.Lstat(filepath.Join(dir, "missing")); !os.IsNotExist(err) {
+					t.Errorf("dangling target exists or returned an unexpected error: %v", err)
+				}
+			},
+		},
+		{
+			name: "in-root symlink replaced without following",
+			setup: func(t *testing.T, dir string) {
+				writeOnDisk(t, dir, "target", []byte("unchanged"))
+				symlinkOrSkip(t, "target", filepath.Join(dir, "LICENSE"))
+			},
+			check: func(t *testing.T, dir string) {
+				data, err := os.ReadFile(filepath.Join(dir, "target"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(data) != "unchanged" {
+					t.Errorf("symlink target changed to %q", data)
+				}
+			},
+		},
+		{
+			name: "escaping symlink replaced without following",
+			setup: func(t *testing.T, dir string) {
+				outside := filepath.Join(t.TempDir(), "LICENSE")
+				if err := os.WriteFile(outside, []byte("outside"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				symlinkOrSkip(t, outside, filepath.Join(dir, "LICENSE"))
+				t.Cleanup(func() {
+					data, err := os.ReadFile(outside)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if string(data) != "outside" {
+						t.Errorf("outside LICENSE changed to %q", data)
+					}
+				})
+			},
+		},
+		{
+			name: "special file rejected",
+			setup: func(t *testing.T, dir string) {
+				if err := syscall.Mkfifo(filepath.Join(dir, "LICENSE"), 0o644); err != nil {
+					t.Skipf("mkfifo unavailable: %v", err)
+				}
+			},
+			wantErr: `licence destination "LICENSE" is not a regular file`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			tt.setup(t, dir)
+
+			server := licenceServer(body)
+			t.Cleanup(server.Close)
+			client := testutil.NewTestClient(t, server)
+
+			cfg := &config.Config{License: "mit"}
+			result, err := alter.ProcessLicence(cfg, dir, alter.Apply, client, io.Discard)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("error = %v, want substring %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ProcessLicence() error: %v", err)
+			}
+			if result == nil {
+				t.Fatal("expected non-nil result")
+			}
+
+			if tt.wantSkip {
+				if result.Category != alter.Skipped || result.Reason != alter.SkipFirstFitExists {
+					t.Errorf("result = %+v, want skipped because first-fit destination exists", result)
+				}
+			} else {
+				if result.Category != alter.WouldCopy {
+					t.Errorf("category = %q, want %q", result.Category, alter.WouldCopy)
+				}
+				info, err := os.Lstat(filepath.Join(dir, "LICENSE"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !info.Mode().IsRegular() {
+					t.Errorf("LICENSE mode = %v, want regular file", info.Mode())
+				}
+				data, err := os.ReadFile(filepath.Join(dir, "LICENSE"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(data) != body {
+					t.Errorf("LICENSE content = %q, want %q", data, body)
+				}
+			}
+
+			if tt.check != nil {
+				tt.check(t, dir)
 			}
 		})
 	}

@@ -1,11 +1,14 @@
 package docket
 
 import (
+	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/cli/go-gh/v2/pkg/api"
 	"github.com/wimpysworld/tailor/internal/gh"
+	"github.com/wimpysworld/tailor/internal/termtext"
 )
 
 // Result holds the diagnostic information gathered by Run.
@@ -25,19 +28,22 @@ func Run(client *api.RESTClient) (*Result, error) {
 		Auth:       "not authenticated",
 	}
 
-	owner, name, ok := gh.RepoContext()
+	repo, ok := gh.RepoContext()
 	if ok {
-		r.Repository = owner + "/" + name
+		r.Repository = repo.Owner + "/" + repo.Name
 	}
 
-	if err := gh.CheckAuth(); err != nil {
+	// Resolve one effective host so the auth check and the REST client
+	// cannot disagree when no repository context exists.
+	host := gh.ResolveHost(repo.Host)
+
+	if err := gh.CheckAuth(host); err != nil {
 		return r, nil
 	}
-	r.Auth = "authenticated"
 
 	if client == nil {
 		var err error
-		client, err = api.DefaultRESTClient()
+		client, err = gh.NewRESTClient(host)
 		if err != nil {
 			return nil, err
 		}
@@ -45,9 +51,14 @@ func Run(client *api.RESTClient) (*Result, error) {
 
 	username, err := gh.FetchUsername(client)
 	if err != nil {
+		var httpErr *api.HTTPError
+		if errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusUnauthorized {
+			return r, nil
+		}
 		return nil, err
 	}
 	r.User = username
+	r.Auth = "authenticated"
 
 	return r, nil
 }
@@ -58,8 +69,8 @@ const labelWidth = 16
 // FormatOutput produces the docket command output from a Result.
 func FormatOutput(r *Result) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%-*s%s\n", labelWidth, "user:", r.User)
-	fmt.Fprintf(&b, "%-*s%s\n", labelWidth, "repository:", r.Repository)
-	fmt.Fprintf(&b, "%-*s%s\n", labelWidth, "auth:", r.Auth)
+	fmt.Fprintf(&b, "%-*s%s\n", labelWidth, "user:", termtext.EscapeControlText(r.User))
+	fmt.Fprintf(&b, "%-*s%s\n", labelWidth, "repository:", termtext.EscapeControlText(r.Repository))
+	fmt.Fprintf(&b, "%-*s%s\n", labelWidth, "auth:", termtext.EscapeControlText(r.Auth))
 	return b.String()
 }

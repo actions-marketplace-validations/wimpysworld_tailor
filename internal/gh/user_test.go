@@ -1,11 +1,15 @@
 package gh
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"sync/atomic"
+	"strings"
 	"testing"
+
+	"github.com/cli/go-gh/v2/pkg/api"
 )
 
 func TestFetchUsernameSuccess(t *testing.T) {
@@ -30,7 +34,6 @@ func TestFetchUsernameSuccess(t *testing.T) {
 }
 
 func TestFetchUsernameAPIError(t *testing.T) {
-	t.Setenv("GITHUB_ACTIONS", "")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
 		fmt.Fprint(w, `{"message": "Bad credentials"}`)
@@ -44,102 +47,83 @@ func TestFetchUsernameAPIError(t *testing.T) {
 	}
 }
 
-func TestFetchUsernameGitHubActionsFallback(t *testing.T) {
-	// Simulate installation token: GET /user returns 403.
+func TestFetchUsernameHTTPErrorBoundsRenderedLiveResponse(t *testing.T) {
+	details := make([]string, 4)
+	for i := range details {
+		details[i] = fmt.Sprintf("detail-%d-\x00\x1b[31m\t\r%s-PRIVATE-TAIL-%d", i, strings.Repeat("x", 300), i)
+	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusForbidden)
-		fmt.Fprint(w, `{"message": "Resource not accessible by integration"}`)
-	}))
-	t.Cleanup(server.Close)
-
-	t.Setenv("GITHUB_ACTIONS", "true")
-	t.Setenv("GITHUB_REPOSITORY_OWNER", "testowner")
-
-	client := newTestClient(t, server)
-	username, err := FetchUsername(client)
-	if err != nil {
-		t.Fatalf("FetchUsername() error: %v", err)
-	}
-
-	if username != "testowner" {
-		t.Errorf("username = %q, want %q", username, "testowner")
-	}
-}
-
-func TestFetchUsernameGitHubActionsPATUsesAPI(t *testing.T) {
-	// PAT in GitHub Actions: GET /user succeeds.
-	var requestCount atomic.Int64
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestCount.Add(1)
-		if r.URL.Path != "/user" {
-			http.NotFound(w, r)
-			return
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		if err := json.NewEncoder(w).Encode(map[string]any{
+			"message": "Bad credentials\x1b[2J",
+			"errors":  details,
+		}); err != nil {
+			t.Errorf("encode response: %v", err)
 		}
-		fmt.Fprint(w, `{"login": "patuser"}`)
 	}))
 	t.Cleanup(server.Close)
 
-	t.Setenv("GITHUB_ACTIONS", "true")
-	t.Setenv("GITHUB_REPOSITORY_OWNER", "testowner")
-
-	client := newTestClient(t, server)
-	username, err := FetchUsername(client)
-	if err != nil {
-		t.Fatalf("FetchUsername() error: %v", err)
-	}
-
-	if username != "patuser" {
-		t.Errorf("username = %q, want %q", username, "patuser")
-	}
-
-	if n := requestCount.Load(); n == 0 {
-		t.Error("expected at least one HTTP request, got zero")
-	}
-}
-
-func TestFetchUsernameGitHubActionsNoOwner(t *testing.T) {
-	// Installation token with no GITHUB_REPOSITORY_OWNER: error propagated.
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusForbidden)
-		fmt.Fprint(w, `{"message": "Resource not accessible by integration"}`)
-	}))
-	t.Cleanup(server.Close)
-
-	t.Setenv("GITHUB_ACTIONS", "true")
-	t.Setenv("GITHUB_REPOSITORY_OWNER", "")
-
-	client := newTestClient(t, server)
-	_, err := FetchUsername(client)
+	_, err := FetchUsername(newTestClient(t, server))
 	if err == nil {
-		t.Fatal("FetchUsername() expected error when GITHUB_REPOSITORY_OWNER is empty, got nil")
+		t.Fatal("FetchUsername() error = nil, want HTTP error")
+	}
+	var httpErr *api.HTTPError
+	if !errors.As(err, &httpErr) {
+		t.Fatalf("FetchUsername() error type = %T, want *api.HTTPError", err)
+	}
+	if httpErr.StatusCode != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d", httpErr.StatusCode, http.StatusUnauthorized)
+	}
+	if len(httpErr.Errors) != 3 {
+		t.Errorf("detail count = %d, want 3", len(httpErr.Errors))
+	}
+	rendered := err.Error()
+	if strings.ContainsAny(rendered, "\x00\x1b\r\t") {
+		t.Errorf("error contains terminal control characters: %q", rendered)
+	}
+	for i := range details {
+		if strings.Contains(rendered, details[i]) || strings.Contains(rendered, fmt.Sprintf("PRIVATE-TAIL-%d", i)) {
+			t.Errorf("error contains unbounded detail %d: %q", i, rendered)
+		}
+	}
+	if strings.Contains(rendered, "detail-3-") {
+		t.Errorf("error contains fourth detail: %q", rendered)
+	}
+	if len(rendered) > 1200 {
+		t.Errorf("rendered error length = %d, want at most 1200", len(rendered))
 	}
 }
 
-func TestFetchUsernameNotGitHubActions(t *testing.T) {
-	var requestCount atomic.Int64
+func TestFetchUsernameGitHubActionsDoesNotMaskAPIError(t *testing.T) {
+	t.Setenv("GITHUB_ACTIONS", "true")
+	t.Setenv("GITHUB_REPOSITORY_OWNER", "actions-owner")
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestCount.Add(1)
 		if r.URL.Path != "/user" {
 			http.NotFound(w, r)
 			return
 		}
-		fmt.Fprint(w, `{"login": "apiuser"}`)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		fmt.Fprint(w, `{"message": "Resource not accessible by integration"}`)
 	}))
 	t.Cleanup(server.Close)
 
-	t.Setenv("GITHUB_ACTIONS", "")
-
 	client := newTestClient(t, server)
 	username, err := FetchUsername(client)
-	if err != nil {
-		t.Fatalf("FetchUsername() error: %v", err)
+	if err == nil {
+		t.Fatalf("FetchUsername() = %q, nil; want /user API error", username)
 	}
 
-	if username != "apiuser" {
-		t.Errorf("username = %q, want %q", username, "apiuser")
+	var httpErr *api.HTTPError
+	if !errors.As(err, &httpErr) {
+		t.Fatalf("FetchUsername() error = %T, want *api.HTTPError", err)
 	}
-
-	if n := requestCount.Load(); n == 0 {
-		t.Error("expected at least one HTTP request, got zero")
+	if httpErr.StatusCode != http.StatusForbidden {
+		t.Errorf("FetchUsername() error status = %d, want %d", httpErr.StatusCode, http.StatusForbidden)
+	}
+	if httpErr.Message != "Resource not accessible by integration" {
+		t.Errorf("FetchUsername() error message = %q, want %q", httpErr.Message, "Resource not accessible by integration")
 	}
 }

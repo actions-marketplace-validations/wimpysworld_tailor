@@ -3,13 +3,13 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
 
 	"github.com/wimpysworld/tailor/internal/model"
-	"github.com/wimpysworld/tailor/internal/ptr"
 	"github.com/wimpysworld/tailor/internal/swatch"
 )
 
@@ -32,8 +32,25 @@ repository:
   allow_update_branch: true
   allow_auto_merge: true
   web_commit_signoff_required: false
+  private_vulnerability_reporting_enabled: true
+  vulnerability_alerts_enabled: true
+  automated_security_fixes_enabled: true
   default_workflow_permissions: read
-  can_approve_pull_request_reviews: true
+  can_approve_pull_request_reviews: false
+
+actions:
+  enabled: true
+  allowed_actions: selected
+  sha_pinning_required: false
+  github_owned_allowed: true
+  verified_allowed: true
+  patterns_allowed:
+    - "freerangebytes/setup-actionlint@*"
+    - "golang/govulncheck-action@*"
+    - "golangci/golangci-lint-action@*"
+    - "nick-fields/retry@*"
+    - "robherley/go-test-action@*"
+    - "softprops/action-gh-release@*"
 
 labels:
   - name: bug
@@ -57,7 +74,7 @@ labels:
     description: Good for newcomers
 
   - name: help wanted
-    color: 179299
+    color: "179299"
     description: Extra attention needed
 
   - name: invalid
@@ -85,9 +102,6 @@ labels:
     description: Hacktoberfest contribution
 
 swatches:
-  - path: .github/workflows/tailor.yml
-    alteration: always
-
   - path: .github/dependabot.yml
     alteration: first-fit
 
@@ -104,7 +118,7 @@ swatches:
     alteration: first-fit
 
   - path: .github/pull_request_template.md
-    alteration: always
+    alteration: never
 
   - path: SECURITY.md
     alteration: always
@@ -135,9 +149,6 @@ swatches:
 
   - path: .tailor.yml
     alteration: always
-
-  - path: .github/workflows/tailor-automerge.yml
-    alteration: triggered
 `
 
 func TestWriteDefaultConfigMatchesSpec(t *testing.T) {
@@ -173,7 +184,7 @@ func TestWriteCreatesFile(t *testing.T) {
 	cfg := &Config{
 		License: "MIT",
 		Repository: &model.RepositorySettings{
-			HasWiki: ptr.Ptr(false),
+			HasWiki: new(false),
 		},
 		Swatches: []SwatchEntry{
 			{Path: "justfile", Alteration: swatch.FirstFit},
@@ -191,31 +202,136 @@ func TestWriteCreatesFile(t *testing.T) {
 	if info.IsDir() {
 		t.Error(".tailor.yml is a directory, want file")
 	}
+	if got, want := info.Mode().Perm(), os.FileMode(0o644); got != want {
+		t.Errorf(".tailor.yml permissions = %v, want %v", got, want)
+	}
+}
+
+func TestWriteReplacesExistingConfig(t *testing.T) {
+	dir := t.TempDir()
+	configFile := filepath.Join(dir, ".tailor.yml")
+	if err := os.WriteFile(configFile, []byte("old config\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cfg := &Config{
+		License: "MIT",
+		Swatches: []SwatchEntry{
+			{Path: "justfile", Alteration: swatch.FirstFit},
+		},
+	}
+	if err := Write(dir, cfg, "2026-08-25", "Refitted"); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	written, err := os.ReadFile(configFile)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if strings.Contains(string(written), "old config") {
+		t.Errorf(".tailor.yml still contains old content:\n%s", written)
+	}
+	if !strings.Contains(string(written), "# Refitted by tailor on 2026-08-25") {
+		t.Errorf(".tailor.yml does not contain replacement content:\n%s", written)
+	}
+
+	info, err := os.Stat(configFile)
+	if err != nil {
+		t.Fatalf("Stat: %v", err)
+	}
+	if got, want := info.Mode().Perm(), os.FileMode(0o600); got != want {
+		t.Errorf(".tailor.yml permissions = %v, want preserved %v", got, want)
+	}
+}
+
+func TestWriteCleansUpTemporaryConfigAfterRenameFailure(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, ".tailor.yml"), 0o755); err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+
+	cfg := &Config{
+		License: "MIT",
+		Swatches: []SwatchEntry{
+			{Path: "justfile", Alteration: swatch.FirstFit},
+		},
+	}
+	if err := Write(dir, cfg, "2026-08-25", "Refitted"); err == nil {
+		t.Fatal("Write() error = nil, want rename error")
+	}
+
+	temps, err := filepath.Glob(filepath.Join(dir, ".tailor.yml.tmp-*"))
+	if err != nil {
+		t.Fatalf("Glob: %v", err)
+	}
+	if len(temps) != 0 {
+		t.Errorf("temporary config files remain after rename failure: %v", temps)
+	}
+}
+
+func TestWriteRejectsConfigSymlinkOutsideProjectRoot(t *testing.T) {
+	dir := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "outside.yml")
+	wantOutside := []byte("outside must stay unchanged\n")
+	if err := os.WriteFile(outside, wantOutside, 0o644); err != nil {
+		t.Fatalf("WriteFile(%q): %v", outside, err)
+	}
+	if err := os.Symlink(outside, filepath.Join(dir, ".tailor.yml")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	cfg := &Config{
+		License: "MIT",
+		Swatches: []SwatchEntry{
+			{Path: "justfile", Alteration: swatch.FirstFit},
+		},
+	}
+	if err := Write(dir, cfg, "2026-08-23", "Refitted"); err == nil {
+		t.Fatal("Write() error = nil, want root-confinement error")
+	}
+
+	gotOutside, err := os.ReadFile(outside)
+	if err != nil {
+		t.Fatalf("ReadFile(%q): %v", outside, err)
+	}
+	if string(gotOutside) != string(wantOutside) {
+		t.Errorf("outside config = %q, want %q", gotOutside, wantOutside)
+	}
+	info, err := os.Lstat(filepath.Join(dir, ".tailor.yml"))
+	if err != nil {
+		t.Fatalf("Lstat(.tailor.yml): %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Errorf(".tailor.yml mode = %v, want symlink", info.Mode())
+	}
 }
 
 func TestWriteOptionalFieldsPresent(t *testing.T) {
 	cfg := &Config{
 		License: "Apache-2.0",
 		Repository: &model.RepositorySettings{
-			Description:                  ptr.Ptr("My project"),
-			Homepage:                     ptr.Ptr("https://example.com"),
-			HasWiki:                      ptr.Ptr(true),
-			HasDiscussions:               ptr.Ptr(false),
-			HasProjects:                  ptr.Ptr(false),
-			HasIssues:                    ptr.Ptr(true),
-			AllowMergeCommit:             ptr.Ptr(true),
-			AllowSquashMerge:             ptr.Ptr(true),
-			AllowRebaseMerge:             ptr.Ptr(false),
-			SquashMergeCommitTitle:       ptr.Ptr("PR_TITLE"),
-			SquashMergeCommitMessage:     ptr.Ptr("COMMIT_MESSAGES"),
-			MergeCommitTitle:             ptr.Ptr("PR_TITLE"),
-			MergeCommitMessage:           ptr.Ptr("PR_BODY"),
-			DeleteBranchOnMerge:          ptr.Ptr(true),
-			AllowUpdateBranch:            ptr.Ptr(true),
-			AllowAutoMerge:               ptr.Ptr(false),
-			WebCommitSignoffRequired:     ptr.Ptr(true),
-			DefaultWorkflowPermissions:   ptr.Ptr("write"),
-			CanApprovePullRequestReviews: ptr.Ptr(true),
+			Description:                       new("My project"),
+			Homepage:                          new("https://example.com"),
+			HasWiki:                           new(true),
+			HasDiscussions:                    new(false),
+			HasProjects:                       new(false),
+			HasIssues:                         new(true),
+			AllowMergeCommit:                  new(true),
+			AllowSquashMerge:                  new(true),
+			AllowRebaseMerge:                  new(false),
+			SquashMergeCommitTitle:            new("PR_TITLE"),
+			SquashMergeCommitMessage:          new("COMMIT_MESSAGES"),
+			MergeCommitTitle:                  new("PR_TITLE"),
+			MergeCommitMessage:                new("PR_BODY"),
+			DeleteBranchOnMerge:               new(true),
+			AllowUpdateBranch:                 new(true),
+			AllowAutoMerge:                    new(false),
+			WebCommitSignoffRequired:          new(true),
+			PrivateVulnerabilityReportEnabled: new(true),
+			VulnerabilityAlertsEnabled:        new(false),
+			AutomatedSecurityFixesEnabled:     new(true),
+			DefaultWorkflowPermissions:        new("write"),
+			CanApprovePullRequestReviews:      new(true),
 		},
 		Swatches: []SwatchEntry{
 			{Path: "justfile", Alteration: swatch.FirstFit},
@@ -243,6 +359,9 @@ repository:
   allow_update_branch: true
   allow_auto_merge: false
   web_commit_signoff_required: true
+  private_vulnerability_reporting_enabled: true
+  vulnerability_alerts_enabled: false
+  automated_security_fixes_enabled: true
   default_workflow_permissions: write
   can_approve_pull_request_reviews: true
 
@@ -271,21 +390,21 @@ func TestWriteOptionalFieldsOmitted(t *testing.T) {
 		License: "MIT",
 		Repository: &model.RepositorySettings{
 			// Description, Homepage, MergeCommitTitle, MergeCommitMessage are nil.
-			HasWiki:                      ptr.Ptr(false),
-			HasDiscussions:               ptr.Ptr(false),
-			HasProjects:                  ptr.Ptr(false),
-			HasIssues:                    ptr.Ptr(true),
-			AllowMergeCommit:             ptr.Ptr(false),
-			AllowSquashMerge:             ptr.Ptr(true),
-			AllowRebaseMerge:             ptr.Ptr(true),
-			SquashMergeCommitTitle:       ptr.Ptr("PR_TITLE"),
-			SquashMergeCommitMessage:     ptr.Ptr("PR_BODY"),
-			DeleteBranchOnMerge:          ptr.Ptr(true),
-			AllowUpdateBranch:            ptr.Ptr(true),
-			AllowAutoMerge:               ptr.Ptr(true),
-			WebCommitSignoffRequired:     ptr.Ptr(false),
-			DefaultWorkflowPermissions:   ptr.Ptr("read"),
-			CanApprovePullRequestReviews: ptr.Ptr(false),
+			HasWiki:                      new(false),
+			HasDiscussions:               new(false),
+			HasProjects:                  new(false),
+			HasIssues:                    new(true),
+			AllowMergeCommit:             new(false),
+			AllowSquashMerge:             new(true),
+			AllowRebaseMerge:             new(true),
+			SquashMergeCommitTitle:       new("PR_TITLE"),
+			SquashMergeCommitMessage:     new("PR_BODY"),
+			DeleteBranchOnMerge:          new(true),
+			AllowUpdateBranch:            new(true),
+			AllowAutoMerge:               new(true),
+			WebCommitSignoffRequired:     new(false),
+			DefaultWorkflowPermissions:   new("read"),
+			CanApprovePullRequestReviews: new(false),
 		},
 		Swatches: []SwatchEntry{
 			{Path: "justfile", Alteration: swatch.FirstFit},
@@ -338,8 +457,8 @@ func TestWriteYAMLSpecialCharactersQuoted(t *testing.T) {
 		License: "MIT",
 		Repository: &model.RepositorySettings{
 			Description:      &desc,
-			HasWiki:          ptr.Ptr(false),
-			AllowSquashMerge: ptr.Ptr(true),
+			HasWiki:          new(false),
+			AllowSquashMerge: new(true),
 		},
 		Swatches: []SwatchEntry{
 			{Path: "justfile", Alteration: swatch.FirstFit},
@@ -370,12 +489,105 @@ func TestWriteYAMLSpecialCharactersQuoted(t *testing.T) {
 	}
 }
 
+func TestWriteDynamicScalarsRoundTrip(t *testing.T) {
+	topics := []string{"? topic"}
+	patterns := []string{"- actions pattern"}
+	cfg := &Config{
+		License: "- licence",
+		Repository: &model.RepositorySettings{
+			Description: new("- repository description"),
+			Homepage:    new("? repository homepage"),
+			Topics:      &topics,
+		},
+		Actions: &model.ActionsSettings{
+			AllowedActions:  new("? actions policy"),
+			PatternsAllowed: &patterns,
+		},
+		Labels: []model.LabelEntry{
+			{
+				Name:        "- label name",
+				Color:       "? label colour",
+				Description: "- label description",
+			},
+		},
+		Swatches: []SwatchEntry{
+			{Path: "justfile", Alteration: swatch.FirstFit},
+		},
+	}
+
+	dir := t.TempDir()
+	if err := Write(dir, cfg, "2026-08-25", "Refitted"); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	written, err := os.ReadFile(filepath.Join(dir, ".tailor.yml"))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+
+	var parsed Config
+	if err := yaml.Unmarshal(written, &parsed); err != nil {
+		t.Fatalf("output is not valid YAML: %v\n--- output ---\n%s", err, written)
+	}
+	if !reflect.DeepEqual(parsed, *cfg) {
+		t.Errorf("round-tripped config = %#v, want %#v", parsed, *cfg)
+	}
+}
+
+func TestWriteHomepageRoundTrips(t *testing.T) {
+	tests := []struct {
+		name     string
+		homepage string
+	}{
+		{"plain URL", "https://example.com"},
+		{"contains space", "https://example.com/my page"},
+		{"contains space hash", "https://example.com #fragment"},
+		{"contains colon tab", "https://example.com/a:\tb"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &Config{
+				License: "MIT",
+				Repository: &model.RepositorySettings{
+					Homepage: &tc.homepage,
+					HasWiki:  new(false),
+				},
+				Swatches: []SwatchEntry{
+					{Path: "justfile", Alteration: swatch.FirstFit},
+				},
+			}
+
+			dir := t.TempDir()
+			if err := Write(dir, cfg, "2026-03-04", "Initially fitted"); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+
+			got, err := os.ReadFile(filepath.Join(dir, ".tailor.yml"))
+			if err != nil {
+				t.Fatalf("ReadFile: %v", err)
+			}
+
+			var parsed Config
+			if err := yaml.Unmarshal(got, &parsed); err != nil {
+				t.Fatalf("output is not valid YAML: %v\n--- output ---\n%s", err, got)
+			}
+
+			if parsed.Repository == nil || parsed.Repository.Homepage == nil {
+				t.Fatal("parsed Repository.Homepage is nil")
+			}
+			if *parsed.Repository.Homepage != tc.homepage {
+				t.Errorf("round-tripped Homepage = %q, want %q", *parsed.Repository.Homepage, tc.homepage)
+			}
+		})
+	}
+}
+
 func TestWriteTopicsPreserved(t *testing.T) {
 	topics := []string{"go", "cli", "template"}
 	cfg := &Config{
 		License: "MIT",
 		Repository: &model.RepositorySettings{
-			HasWiki: ptr.Ptr(false),
+			HasWiki: new(false),
 			Topics:  &topics,
 		},
 		Swatches: []SwatchEntry{
@@ -421,8 +633,8 @@ func TestWriteTopicsOmittedWhenNil(t *testing.T) {
 	cfg := &Config{
 		License: "MIT",
 		Repository: &model.RepositorySettings{
-			HasWiki: ptr.Ptr(false),
-			// Topics is nil - should be omitted from output.
+			HasWiki: new(false),
+			// Nil topics are omitted from output.
 		},
 		Swatches: []SwatchEntry{
 			{Path: "justfile", Alteration: swatch.FirstFit},
@@ -449,7 +661,7 @@ func TestWriteEmptyTopicsRoundTrip(t *testing.T) {
 	cfg := &Config{
 		License: "MIT",
 		Repository: &model.RepositorySettings{
-			HasWiki: ptr.Ptr(false),
+			HasWiki: new(false),
 			Topics:  &topics,
 		},
 		Swatches: []SwatchEntry{

@@ -6,6 +6,7 @@ import (
 
 	"github.com/wimpysworld/tailor/internal/model"
 	"github.com/wimpysworld/tailor/internal/swatch"
+	"github.com/wimpysworld/tailor/internal/testutil"
 )
 
 // allNonConfigSwatches returns every registered swatch except .tailor.yml.
@@ -59,7 +60,7 @@ func TestMergeSubset(t *testing.T) {
 		t.Fatalf("expected %d total swatches, got %d", len(expected), len(cfg.Swatches))
 	}
 
-	// Verify each added entry has the correct alteration mode from the registry.
+	// Added entries use their registry alteration modes.
 	addedByPath := make(map[string]SwatchEntry, len(added))
 	for _, e := range added {
 		addedByPath[e.Path] = e
@@ -120,11 +121,65 @@ func TestMergeEmptyConfig(t *testing.T) {
 		t.Fatalf("expected %d total swatches, got %d", len(expected), len(cfg.Swatches))
 	}
 
-	// Verify no config swatch entry was added.
+	// The config swatch is not merged into cfg.Swatches.
 	for _, e := range cfg.Swatches {
 		if e.Path == ConfigSwatchPath {
 			t.Fatal("config swatch should not be added by merge")
 		}
+	}
+}
+
+func TestMergeDefaultsChangedByEachSection(t *testing.T) {
+	tests := []struct {
+		name  string
+		alter func(*Config)
+	}{
+		{
+			name: "swatches",
+			alter: func(cfg *Config) {
+				cfg.Swatches = cfg.Swatches[1:]
+			},
+		},
+		{
+			name: "repository",
+			alter: func(cfg *Config) {
+				cfg.Repository.HasIssues = nil
+			},
+		},
+		{
+			name: "actions",
+			alter: func(cfg *Config) {
+				cfg.Actions.Enabled = nil
+			},
+		},
+		{
+			name: "labels",
+			alter: func(cfg *Config) {
+				cfg.Labels = nil
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := defaultConfig(t)
+			tt.alter(cfg)
+
+			changed, err := MergeDefaults(cfg)
+			if err != nil {
+				t.Fatalf("MergeDefaults() error = %v", err)
+			}
+			if !changed {
+				t.Fatal("MergeDefaults() changed = false, want true")
+			}
+			changed, err = MergeDefaults(cfg)
+			if err != nil {
+				t.Fatalf("second MergeDefaults() error = %v", err)
+			}
+			if changed {
+				t.Fatal("second MergeDefaults() changed = true, want false")
+			}
+		})
 	}
 }
 
@@ -142,23 +197,36 @@ func defaultRepoDefaults(t *testing.T) *model.RepositorySettings {
 	return defaults.Repository
 }
 
+func defaultConfig(t *testing.T) *Config {
+	t.Helper()
+	defaults, err := DefaultConfig("_")
+	if err != nil {
+		t.Fatalf("DefaultConfig: %v", err)
+	}
+	return defaults
+}
+
+func mergeRepoDefaultsForTest(t *testing.T, cfg *Config) bool {
+	t.Helper()
+	return mergeRepoSettingsFrom(cfg, defaultConfig(t))
+}
+
+func mergeLabelsDefaultsForTest(t *testing.T, cfg *Config) bool {
+	t.Helper()
+	return mergeLabelsFrom(cfg, defaultConfig(t))
+}
+
 // countMergeableFields returns the number of pointer fields in the default
 // RepositorySettings that are non-nil and not in repoSettingsSkipFields.
 func countMergeableFields(t *testing.T) int {
 	t.Helper()
 	def := defaultRepoDefaults(t)
-	dv := reflect.ValueOf(def).Elem()
-	dt := dv.Type()
 	count := 0
-	for i := range dt.NumField() {
-		f := dt.Field(i)
-		if _, skip := repoSettingsSkipFields[f.Name]; skip {
+	for _, field := range model.RepositorySettingFields(def) {
+		if _, skip := repoSettingsSkipFields[field.YAMLKey]; skip {
 			continue
 		}
-		if f.Tag.Get("yaml") == "" || f.Tag.Get("yaml") == ",inline" {
-			continue
-		}
-		if dv.Field(i).Kind() == reflect.Pointer && !dv.Field(i).IsNil() {
+		if field.Set {
 			count++
 		}
 	}
@@ -168,7 +236,7 @@ func countMergeableFields(t *testing.T) int {
 func TestMergeRepoSettingsNilRepository(t *testing.T) {
 	cfg := &Config{}
 
-	changed := MergeDefaultRepoSettings(cfg)
+	changed := mergeRepoDefaultsForTest(t, cfg)
 
 	if !changed {
 		t.Fatal("expected changed=true for nil Repository")
@@ -178,30 +246,23 @@ func TestMergeRepoSettingsNilRepository(t *testing.T) {
 	}
 
 	def := defaultRepoDefaults(t)
-	dv := reflect.ValueOf(def).Elem()
 	cv := reflect.ValueOf(cfg.Repository).Elem()
-	dt := dv.Type()
 
 	merged := 0
-	for i := range dt.NumField() {
-		f := dt.Field(i)
-		if _, skip := repoSettingsSkipFields[f.Name]; skip {
+	for _, field := range model.RepositorySettingFields(def) {
+		if _, skip := repoSettingsSkipFields[field.YAMLKey]; skip {
 			continue
 		}
-		if f.Tag.Get("yaml") == "" || f.Tag.Get("yaml") == ",inline" {
+		if !field.Set {
 			continue
 		}
-		dfv := dv.Field(i)
-		if dfv.Kind() != reflect.Pointer || dfv.IsNil() {
-			continue
-		}
-		cfv := cv.Field(i)
+		cfv := cv.Field(field.Index)
 		if cfv.IsNil() {
-			t.Errorf("field %s should be set from defaults", f.Name)
+			t.Errorf("field %s should be set from defaults", field.YAMLKey)
 			continue
 		}
-		if !reflect.DeepEqual(cfv.Elem().Interface(), dfv.Elem().Interface()) {
-			t.Errorf("field %s: got %v, want %v", f.Name, cfv.Elem().Interface(), dfv.Elem().Interface())
+		if !reflect.DeepEqual(cfv.Elem().Interface(), field.Value.Elem().Interface()) {
+			t.Errorf("field %s: got %v, want %v", field.YAMLKey, cfv.Elem().Interface(), field.Value.Elem().Interface())
 		}
 		merged++
 	}
@@ -213,15 +274,17 @@ func TestMergeRepoSettingsNilRepository(t *testing.T) {
 
 func TestMergeRepoSettingsPartialRepository(t *testing.T) {
 	customWiki := true
+	customCanApprove := true
 	customTitle := "CUSTOM_TITLE"
 	cfg := &Config{
 		Repository: &model.RepositorySettings{
-			HasWiki:                &customWiki,
-			SquashMergeCommitTitle: &customTitle,
+			HasWiki:                      &customWiki,
+			CanApprovePullRequestReviews: &customCanApprove,
+			SquashMergeCommitTitle:       &customTitle,
 		},
 	}
 
-	changed := MergeDefaultRepoSettings(cfg)
+	changed := mergeRepoDefaultsForTest(t, cfg)
 
 	if !changed {
 		t.Fatal("expected changed=true for partial Repository")
@@ -231,33 +294,57 @@ func TestMergeRepoSettingsPartialRepository(t *testing.T) {
 	if *cfg.Repository.HasWiki != customWiki {
 		t.Errorf("HasWiki changed: got %v, want %v", *cfg.Repository.HasWiki, customWiki)
 	}
+	if *cfg.Repository.CanApprovePullRequestReviews != customCanApprove {
+		t.Errorf("CanApprovePullRequestReviews changed: got %v, want %v", *cfg.Repository.CanApprovePullRequestReviews, customCanApprove)
+	}
 	if *cfg.Repository.SquashMergeCommitTitle != customTitle {
 		t.Errorf("SquashMergeCommitTitle changed: got %q, want %q", *cfg.Repository.SquashMergeCommitTitle, customTitle)
 	}
 
-	// Nil fields should now be filled from defaults.
+	// Nil fields receive values from defaults.
 	def := defaultRepoDefaults(t)
-	dv := reflect.ValueOf(def).Elem()
 	cv := reflect.ValueOf(cfg.Repository).Elem()
-	dt := dv.Type()
 
-	for i := range dt.NumField() {
-		f := dt.Field(i)
-		if _, skip := repoSettingsSkipFields[f.Name]; skip {
+	for _, field := range model.RepositorySettingFields(def) {
+		if _, skip := repoSettingsSkipFields[field.YAMLKey]; skip {
 			continue
 		}
-		if f.Tag.Get("yaml") == "" || f.Tag.Get("yaml") == ",inline" {
+		if !field.Set {
 			continue
 		}
-		dfv := dv.Field(i)
-		if dfv.Kind() != reflect.Pointer || dfv.IsNil() {
-			continue
-		}
-		cfv := cv.Field(i)
+		cfv := cv.Field(field.Index)
 		if cfv.IsNil() {
-			t.Errorf("field %s should be set from defaults", f.Name)
+			t.Errorf("field %s should be set from defaults", field.YAMLKey)
 		}
 	}
+}
+
+func TestMergeRepoSettingsAddsSecurityDefaults(t *testing.T) {
+	cfg := &Config{Repository: &model.RepositorySettings{HasWiki: new(false)}}
+
+	if !mergeRepoDefaultsForTest(t, cfg) {
+		t.Fatal("expected changed=true for missing security settings")
+	}
+
+	testutil.AssertPtr(t, cfg.Repository.PrivateVulnerabilityReportEnabled, false, true, "private_vulnerability_reporting_enabled")
+	testutil.AssertPtr(t, cfg.Repository.VulnerabilityAlertsEnabled, false, true, "vulnerability_alerts_enabled")
+	testutil.AssertPtr(t, cfg.Repository.AutomatedSecurityFixesEnabled, false, true, "automated_security_fixes_enabled")
+}
+
+func TestMergeRepoSettingsPreservesExplicitFalseSecuritySettings(t *testing.T) {
+	cfg := &Config{Repository: &model.RepositorySettings{
+		PrivateVulnerabilityReportEnabled: new(false),
+		VulnerabilityAlertsEnabled:        new(false),
+		AutomatedSecurityFixesEnabled:     new(false),
+	}}
+
+	if !mergeRepoDefaultsForTest(t, cfg) {
+		t.Fatal("expected changed=true for other missing repository settings")
+	}
+
+	testutil.AssertPtr(t, cfg.Repository.PrivateVulnerabilityReportEnabled, false, false, "private_vulnerability_reporting_enabled")
+	testutil.AssertPtr(t, cfg.Repository.VulnerabilityAlertsEnabled, false, false, "vulnerability_alerts_enabled")
+	testutil.AssertPtr(t, cfg.Repository.AutomatedSecurityFixesEnabled, false, false, "automated_security_fixes_enabled")
 }
 
 func TestMergeRepoSettingsFullRepository(t *testing.T) {
@@ -284,10 +371,67 @@ func TestMergeRepoSettingsFullRepository(t *testing.T) {
 
 	cfg := &Config{Repository: full}
 
-	changed := MergeDefaultRepoSettings(cfg)
+	changed := mergeRepoDefaultsForTest(t, cfg)
 
 	if changed {
 		t.Fatal("expected changed=false for full Repository")
+	}
+}
+
+func mergeActionsDefaultsForTest(t *testing.T, cfg *Config) bool {
+	t.Helper()
+	return mergeActionsFrom(cfg, defaultConfig(t))
+}
+
+func TestMergeActionsNilActions(t *testing.T) {
+	cfg := &Config{}
+
+	if !mergeActionsDefaultsForTest(t, cfg) {
+		t.Fatal("expected changed=true for nil Actions")
+	}
+
+	// The default policy is "selected", so selected-only fields merge too.
+	testutil.AssertPtr(t, cfg.Actions.Enabled, false, true, "enabled")
+	testutil.AssertPtr(t, cfg.Actions.AllowedActions, false, "selected", "allowed_actions")
+	testutil.AssertPtr(t, cfg.Actions.SHAPinningRequired, false, false, "sha_pinning_required")
+	testutil.AssertPtr(t, cfg.Actions.GitHubOwnedAllowed, false, true, "github_owned_allowed")
+	testutil.AssertPtr(t, cfg.Actions.VerifiedAllowed, false, true, "verified_allowed")
+	if cfg.Actions.PatternsAllowed == nil || len(*cfg.Actions.PatternsAllowed) == 0 {
+		t.Error("patterns_allowed should be set from defaults")
+	}
+}
+
+func TestMergeActionsSkipsSelectedFieldsForOtherPolicies(t *testing.T) {
+	policy := "all"
+	cfg := &Config{Actions: &model.ActionsSettings{AllowedActions: &policy}}
+
+	if !mergeActionsDefaultsForTest(t, cfg) {
+		t.Fatal("expected changed=true for missing non-selected fields")
+	}
+
+	testutil.AssertPtr(t, cfg.Actions.Enabled, false, true, "enabled")
+	testutil.AssertPtr(t, cfg.Actions.AllowedActions, false, "all", "allowed_actions")
+	testutil.AssertPtr(t, cfg.Actions.GitHubOwnedAllowed, true, false, "github_owned_allowed")
+	testutil.AssertPtr(t, cfg.Actions.VerifiedAllowed, true, false, "verified_allowed")
+	if cfg.Actions.PatternsAllowed != nil {
+		t.Error("patterns_allowed should remain nil for non-selected policy")
+	}
+}
+
+func TestMergeActionsClonesPatterns(t *testing.T) {
+	defaults := defaultConfig(t)
+	cfg := &Config{}
+
+	if !mergeActionsFrom(cfg, defaults) {
+		t.Fatal("expected changed=true for nil Actions")
+	}
+	if cfg.Actions.PatternsAllowed == nil || len(*cfg.Actions.PatternsAllowed) == 0 {
+		t.Fatal("patterns_allowed should be set from defaults")
+	}
+
+	(*cfg.Actions.PatternsAllowed)[0] = "mutated/*"
+	if (*defaults.Actions.PatternsAllowed)[0] == "mutated/*" {
+		t.Error("merged patterns_allowed shares a backing array with defaults")
 	}
 }
 
@@ -304,7 +448,7 @@ func defaultLabelDefaults(t *testing.T) []model.LabelEntry {
 func TestMergeLabelsNilLabels(t *testing.T) {
 	cfg := &Config{}
 
-	changed := MergeDefaultLabels(cfg)
+	changed := mergeLabelsDefaultsForTest(t, cfg)
 
 	if !changed {
 		t.Fatal("expected changed=true for nil Labels")
@@ -322,7 +466,7 @@ func TestMergeLabelsNilLabels(t *testing.T) {
 func TestMergeLabelsEmptySlice(t *testing.T) {
 	cfg := &Config{Labels: []model.LabelEntry{}}
 
-	changed := MergeDefaultLabels(cfg)
+	changed := mergeLabelsDefaultsForTest(t, cfg)
 
 	if !changed {
 		t.Fatal("expected changed=true for empty Labels slice")
@@ -343,7 +487,7 @@ func TestMergeLabelsNonEmpty(t *testing.T) {
 	}
 	cfg := &Config{Labels: custom}
 
-	changed := MergeDefaultLabels(cfg)
+	changed := mergeLabelsDefaultsForTest(t, cfg)
 
 	if changed {
 		t.Fatal("expected changed=false for non-empty Labels")
@@ -369,7 +513,7 @@ func TestMergeRepoSettingsSkipsDescriptionHomepageTopics(t *testing.T) {
 		Repository: &model.RepositorySettings{},
 	}
 
-	MergeDefaultRepoSettings(cfg)
+	mergeRepoDefaultsForTest(t, cfg)
 
 	if cfg.Repository.Description != nil {
 		t.Error("Description should remain nil after merge")

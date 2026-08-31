@@ -2,6 +2,7 @@ package alter
 
 import (
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/cli/go-gh/v2/pkg/api"
@@ -22,77 +23,103 @@ const (
 // ShouldWrite reports whether the mode permits writing to disk.
 func (m ApplyMode) ShouldWrite() bool { return m == Apply || m == Recut }
 
-// Run executes the alter command. It validates the config, applies
-// repository settings, fetches the licence, and processes swatches.
+// Run executes the alter command. It validates the config, verifies the
+// token against the API before any local file change, applies repository
+// settings, fetches the licence, and processes swatches.
 // When client is nil, a default GitHub REST client is created.
-func Run(cfg *config.Config, dir string, mode ApplyMode, client *api.RESTClient) error {
+func Run(cfg *config.Config, dir string, mode ApplyMode, client *api.RESTClient, stdout, stderr io.Writer) error {
+	if stdout == nil {
+		stdout = io.Discard
+	}
+	if stderr == nil {
+		stderr = io.Discard
+	}
+
+	configChanged := config.RemoveRetiredWorkflowEntries(cfg)
+	securityNormalised := config.NormaliseSecurityPrerequisites(cfg)
+	if securityNormalised {
+		fmt.Fprintln(stderr, "warning: set vulnerability_alerts_enabled to true because automated_security_fixes_enabled requires vulnerability alerts")
+	}
+	configChanged = configChanged || securityNormalised
 	if err := validateConfig(cfg); err != nil {
 		return err
 	}
-	if err := config.ValidateRepoSettings(cfg); err != nil {
-		return err
-	}
 
-	// Merge missing default swatch entries into the config when the
-	// config swatch is set to always, or when it is first-fit and the
-	// caller requested a recut.
+	// Keep the local config aligned with built-in defaults only when the
+	// config swatch mode allows tailor to rewrite it.
 	if shouldMerge(cfg, mode) {
-		added, repoMerged, labelsMerged := config.MergeDefaults(cfg)
-		if (len(added) > 0 || repoMerged || labelsMerged) && mode.ShouldWrite() {
-			todayDate := time.Now().Format("2006-01-02")
-			if err := config.Write(dir, cfg, todayDate, "Refitted"); err != nil {
-				return fmt.Errorf("writing refitted config: %w", err)
-			}
+		defaultsChanged, err := config.MergeDefaults(cfg)
+		if err != nil {
+			return err
 		}
+		configChanged = configChanged || defaultsChanged
 		// Re-validate after merge as a safety check.
 		if err := validateConfig(cfg); err != nil {
 			return err
 		}
-		if err := config.ValidateRepoSettings(cfg); err != nil {
-			return err
-		}
+	}
+	if err := config.ValidateCompleteActions(cfg); err != nil {
+		return err
+	}
+
+	repo, hasRepo, err := gh.RepoContextAt(dir)
+	if err != nil {
+		return err
 	}
 
 	if client == nil {
-		var err error
-		client, err = api.DefaultRESTClient()
+		client, err = gh.NewRESTClient(gh.ResolveHost(repo.Host))
 		if err != nil {
 			return fmt.Errorf("creating GitHub API client: %w", err)
 		}
 	}
 
+	// Verify the token against the API before any local file change. The
+	// same request resolves {{GITHUB_USERNAME}} for token substitution.
 	username, err := gh.FetchUsername(client)
 	if err != nil {
-		return fmt.Errorf("fetching GitHub username: %w", err)
+		return fmt.Errorf("verifying GitHub authentication: %w", err)
 	}
 
-	owner, name, hasRepo := gh.RepoContext()
+	if configChanged && mode.ShouldWrite() {
+		todayDate := time.Now().Format("2006-01-02")
+		if err := config.Write(dir, cfg, todayDate, "Refitted"); err != nil {
+			return fmt.Errorf("writing refitted config: %w", err)
+		}
+	}
+
+	retiredResults, err := ProcessRetiredWorkflows(dir, mode)
+	if err != nil {
+		return err
+	}
+
 	tokens := TokenContext{
 		GitHubUsername: username,
-		Owner:          owner,
-		Name:           name,
-		Repository:     cfg.Repository,
+		Owner:          repo.Owner,
+		Name:           repo.Name,
 	}
+	target := RepoTarget{Client: client, Owner: repo.Owner, Name: repo.Name, HasRepo: hasRepo, Stderr: stderr}
 
-	// Repository settings processing.
-	repoResults, err := ProcessRepoSettings(cfg, mode, client, owner, name, hasRepo)
+	repoResults, err := ProcessRepoSettings(cfg, mode, target)
+	if err != nil {
+		return err
+	}
+	actionsResults, err := ProcessActions(cfg, mode, target)
+	if err != nil {
+		return err
+	}
+	repoResults = append(repoResults, actionsResults...)
+
+	labelResults, err := ProcessLabels(cfg, mode, target)
 	if err != nil {
 		return err
 	}
 
-	// Labels processing.
-	labelResults, err := ProcessLabels(cfg, mode, client, owner, name, hasRepo)
+	licenceResult, err := ProcessLicence(cfg, dir, mode, client, stderr)
 	if err != nil {
 		return err
 	}
 
-	// Licence processing.
-	licenceResult, err := ProcessLicence(cfg, dir, mode, client)
-	if err != nil {
-		return err
-	}
-
-	// Swatch processing.
 	swatchResults, err := ProcessSwatches(cfg, dir, mode, &tokens)
 	if err != nil {
 		return err
@@ -102,21 +129,34 @@ func Run(cfg *config.Config, dir string, mode ApplyMode, client *api.RESTClient)
 	if licenceResult != nil {
 		swatchResults = append([]SwatchResult{*licenceResult}, swatchResults...)
 	}
+	if configChanged {
+		swatchResults = append(swatchResults, SwatchResult{Path: configPath, Category: WouldUpdateConfig})
+	}
+	swatchResults = append(swatchResults, retiredResults...)
 
-	output := FormatOutput(repoResults, labelResults, swatchResults)
+	output := FormatOutput(repoResults, labelResults, swatchResults, mode)
 	if output != "" {
-		fmt.Print(output)
+		fmt.Fprint(stdout, output)
 	}
 
 	return nil
 }
 
-// validateConfig runs path and duplicate-path validation in sequence.
+// validateConfig runs the repeated config validation pass in sequence.
 func validateConfig(cfg *config.Config) error {
+	if err := config.ValidateSwatches(cfg); err != nil {
+		return err
+	}
 	if err := config.ValidatePaths(cfg); err != nil {
 		return err
 	}
-	return config.ValidateDuplicatePaths(cfg)
+	if err := config.ValidateDuplicatePaths(cfg); err != nil {
+		return err
+	}
+	if err := config.ValidateRepoSettings(cfg); err != nil {
+		return err
+	}
+	return config.ValidateActions(cfg)
 }
 
 // shouldMerge reports whether the config merge step should run. It looks up

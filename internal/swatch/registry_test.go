@@ -4,12 +4,13 @@ import (
 	"testing"
 
 	"github.com/wimpysworld/tailor/internal/swatch"
+	"gopkg.in/yaml.v3"
 )
 
-func TestAllReturns18Swatches(t *testing.T) {
+func TestAllReturns16Swatches(t *testing.T) {
 	all := swatch.All()
-	if len(all) != 18 {
-		t.Fatalf("All() returned %d swatches, want 18", len(all))
+	if len(all) != 16 {
+		t.Fatalf("All() returned %d swatches, want 16", len(all))
 	}
 }
 
@@ -19,8 +20,8 @@ func TestAllSwatchesHaveRequiredFields(t *testing.T) {
 			if s.Path == "" {
 				t.Error("Path is empty")
 			}
-			if s.DefaultAlteration != swatch.Always && s.DefaultAlteration != swatch.FirstFit && s.DefaultAlteration != swatch.Triggered {
-				t.Errorf("DefaultAlteration is %q, want %q, %q, or %q", s.DefaultAlteration, swatch.Always, swatch.FirstFit, swatch.Triggered)
+			if s.DefaultAlteration != swatch.Always && s.DefaultAlteration != swatch.FirstFit && s.DefaultAlteration != swatch.Never {
+				t.Errorf("DefaultAlteration is %q, want %q, %q, or %q", s.DefaultAlteration, swatch.Always, swatch.FirstFit, swatch.Never)
 			}
 			if s.Category != swatch.Health && s.Category != swatch.Development {
 				t.Errorf("Category is %q, want %q or %q", s.Category, swatch.Health, swatch.Development)
@@ -49,9 +50,7 @@ func TestSwatchAttributes(t *testing.T) {
 		{".github/ISSUE_TEMPLATE/bug_report.yml", swatch.Always, swatch.Health},
 		{".github/ISSUE_TEMPLATE/feature_request.yml", swatch.Always, swatch.Health},
 		{".github/ISSUE_TEMPLATE/config.yml", swatch.FirstFit, swatch.Health},
-		{".github/pull_request_template.md", swatch.Always, swatch.Health},
-		{".github/workflows/tailor.yml", swatch.Always, swatch.Development},
-		{".github/workflows/tailor-automerge.yml", swatch.Triggered, swatch.Development},
+		{".github/pull_request_template.md", swatch.Never, swatch.Health},
 		{".tailor.yml", swatch.Always, swatch.Development},
 	}
 
@@ -77,10 +76,58 @@ func TestSwatchAttributes(t *testing.T) {
 	}
 }
 
+func TestEmbeddedConfigSwatchesMatchRegistry(t *testing.T) {
+	data, err := swatch.Content(".tailor.yml")
+	if err != nil {
+		t.Fatalf("Content(%q) returned error: %v", ".tailor.yml", err)
+	}
+
+	var config struct {
+		Swatches []struct {
+			Path       string                `yaml:"path"`
+			Alteration swatch.AlterationMode `yaml:"alteration"`
+		} `yaml:"swatches"`
+	}
+	if err := yaml.Unmarshal(data, &config); err != nil {
+		t.Fatalf("unmarshalling embedded .tailor.yml: %v", err)
+	}
+
+	registry := make(map[string]swatch.AlterationMode)
+	for _, entry := range swatch.All() {
+		if _, exists := registry[entry.Path]; exists {
+			t.Fatalf("registry contains duplicate path %q", entry.Path)
+		}
+		registry[entry.Path] = entry.DefaultAlteration
+	}
+
+	configured := make(map[string]bool)
+	for _, entry := range config.Swatches {
+		if configured[entry.Path] {
+			t.Fatalf("embedded .tailor.yml contains duplicate path %q", entry.Path)
+		}
+		configured[entry.Path] = true
+
+		mode, exists := registry[entry.Path]
+		if !exists {
+			t.Errorf("embedded .tailor.yml contains unregistered path %q", entry.Path)
+			continue
+		}
+		if entry.Alteration != mode {
+			t.Errorf("embedded .tailor.yml mode for %q = %q, want %q", entry.Path, entry.Alteration, mode)
+		}
+	}
+
+	for path := range registry {
+		if !configured[path] {
+			t.Errorf("embedded .tailor.yml is missing registered path %q", path)
+		}
+	}
+}
+
 func TestHealthSwatchesReturnsCorrectSubset(t *testing.T) {
 	health := swatch.HealthSwatches()
 
-	// The spec lists 10 health swatches (excluding LICENSE which is not embedded).
+	// The spec lists 10 health swatches (excluding LICENSE, which is not embedded).
 	if len(health) != 10 {
 		t.Fatalf("HealthSwatches() returned %d swatches, want 10", len(health))
 	}
@@ -94,8 +141,8 @@ func TestHealthSwatchesReturnsCorrectSubset(t *testing.T) {
 
 func TestPathsReturnsSortedList(t *testing.T) {
 	names := swatch.Paths()
-	if len(names) != 18 {
-		t.Fatalf("Paths() returned %d names, want 18", len(names))
+	if len(names) != 16 {
+		t.Fatalf("Paths() returned %d names, want 16", len(names))
 	}
 	for i := 1; i < len(names); i++ {
 		if names[i] < names[i-1] {
