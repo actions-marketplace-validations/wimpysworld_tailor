@@ -55,7 +55,7 @@ let
       trap 'exit 143' TERM
       (
         unset GOARM GOARM64 GOAMD64 GO386 GOMIPS GOMIPS64 GOPPC64 GORISCV64 GOWASM GOEXPERIMENT
-        export GOOS="$host_os" GOARCH="$host_arch" GOWORK=off GOFLAGS= CGO_ENABLED=0
+        export GOOS="$host_os" GOARCH="$host_arch" GOWORK=off GOFLAGS="" CGO_ENABLED=0
         go -C "$module_dir" build -mod=readonly -o "$tmp/ebitenmobile" ./cmd/ebitenmobile
       )
       cd "$caller"

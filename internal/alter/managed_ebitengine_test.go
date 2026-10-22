@@ -95,6 +95,17 @@ func testEbitengineMobileRunner(t *testing.T, bash string) {
 		t.Fatalf("runner eval: %v %s", err, output)
 	}
 	runner := string(output)
+	t.Run("shellcheck", func(t *testing.T) {
+		shellcheck, err := exec.LookPath("shellcheck")
+		if err != nil {
+			t.Skip("shellcheck required")
+		}
+		cmd := exec.CommandContext(t.Context(), shellcheck, "--shell=bash", "-")
+		cmd.Stdin = strings.NewReader("set -o errexit -o nounset -o pipefail\n" + runner)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("runner shellcheck: %v %s", err, output)
+		}
+	})
 	for _, forbidden := range []string{"go install", "@latest"} {
 		if strings.Contains(runner, forbidden) {
 			t.Fatal(forbidden)
