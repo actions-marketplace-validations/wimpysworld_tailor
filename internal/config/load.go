@@ -6,6 +6,8 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"strconv"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 
@@ -13,7 +15,6 @@ import (
 )
 
 const (
-	configPath    = ".tailor.yml"
 	maxConfigSize = 1 << 20
 )
 
@@ -25,7 +26,7 @@ func Exists(dir string) (bool, error) {
 	}
 	defer root.Close()
 
-	_, err = root.Lstat(configPath)
+	_, err = root.Lstat(ConfigSwatchPath)
 	switch {
 	case err == nil:
 		return true, nil
@@ -36,8 +37,8 @@ func Exists(dir string) (bool, error) {
 	}
 }
 
-// Load reads and parses .tailor.yml from dir, returning the validated Config
-// or an error.
+// Load reads and validates the regular .tailor.yml file in dir, up to 1 MiB.
+// Callers must remove retired entries before checking known paths and duplicates.
 func Load(dir string) (*Config, error) {
 	root, err := os.OpenRoot(dir)
 	if err != nil {
@@ -45,15 +46,15 @@ func Load(dir string) (*Config, error) {
 	}
 	defer root.Close()
 
-	info, err := root.Lstat(configPath)
+	info, err := root.Lstat(ConfigSwatchPath)
 	if err != nil {
 		return nil, fmt.Errorf("reading config: %w", err)
 	}
 	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("reading config: %s is not a regular file", configPath)
+		return nil, fmt.Errorf("reading config: %s is not a regular file", ConfigSwatchPath)
 	}
 
-	file, err := root.Open(configPath)
+	file, err := root.Open(ConfigSwatchPath)
 	if err != nil {
 		return nil, fmt.Errorf("reading config: %w", err)
 	}
@@ -66,10 +67,10 @@ func Load(dir string) (*Config, error) {
 		return nil, fmt.Errorf("reading config metadata: %w", err)
 	}
 	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("reading config: %s is not a regular file", configPath)
+		return nil, fmt.Errorf("reading config: %s is not a regular file", ConfigSwatchPath)
 	}
 	if info.Size() > maxConfigSize {
-		return nil, fmt.Errorf("reading config: %s exceeds maximum size of 1 MiB", configPath)
+		return nil, fmt.Errorf("reading config: %s exceeds maximum size of 1 MiB", ConfigSwatchPath)
 	}
 
 	data, err := io.ReadAll(io.LimitReader(file, maxConfigSize+1))
@@ -77,7 +78,7 @@ func Load(dir string) (*Config, error) {
 		return nil, fmt.Errorf("reading config: %w", err)
 	}
 	if len(data) > maxConfigSize {
-		return nil, fmt.Errorf("reading config: %s exceeds maximum size of 1 MiB", configPath)
+		return nil, fmt.Errorf("reading config: %s exceeds maximum size of 1 MiB", ConfigSwatchPath)
 	}
 
 	return parseAndValidate(data, "config")
@@ -86,9 +87,37 @@ func Load(dir string) (*Config, error) {
 // parseAndValidate unmarshals YAML data into a Config and validates it.
 // The context string is used in error messages to identify the source.
 func parseAndValidate(data []byte, context string) (*Config, error) {
-	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	var document yaml.Node
+	if err := yaml.Unmarshal(data, &document); err != nil {
 		return nil, fmt.Errorf("parsing %s: %w", context, err)
+	}
+	if err := validateVariableNodes(&document); err != nil {
+		return nil, fmt.Errorf("parsing %s: %w", context, err)
+	}
+	if err := validatePagesNodes(&document); err != nil {
+		return nil, fmt.Errorf("parsing %s: %w", context, err)
+	}
+	if err := validateLanguageNodes(&document); err != nil {
+		return nil, fmt.Errorf("parsing %s: %w", context, err)
+	}
+	if err := validateMCPNodes(&document); err != nil {
+		return nil, fmt.Errorf("parsing %s: %w", context, err)
+	}
+	var cfg Config
+	if err := document.Decode(&cfg); err != nil {
+		return nil, fmt.Errorf("parsing %s: %w", context, err)
+	}
+	var sections map[string]yaml.Node
+	// An edited value or removed marker makes the homepage an explicit declaration.
+	if err := document.Decode(&sections); err == nil {
+		if repository, ok := sections["repository"]; ok {
+			var fields map[string]yaml.Node
+			if err := repository.Decode(&fields); err == nil {
+				if homepage, ok := fields["homepage"]; ok && homepage.Value != "" && homepage.LineComment == inferredHomepageMarker(homepage.Value) {
+					cfg.InferredHomepage = homepage.Value
+				}
+			}
+		}
 	}
 
 	if err := validate(&cfg); err != nil {
@@ -100,6 +129,9 @@ func parseAndValidate(data []byte, context string) (*Config, error) {
 
 // validate checks the parsed config for structural correctness.
 func validate(cfg *Config) error {
+	if err := ValidateImmutableReleases(cfg); err != nil {
+		return err
+	}
 	if err := validateTopLevelSettings(cfg); err != nil {
 		return err
 	}
@@ -115,7 +147,22 @@ func validate(cfg *Config) error {
 	if err := ValidateRepoStringSettings(cfg); err != nil {
 		return err
 	}
+	if err := ValidateSecretScanning(cfg); err != nil {
+		return err
+	}
 	if err := ValidateActions(cfg); err != nil {
+		return err
+	}
+	if err := ValidateCodeScanning(cfg); err != nil {
+		return err
+	}
+	if err := ValidateCodeQuality(cfg); err != nil {
+		return err
+	}
+	if err := ValidateRuleset(cfg); err != nil {
+		return err
+	}
+	if err := ValidatePages(cfg); err != nil {
 		return err
 	}
 	if err := ValidateTopics(cfg); err != nil {
@@ -124,10 +171,53 @@ func validate(cfg *Config) error {
 	if err := ValidateLabels(cfg); err != nil {
 		return err
 	}
+	return ValidateVariables(cfg)
+}
+
+const inferredHomepageComment = "# tailor: inferred homepage "
+
+func inferredHomepageMarker(value string) string {
+	return inferredHomepageComment + strconv.Quote(value)
+}
+
+func validatePagesNodes(document *yaml.Node) error {
+	var sections map[string]yaml.Node
+	if err := document.Decode(&sections); err != nil {
+		return err
+	}
+	node, ok := sections["pages"]
+	if !ok {
+		return nil
+	}
+	if node.Kind != yaml.MappingNode {
+		return fmt.Errorf("pages must be a mapping")
+	}
+	for i := 0; i < len(node.Content); i += 2 {
+		key, value := node.Content[i], node.Content[i+1]
+		if key.Value == "links" {
+			if value.Kind != yaml.MappingNode {
+				return fmt.Errorf("pages.links must be a mapping")
+			}
+			for j := 0; j < len(value.Content); j += 2 {
+				if value.Content[j].Tag != "!!str" || value.Content[j+1].Kind != yaml.ScalarNode || value.Content[j+1].Tag != "!!str" {
+					return fmt.Errorf("pages.links keys and values must be strings")
+				}
+			}
+			continue
+		}
+		tag := "!!str"
+		if key.Value == "enabled" {
+			tag = "!!bool"
+		}
+		if value.Kind != yaml.ScalarNode || value.Tag != tag {
+			return fmt.Errorf("pages.%s must be a %s", key.Value, strings.TrimPrefix(tag, "!!"))
+		}
+	}
 	return nil
 }
 
-// ValidateSwatches checks active swatch entries without legacy allowances.
+// ValidateSwatches requires non-empty paths and active alteration modes.
+// ValidatePaths and ValidateDuplicatePaths check path membership and uniqueness separately.
 func ValidateSwatches(cfg *Config) error {
 	return validateSwatches(cfg, false)
 }
@@ -139,7 +229,6 @@ func validateSwatches(cfg *Config, allowLegacyRetired bool) error {
 		}
 		switch s.Alteration {
 		case swatch.Always, swatch.FirstFit, swatch.Never:
-			// valid
 		default:
 			if allowLegacyRetired && isLegacyRetiredEntry(s) {
 				continue

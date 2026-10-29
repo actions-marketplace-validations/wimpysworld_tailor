@@ -10,21 +10,32 @@ import (
 	"github.com/wimpysworld/tailor/internal/swatch"
 )
 
-func TestHasRepoContext(t *testing.T) {
+func TestSubstituteRepoContext(t *testing.T) {
+	advisory := []byte("Report: {{ADVISORY_URL}}\n")
+	support := []byte("url: \"{{SUPPORT_URL}}\"\n")
 	tests := []struct {
-		name string
-		tc   alter.TokenContext
-		want bool
+		name         string
+		tc           alter.TokenContext
+		wantAdvisory []byte
+		wantSupport  []byte
 	}{
-		{"both set", alter.TokenContext{Owner: "org", Name: "repo"}, true},
-		{"owner empty", alter.TokenContext{Owner: "", Name: "repo"}, false},
-		{"name empty", alter.TokenContext{Owner: "org", Name: ""}, false},
-		{"both empty", alter.TokenContext{}, false},
+		{
+			"both set",
+			alter.TokenContext{Owner: "org", Name: "repo"},
+			[]byte("Report: https://github.com/org/repo/security/advisories/new\n"),
+			[]byte("url: \"https://github.com/org/repo/blob/HEAD/SUPPORT.md\"\n"),
+		},
+		{"owner empty", alter.TokenContext{Owner: "", Name: "repo"}, advisory, support},
+		{"name empty", alter.TokenContext{Owner: "org", Name: ""}, advisory, support},
+		{"both empty", alter.TokenContext{}, advisory, support},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := tt.tc.HasRepoContext(); got != tt.want {
-				t.Errorf("HasRepoContext() = %v, want %v", got, tt.want)
+			if got := tt.tc.Substitute(advisory, "SECURITY.md"); !bytes.Equal(got, tt.wantAdvisory) {
+				t.Errorf("SECURITY.md: got %q, want %q", got, tt.wantAdvisory)
+			}
+			if got := tt.tc.Substitute(support, ".github/ISSUE_TEMPLATE/config.yml"); !bytes.Equal(got, tt.wantSupport) {
+				t.Errorf("config.yml: got %q, want %q", got, tt.wantSupport)
 			}
 		})
 	}
@@ -37,44 +48,6 @@ func TestSubstituteFundingYml(t *testing.T) {
 	want := []byte("github: \"octocat\"\n")
 	if !bytes.Equal(got, want) {
 		t.Errorf("got %q, want %q", got, want)
-	}
-}
-
-func TestSubstituteSecurityMdWithRepoContext(t *testing.T) {
-	tc := &alter.TokenContext{Owner: "org", Name: "repo"}
-	input := []byte("Report: {{ADVISORY_URL}}\n")
-	got := tc.Substitute(input, "SECURITY.md")
-	want := []byte("Report: https://github.com/org/repo/security/advisories/new\n")
-	if !bytes.Equal(got, want) {
-		t.Errorf("got %q, want %q", got, want)
-	}
-}
-
-func TestSubstituteSecurityMdWithoutRepoContext(t *testing.T) {
-	tc := &alter.TokenContext{}
-	input := []byte("Report: {{ADVISORY_URL}}\n")
-	got := tc.Substitute(input, "SECURITY.md")
-	if !bytes.Equal(got, input) {
-		t.Errorf("expected no substitution, got %q", got)
-	}
-}
-
-func TestSubstituteConfigYmlWithRepoContext(t *testing.T) {
-	tc := &alter.TokenContext{Owner: "org", Name: "repo"}
-	input := []byte("url: \"{{SUPPORT_URL}}\"\n")
-	got := tc.Substitute(input, ".github/ISSUE_TEMPLATE/config.yml")
-	want := []byte("url: \"https://github.com/org/repo/blob/HEAD/SUPPORT.md\"\n")
-	if !bytes.Equal(got, want) {
-		t.Errorf("got %q, want %q", got, want)
-	}
-}
-
-func TestSubstituteConfigYmlWithoutRepoContext(t *testing.T) {
-	tc := &alter.TokenContext{}
-	input := []byte("url: \"{{SUPPORT_URL}}\"\n")
-	got := tc.Substitute(input, ".github/ISSUE_TEMPLATE/config.yml")
-	if !bytes.Equal(got, input) {
-		t.Errorf("expected no substitution, got %q", got)
 	}
 }
 

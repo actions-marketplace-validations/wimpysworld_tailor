@@ -1,3 +1,4 @@
+// Package swatch defines the built-in templates, their defaults and their renderers.
 package swatch
 
 import (
@@ -9,7 +10,9 @@ import (
 type Category string
 
 const (
-	Health      Category = "health"
+	// Health marks community health files checked by measure.
+	Health Category = "health"
+	// Development marks tooling files excluded from health checks.
 	Development Category = "development"
 )
 
@@ -17,10 +20,11 @@ const (
 type AlterationMode string
 
 const (
-	// Always compares the embedded content against the on-disk file on
-	// every alter run and overwrites the file when they differ.
+	// Always replaces changed files with resolved content on each alter run.
+	// Config updates append missing defaults, and existing wiki starter pages remain unchanged.
 	Always AlterationMode = "always"
-	// FirstFit writes the file only when it does not already exist.
+	// FirstFit creates missing files. Recut also replaces existing files,
+	// except that config updates merge defaults and wiki starter pages remain unchanged.
 	FirstFit AlterationMode = "first-fit"
 	// Never skips the swatch. Tailor does not write or compare the
 	// destination.
@@ -51,22 +55,36 @@ var registry = []Swatch{
 	{Path: "flake.nix", DefaultAlteration: FirstFit, Category: Development},
 	{Path: "cubic.yaml", DefaultAlteration: FirstFit, Category: Development},
 	{Path: "justfile", DefaultAlteration: FirstFit, Category: Development},
+	{Path: "ruff.toml", DefaultAlteration: FirstFit, Category: Development},
+	{Path: "pyrightconfig.json", DefaultAlteration: FirstFit, Category: Development},
+	{Path: GoLintDestination, DefaultAlteration: FirstFit, Category: Development},
+	{Path: GoReleaseDestination, DefaultAlteration: FirstFit, Category: Development},
+	{Path: "Dockerfile", DefaultAlteration: FirstFit, Category: Development},
+	{Path: GoWorkflowDestination, DefaultAlteration: FirstFit, Category: Development},
 	{Path: ".github/FUNDING.yml", DefaultAlteration: FirstFit, Category: Health},
 	{Path: ".github/dependabot.yml", DefaultAlteration: FirstFit, Category: Health},
 	{Path: ".github/ISSUE_TEMPLATE/bug_report.yml", DefaultAlteration: Always, Category: Health},
 	{Path: ".github/ISSUE_TEMPLATE/feature_request.yml", DefaultAlteration: Always, Category: Health},
 	{Path: ".github/ISSUE_TEMPLATE/config.yml", DefaultAlteration: FirstFit, Category: Health},
 	{Path: ".github/pull_request_template.md", DefaultAlteration: Never, Category: Health},
+	{Path: PagesDestination, DefaultAlteration: Always, Category: Development},
+	{Path: "pages/index.html", DefaultAlteration: FirstFit, Category: Development},
+	{Path: "pages/style.css", DefaultAlteration: FirstFit, Category: Development},
+	{Path: "pages/theme.js", DefaultAlteration: FirstFit, Category: Development},
+	{Path: "pages/icon.svg", DefaultAlteration: FirstFit, Category: Development},
+	{Path: "wiki/Home.md", DefaultAlteration: FirstFit, Category: Development},
+	{Path: "wiki/_Sidebar.md", DefaultAlteration: FirstFit, Category: Development},
+	{Path: "wiki/_Footer.md", DefaultAlteration: FirstFit, Category: Development},
+	{Path: WikiDestination, DefaultAlteration: Always, Category: Development},
 	{Path: ".tailor.yml", DefaultAlteration: Always, Category: Development},
 }
 
-// All returns every registered swatch in definition order.
+// All returns a copy of every registered swatch in definition order.
 func All() []Swatch {
 	return slices.Clone(registry)
 }
 
-// Paths returns the paths of all registered swatches, sorted
-// lexicographically.
+// Paths returns all registered paths in lexicographic order.
 func Paths() []string {
 	names := make([]string, len(registry))
 	for i, s := range registry {

@@ -9,10 +9,10 @@ import (
 	"github.com/wimpysworld/tailor/internal/testutil"
 )
 
-// allNonConfigSwatches returns every registered swatch except .tailor.yml.
+// allNonConfigSwatches returns defaults for a config with no language opt-in, except .tailor.yml.
 func allNonConfigSwatches() []swatch.Swatch {
 	var out []swatch.Swatch
-	for _, s := range swatch.All() {
+	for _, s := range (&Config{}).ActiveDefaultSwatches() {
 		if s.Path != ConfigSwatchPath {
 			out = append(out, s)
 		}
@@ -89,7 +89,7 @@ func TestMergeNeverNotDuplicated(t *testing.T) {
 
 	added := MergeDefaultSwatches(cfg)
 
-	// .gitignore already present (with never), should not be duplicated.
+	// A different alteration mode does not make an existing path a new entry.
 	count := 0
 	for _, e := range cfg.Swatches {
 		if e.Path == ".gitignore" {
@@ -100,7 +100,6 @@ func TestMergeNeverNotDuplicated(t *testing.T) {
 		t.Fatalf(".gitignore appears %d times, want 1", count)
 	}
 
-	// Should not be in the added slice either.
 	for _, e := range added {
 		if e.Path == ".gitignore" {
 			t.Fatal(".gitignore should not appear in added slice")
@@ -183,18 +182,22 @@ func TestMergeDefaultsChangedByEachSection(t *testing.T) {
 	}
 }
 
-// defaultRepoDefaults returns the default RepositorySettings from the embedded
-// config, for comparison in merge tests.
-func defaultRepoDefaults(t *testing.T) *model.RepositorySettings {
-	t.Helper()
-	defaults, err := DefaultConfig("_")
-	if err != nil {
-		t.Fatalf("DefaultConfig: %v", err)
+func TestMergeDefaultsPreservesVariables(t *testing.T) {
+	for _, variables := range [][]model.VariableEntry{
+		nil,
+		{},
+		{{Name: "Deploy_Region", Value: new(" eu-west-2\n")}, {Name: "RELEASE_SUFFIX", Value: new("")}},
+	} {
+		cfg := &Config{License: "none", Variables: variables}
+		for range 2 {
+			if _, err := MergeDefaults(cfg); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(cfg.Variables, variables) {
+				t.Fatalf("variables = %#v, want %#v", cfg.Variables, variables)
+			}
+		}
 	}
-	if defaults.Repository == nil {
-		t.Fatal("DefaultConfig returned nil Repository")
-	}
-	return defaults.Repository
 }
 
 func defaultConfig(t *testing.T) *Config {
@@ -208,7 +211,8 @@ func defaultConfig(t *testing.T) *Config {
 
 func mergeRepoDefaultsForTest(t *testing.T, cfg *Config) bool {
 	t.Helper()
-	return mergeRepoSettingsFrom(cfg, defaultConfig(t))
+	defaults := defaultConfig(t)
+	return mergeSettingsFrom(&cfg.Repository, defaults.Repository, model.RepositorySettingFields, skipRepoField)
 }
 
 func mergeLabelsDefaultsForTest(t *testing.T, cfg *Config) bool {
@@ -220,7 +224,7 @@ func mergeLabelsDefaultsForTest(t *testing.T, cfg *Config) bool {
 // RepositorySettings that are non-nil and not in repoSettingsSkipFields.
 func countMergeableFields(t *testing.T) int {
 	t.Helper()
-	def := defaultRepoDefaults(t)
+	def := defaultConfig(t).Repository
 	count := 0
 	for _, field := range model.RepositorySettingFields(def) {
 		if _, skip := repoSettingsSkipFields[field.YAMLKey]; skip {
@@ -245,7 +249,7 @@ func TestMergeRepoSettingsNilRepository(t *testing.T) {
 		t.Fatal("Repository should be allocated after merge")
 	}
 
-	def := defaultRepoDefaults(t)
+	def := defaultConfig(t).Repository
 	cv := reflect.ValueOf(cfg.Repository).Elem()
 
 	merged := 0
@@ -302,7 +306,7 @@ func TestMergeRepoSettingsPartialRepository(t *testing.T) {
 	}
 
 	// Nil fields receive values from defaults.
-	def := defaultRepoDefaults(t)
+	def := defaultConfig(t).Repository
 	cv := reflect.ValueOf(cfg.Repository).Elem()
 
 	for _, field := range model.RepositorySettingFields(def) {
@@ -326,9 +330,9 @@ func TestMergeRepoSettingsAddsSecurityDefaults(t *testing.T) {
 		t.Fatal("expected changed=true for missing security settings")
 	}
 
-	testutil.AssertPtr(t, cfg.Repository.PrivateVulnerabilityReportEnabled, false, true, "private_vulnerability_reporting_enabled")
-	testutil.AssertPtr(t, cfg.Repository.VulnerabilityAlertsEnabled, false, true, "vulnerability_alerts_enabled")
-	testutil.AssertPtr(t, cfg.Repository.AutomatedSecurityFixesEnabled, false, true, "automated_security_fixes_enabled")
+	testutil.AssertPtrEqual(t, cfg.Repository.PrivateVulnerabilityReportEnabled, new(true), "private_vulnerability_reporting_enabled")
+	testutil.AssertPtrEqual(t, cfg.Repository.VulnerabilityAlertsEnabled, new(true), "vulnerability_alerts_enabled")
+	testutil.AssertPtrEqual(t, cfg.Repository.AutomatedSecurityFixesEnabled, new(true), "automated_security_fixes_enabled")
 }
 
 func TestMergeRepoSettingsPreservesExplicitFalseSecuritySettings(t *testing.T) {
@@ -342,15 +346,15 @@ func TestMergeRepoSettingsPreservesExplicitFalseSecuritySettings(t *testing.T) {
 		t.Fatal("expected changed=true for other missing repository settings")
 	}
 
-	testutil.AssertPtr(t, cfg.Repository.PrivateVulnerabilityReportEnabled, false, false, "private_vulnerability_reporting_enabled")
-	testutil.AssertPtr(t, cfg.Repository.VulnerabilityAlertsEnabled, false, false, "vulnerability_alerts_enabled")
-	testutil.AssertPtr(t, cfg.Repository.AutomatedSecurityFixesEnabled, false, false, "automated_security_fixes_enabled")
+	testutil.AssertPtrEqual(t, cfg.Repository.PrivateVulnerabilityReportEnabled, new(false), "private_vulnerability_reporting_enabled")
+	testutil.AssertPtrEqual(t, cfg.Repository.VulnerabilityAlertsEnabled, new(false), "vulnerability_alerts_enabled")
+	testutil.AssertPtrEqual(t, cfg.Repository.AutomatedSecurityFixesEnabled, new(false), "automated_security_fixes_enabled")
 }
 
 func TestMergeRepoSettingsFullRepository(t *testing.T) {
-	def := defaultRepoDefaults(t)
+	def := defaultConfig(t).Repository
 
-	// Deep-copy default into a new RepositorySettings so every field is set.
+	// Copy the set defaults independently so mutation cannot affect the comparison source.
 	full := &model.RepositorySettings{}
 	dv := reflect.ValueOf(def).Elem()
 	fv := reflect.ValueOf(full).Elem()
@@ -390,14 +394,14 @@ func TestMergeActionsNilActions(t *testing.T) {
 		t.Fatal("expected changed=true for nil Actions")
 	}
 
-	// The default policy is "selected", so selected-only fields merge too.
-	testutil.AssertPtr(t, cfg.Actions.Enabled, false, true, "enabled")
-	testutil.AssertPtr(t, cfg.Actions.AllowedActions, false, "selected", "allowed_actions")
-	testutil.AssertPtr(t, cfg.Actions.SHAPinningRequired, false, false, "sha_pinning_required")
-	testutil.AssertPtr(t, cfg.Actions.GitHubOwnedAllowed, false, true, "github_owned_allowed")
-	testutil.AssertPtr(t, cfg.Actions.VerifiedAllowed, false, true, "verified_allowed")
-	if cfg.Actions.PatternsAllowed == nil || len(*cfg.Actions.PatternsAllowed) == 0 {
-		t.Error("patterns_allowed should be set from defaults")
+	// The default policy omits selected-only fields.
+	testutil.AssertPtrEqual(t, cfg.Actions.Enabled, new(true), "enabled")
+	testutil.AssertPtrEqual(t, cfg.Actions.AllowedActions, new("all"), "allowed_actions")
+	testutil.AssertPtrEqual(t, cfg.Actions.SHAPinningRequired, new(false), "sha_pinning_required")
+	testutil.AssertPtrEqual(t, cfg.Actions.GitHubOwnedAllowed, nil, "github_owned_allowed")
+	testutil.AssertPtrEqual(t, cfg.Actions.VerifiedAllowed, nil, "verified_allowed")
+	if cfg.Actions.PatternsAllowed != nil {
+		t.Error("patterns_allowed should remain nil")
 	}
 }
 
@@ -409,10 +413,10 @@ func TestMergeActionsSkipsSelectedFieldsForOtherPolicies(t *testing.T) {
 		t.Fatal("expected changed=true for missing non-selected fields")
 	}
 
-	testutil.AssertPtr(t, cfg.Actions.Enabled, false, true, "enabled")
-	testutil.AssertPtr(t, cfg.Actions.AllowedActions, false, "all", "allowed_actions")
-	testutil.AssertPtr(t, cfg.Actions.GitHubOwnedAllowed, true, false, "github_owned_allowed")
-	testutil.AssertPtr(t, cfg.Actions.VerifiedAllowed, true, false, "verified_allowed")
+	testutil.AssertPtrEqual(t, cfg.Actions.Enabled, new(true), "enabled")
+	testutil.AssertPtrEqual(t, cfg.Actions.AllowedActions, new("all"), "allowed_actions")
+	testutil.AssertPtrEqual(t, cfg.Actions.GitHubOwnedAllowed, nil, "github_owned_allowed")
+	testutil.AssertPtrEqual(t, cfg.Actions.VerifiedAllowed, nil, "verified_allowed")
 	if cfg.Actions.PatternsAllowed != nil {
 		t.Error("patterns_allowed should remain nil for non-selected policy")
 	}
@@ -420,29 +424,16 @@ func TestMergeActionsSkipsSelectedFieldsForOtherPolicies(t *testing.T) {
 
 func TestMergeActionsClonesPatterns(t *testing.T) {
 	defaults := defaultConfig(t)
-	cfg := &Config{}
-
+	cfg := &Config{Actions: &model.ActionsSettings{AllowedActions: new("selected")}}
 	if !mergeActionsFrom(cfg, defaults) {
-		t.Fatal("expected changed=true for nil Actions")
+		t.Fatal("expected missing selected fields")
 	}
-	if cfg.Actions.PatternsAllowed == nil || len(*cfg.Actions.PatternsAllowed) == 0 {
-		t.Fatal("patterns_allowed should be set from defaults")
-	}
-
 	(*cfg.Actions.PatternsAllowed)[0] = "mutated/*"
-	if (*defaults.Actions.PatternsAllowed)[0] == "mutated/*" {
-		t.Error("merged patterns_allowed shares a backing array with defaults")
+	other := &Config{Actions: &model.ActionsSettings{AllowedActions: new("selected")}}
+	mergeActionsFrom(other, defaults)
+	if (*other.Actions.PatternsAllowed)[0] == "mutated/*" {
+		t.Error("selected defaults share a backing array")
 	}
-}
-
-// defaultLabelDefaults returns the default Labels from the embedded config.
-func defaultLabelDefaults(t *testing.T) []model.LabelEntry {
-	t.Helper()
-	defaults, err := DefaultConfig("_")
-	if err != nil {
-		t.Fatalf("DefaultConfig: %v", err)
-	}
-	return defaults.Labels
 }
 
 func TestMergeLabelsNilLabels(t *testing.T) {
@@ -454,7 +445,7 @@ func TestMergeLabelsNilLabels(t *testing.T) {
 		t.Fatal("expected changed=true for nil Labels")
 	}
 
-	def := defaultLabelDefaults(t)
+	def := defaultConfig(t).Labels
 	if len(cfg.Labels) != len(def) {
 		t.Fatalf("got %d labels, want %d", len(cfg.Labels), len(def))
 	}
@@ -472,7 +463,7 @@ func TestMergeLabelsEmptySlice(t *testing.T) {
 		t.Fatal("expected changed=true for empty Labels slice")
 	}
 
-	def := defaultLabelDefaults(t)
+	def := defaultConfig(t).Labels
 	if len(cfg.Labels) != len(def) {
 		t.Fatalf("got %d labels, want %d", len(cfg.Labels), len(def))
 	}
@@ -501,7 +492,7 @@ func TestMergeLabelsNonEmpty(t *testing.T) {
 }
 
 func TestMergeLabelsDefaultCount(t *testing.T) {
-	def := defaultLabelDefaults(t)
+	def := defaultConfig(t).Labels
 	const wantCount = 12
 	if len(def) != wantCount {
 		t.Fatalf("embedded default label count = %d, want %d", len(def), wantCount)

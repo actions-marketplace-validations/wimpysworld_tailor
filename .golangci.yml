@@ -7,6 +7,9 @@ linters:
     - errorlint
     - gocritic
     - gosec
+    - govet
+    - ineffassign
+    - intrange
     - misspell
     - noctx
     - revive
@@ -51,8 +54,23 @@ linters:
       - common-false-positives
       - legacy
       - std-error-handling
+    rules:
+      # Test fixtures use credentialed proxy URLs to exercise credential
+      # stripping; they are not real secrets.
+      - path: _test\.go
+        text: "G101"
+        linters:
+          - gosec
+    paths:
+      - (^|/)third_party(/|$)
+      - (^|/)builtin(/|$)
+      - (^|/)examples(/|$)
 formatters:
   enable:
     - gofumpt
   exclusions:
     generated: lax
+    paths:
+      - (^|/)third_party(/|$)
+      - (^|/)builtin(/|$)
+      - (^|/)examples(/|$)

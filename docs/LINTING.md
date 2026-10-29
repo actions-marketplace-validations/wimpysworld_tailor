@@ -2,7 +2,7 @@
 
 ## Overview
 
-Tailor's golangci-lint configuration targets three goals: catch real bugs (resource leaks, error handling, security), prevent code quality issues (duplicate words, hardcoded constants, stale idioms), and keep contributor friction low. With 14 explicitly enabled linters and selective govet/revive rules, the config sits in the moderate tier of the Go ecosystem, comparable to Prometheus in philosophy but leaner in total linter count. Projects at the strict end (Traefik, Gitea, Moby) enable 25-50 linters; projects at the lenient end (GitHub CLI, Kubernetes) enable 14-19 but disable many sub-checks.
+Tailor's golangci-lint configuration targets three goals: catch real bugs (resource leaks, error handling, security), prevent code quality issues (duplicate words, hardcoded constants, stale idioms), and keep contributor friction low. The config explicitly enables 16 linters, including `modernize` for modern Go idioms, with selective govet/revive rules. The approach is moderate, similar to Prometheus but with fewer linters. Projects at the strict end (Traefik, Gitea, Moby) enable 25-50 linters; projects at the lenient end (GitHub CLI, Kubernetes) enable 14-19 but disable many sub-checks.
 
 ## Enabled Linters
 
@@ -13,8 +13,10 @@ Tailor's golangci-lint configuration targets three goals: catch real bugs (resou
 | dupword | Catches duplicate words in comments and strings, particularly AI-generated repetition |
 | errorlint | Enforces correct use of `errors.Is` and `errors.As` over direct comparison |
 | gocritic | Default checker set covering a broad range of code improvement suggestions |
+| gocyclo | Reports functions with cyclomatic complexity above 30, excluding test files, replacing the standalone `gocyclo` tool |
 | gosec | Security-focused analysis (SQL injection, hardcoded credentials, weak crypto) |
 | misspell | Catches typos in comments, strings, and identifiers |
+| modernize | Suggests modern Go idioms to replace outdated patterns |
 | noctx | Flags HTTP requests made without an explicit context, enforcing cancellation support |
 | revive | Configurable linter replacing golint, run with 18 explicit rules (see below) |
 | staticcheck | The most widely adopted Go linter after govet, catches bugs govet misses |
@@ -23,7 +25,7 @@ Tailor's golangci-lint configuration targets three goals: catch real bugs (resou
 | usestdlibvars | Flags hardcoded HTTP status codes and methods that should use `net/http` constants |
 | wastedassign | Detects assignments to variables that are never subsequently used |
 
-The configuration does not override the golangci-lint v2 default set, so the defaults `errcheck`, `govet`, `ineffassign`, `staticcheck`, and `unused` also run. In total 18 linters are enabled.
+The configuration does not override the golangci-lint v2 default set, so the defaults `errcheck`, `govet`, `ineffassign`, `staticcheck`, and `unused` also run. In total 20 linters are enabled, because `staticcheck` also appears in the explicit list.
 
 ## Configuration Choices
 
@@ -53,7 +55,7 @@ All configs examined were golangci-lint v2 format unless noted. "Linters enabled
 
 | Project | Linters enabled | Approach | govet | gocritic | revive rules | Formatter | Strictness |
 |---------|----------------|----------|-------|----------|-------------|-----------|------------|
-| **Tailor** | 14 | Selective enable | enable-all (minus fieldalignment, shadow) | Default checks | 18 rules | gofumpt | Moderate |
+| **Tailor** | 16 | Selective enable | enable-all (minus fieldalignment, shadow) | Default checks | 18 rules | gofumpt | Moderate |
 | **Moby/Docker** | 28 | Selective enable | enable-all (minus fieldalignment) | enable-all (38 checks disabled) | 7 rules | gofmt, goimports | High |
 | **Prometheus** | 19 | Selective enable | enable-all (minus shadow, fieldalignment) | enable-all (28 checks disabled) | 22 rules | gci, gofumpt, goimports | High |
 | **Caddy** | 26 | default: none, selective | default | default | none | gci, gofmt, gofumpt, goimports | High |
@@ -78,15 +80,14 @@ All configs examined were golangci-lint v2 format unless noted. "Linters enabled
 | prealloc | No other surveyed project enables it. Traefik explicitly disables it ("Too many false-positive"). Performance gains from pre-allocating slices are negligible outside hot paths. |
 | depguard | Prevents use of deprecated or unwanted packages. Every large project uses it, but tailor's dependency surface is small enough that code review suffices. |
 | exhaustive | Enum switch exhaustiveness. Only Moby and Caddy use it, both requiring configuration to avoid noise. |
-| funlen, gocognit, cyclop | Function length and complexity linters create significant contributor friction. Even Traefik sets funlen to 120 statements. |
+| funlen, gocognit, cyclop | Function length and complexity linters create significant contributor friction. Even Traefik sets funlen to 120 statements. `gocyclo` at 30 is the one complexity check that tailor keeps. |
 | wsl, nlreturn | Whitespace style linters. Traefik explicitly disables both ("Too strict"). |
 | testpackage, paralleltest, tparallel | Test structure linters. Traefik disables them ("Not relevant"). |
 | ireturn, wrapcheck, varnamelen | Traefik disables all three as too strict. |
-| modernize | Suggests modern Go idioms. Useful but flags existing code that contributors did not write, creating churn in unrelated PRs. |
 
 ## Dependency Review Security Gate
 
-The `security` job in [`.github/workflows/builder.yml`](../.github/workflows/builder.yml) runs `actions/dependency-review-action@v5` for pull requests to `main`. It blocks merges that introduce a runtime dependency with a moderate-or-higher vulnerability or an unapproved licence.
+The `security` job in [`.github/workflows/builder.yml`](../.github/workflows/builder.yml) runs `actions/dependency-review-action@v5` for pull requests to `main`. It blocks merges that introduce a runtime dependency with a moderate-or-higher vulnerability.
 
 ### Trigger and CI graph position
 
@@ -97,7 +98,7 @@ The dependency review step runs only on `pull_request` events (`if: github.event
 | Setting | Value | Rationale |
 |---------|-------|-----------|
 | `fail-on-severity` | `moderate` | Blocks moderate, high, and critical CVEs; low-only vulnerabilities pass. Matches GitHub's recommended starting point. |
-| `allow-licenses` | See the full allowlist in [`.github/workflows/builder.yml`](../.github/workflows/builder.yml), including `LicenseRef-scancode-google-patent-license-golang` | Blocks every licence outside the explicit list. |
+| `license-check` | `false` | Disables dependency licence checks. No licence allowlist is enforced. |
 | `fail-on-scopes` | `runtime` | Checks runtime dependencies only; test-only imports are excluded to reduce false positives. |
 | `comment-summary-in-pr` | `on-failure` | Posts a summary comment on the PR when the job fails; no noise on clean PRs. |
 
@@ -119,7 +120,9 @@ The job grants only `contents: read`, which permits checkout without write acces
 
 ### Local usage
 
-`actionlint` is available in the dev shell via `flake.nix`. The `just lint` recipe runs it alongside `golangci-lint`, so contributors get the same workflow validation locally before pushing.
+`actionlint` and `golangci-lint` are available in the dev shell via `flake.nix`. Run `just lint` to execute `lint-actions` first, then `lint-go` because this repository enables Go. `lint-actions` runs only `actionlint`, and `lint-go` runs only `golangci-lint run`. Missing tools fail visibly, and Just stops at the first failure.
+
+`just lint-all` is this repository's compatibility alias for `just lint`; Tailor does not generate `lint-all` in other projects. The generated dispatch is consistent with the selected capabilities. Tool versions and local configuration can still produce diagnostics that differ from CI.
 
 ## Source Configs
 

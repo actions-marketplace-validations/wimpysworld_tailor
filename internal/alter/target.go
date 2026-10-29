@@ -7,15 +7,15 @@ import (
 	"github.com/cli/go-gh/v2/pkg/api"
 )
 
-// RepoTarget identifies the GitHub repository that the alter processors act
-// on: the API client, the owner and name, and whether a repository context
-// exists.
+// RepoTarget supplies repository identity, API access and diagnostics to alteration processors.
 type RepoTarget struct {
-	Client  *api.RESTClient
-	Owner   string
-	Name    string
-	HasRepo bool
-	Stderr  io.Writer
+	Client      *api.RESTClient
+	Host        string
+	wikiEnabled bool
+	Owner       string
+	Name        string
+	HasRepo     bool
+	Stderr      io.Writer
 }
 
 func (t RepoTarget) stderr() io.Writer {

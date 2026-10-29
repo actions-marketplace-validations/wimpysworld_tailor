@@ -1,6 +1,8 @@
 package gh
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -11,34 +13,33 @@ import (
 	"github.com/cli/go-gh/v2/pkg/api"
 )
 
-// ErrInsufficientScope signals the token lacks a required scope.
+// ErrInsufficientScope signals that token permissions are missing or cannot be confirmed.
 type ErrInsufficientScope struct {
-	StatusCode  int
-	HaveScopes  []string // parsed from X-OAuth-Scopes (empty for fine-grained tokens)
-	NeedScopes  []string // parsed from X-Accepted-OAuth-Scopes
-	Message     string   // from JSON body
-	DocumentURL string   // from JSON body
-	Operation   Operation
+	StatusCode int
+	HaveScopes []string // parsed from X-OAuth-Scopes (empty for fine-grained tokens)
+	NeedScopes []string // parsed from X-Accepted-OAuth-Scopes
+	Message    string   // from JSON body
+	Operation  Operation
 }
 
+// Error describes the operation and any reported OAuth scopes.
 func (e *ErrInsufficientScope) Error() string {
-	msg := fmt.Sprintf("%s: insufficient scope (have: %v, need: %v): %s",
-		e.Operation, e.HaveScopes, e.NeedScopes, e.Message)
-	if e.DocumentURL != "" {
-		msg += fmt.Sprintf(" (see %s)", e.DocumentURL)
+	// A successful response that omits an admin-only block carries no scope
+	// headers, so the message stands alone.
+	if e.StatusCode < http.StatusBadRequest {
+		return fmt.Sprintf("%s: %s", e.Operation, e.Message)
 	}
-	return msg
+	return fmt.Sprintf("%s: insufficient scope (have: %v, need: %v): %s",
+		e.Operation, e.HaveScopes, e.NeedScopes, e.Message)
 }
 
-// isAccessError returns true when err is an *ErrInsufficientScope, indicating
-// the token lacks permission for the operation.
+// isAccessError reports whether err contains an *ErrInsufficientScope.
 func isAccessError(err error) bool {
 	var scope *ErrInsufficientScope
 	return errors.As(err, &scope)
 }
 
-// ErrRateLimited signals the API rejected the request because the caller
-// exhausted a rate limit.
+// ErrRateLimited signals that the API rejected a request because of a rate limit.
 type ErrRateLimited struct {
 	StatusCode int
 	Message    string // from JSON body
@@ -46,6 +47,7 @@ type ErrRateLimited struct {
 	Operation  Operation
 }
 
+// Error describes the rate limit and includes retry guidance when available.
 func (e *ErrRateLimited) Error() string {
 	msg := fmt.Sprintf("%s: rate limited (HTTP %d): %s", e.Operation, e.StatusCode, e.Message)
 	if e.RetryAfter != "" {
@@ -79,8 +81,8 @@ func isRateLimitHTTPError(httpErr *api.HTTPError) bool {
 	return strings.Contains(strings.ToLower(httpErr.Message), "rate limit")
 }
 
-// parseCSVScopes splits a comma-separated scope header value into a slice,
-// trimming whitespace from each entry. Returns nil for an empty string.
+// parseCSVScopes trims comma-separated scopes and discards empty entries.
+// It returns nil for an empty header.
 func parseCSVScopes(header string) []string {
 	if header == "" {
 		return nil
@@ -99,8 +101,8 @@ func parseCSVScopes(header string) []string {
 // classifyHTTPError inspects err for a *api.HTTPError. Rate-limit responses
 // (any 429, or a 403 that carries rate-limit evidence) return an
 // *ErrRateLimited. Other 403 responses and most 404 responses return an
-// *ErrInsufficientScope. An update-label 404 passes through because the label
-// can disappear after Tailor reads it. Non-HTTP errors and other HTTP errors
+// *ErrInsufficientScope. Label and variable update 404s pass through because
+// an entry can disappear after Tailor reads it. Non-HTTP errors and other HTTP errors
 // pass through unchanged.
 func classifyHTTPError(err error, operation Operation) error {
 	if err == nil {
@@ -122,16 +124,12 @@ func classifyHTTPError(err error, operation Operation) error {
 	}
 
 	if httpErr.StatusCode != http.StatusForbidden &&
-		(httpErr.StatusCode != http.StatusNotFound || operation.Kind == OpUpdateLabel) {
+		(httpErr.StatusCode != http.StatusNotFound || operation.Kind == OpUpdateLabel || operation.Kind == OpUpdateVariable) {
 		return err
 	}
 
 	haveScopes := parseCSVScopes(httpErr.Headers.Get("X-OAuth-Scopes"))
 	needScopes := parseCSVScopes(httpErr.Headers.Get("X-Accepted-OAuth-Scopes"))
-
-	// api.HTTPError (go-gh v2.13.0) does not expose the documentation_url
-	// field from the JSON error body. DocumentURL is left empty until
-	// upstream adds support or response-body parsing supplies it here.
 
 	return &ErrInsufficientScope{
 		StatusCode: httpErr.StatusCode,
@@ -213,4 +211,14 @@ func boundedSanitisedText(input string, limit int) string {
 		text += "..."
 	}
 	return text
+}
+
+// sendJSON marshals body, sends it with the given method, and discards the
+// response. The returned error is bounded by boundedHTTPError.
+func sendJSON(client *api.RESTClient, method, path string, body any) error {
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	return boundedHTTPError(client.Do(method, path, bytes.NewReader(payload), nil))
 }

@@ -1,7 +1,6 @@
 package gh
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -22,7 +21,7 @@ type labelResponse struct {
 }
 
 // ReadLabels fetches all labels from a repository using paginated GET requests.
-// Returns an empty slice (not nil) when the repository has no labels.
+// It returns an empty slice (not nil) when the repository has no labels.
 func ReadLabels(client *api.RESTClient, owner, repo string) ([]model.LabelEntry, error) {
 	var all []model.LabelEntry
 
@@ -69,18 +68,10 @@ func hasNextPage(link string) bool {
 	return strings.Contains(link, `rel="next"`)
 }
 
-// ApplyLabels diffs desired labels against current labels and reconciles the
-// difference. Missing labels are created (POST), changed labels are updated
-// (PATCH), and matched labels are skipped. Labels present on GitHub but absent
-// from desired are left untouched (no delete/prune).
-//
-// Name matching is case-insensitive per GitHub's label behaviour.
-//
-// Access errors (insufficient scope or role) on individual labels are collected
-// in the returned ApplyResult rather than aborting, so a 403 on one label does
-// not prevent others from being applied. Rate-limit errors abort immediately
-// with a partial-completion error, so the loop does not burn the remaining
-// API budget.
+// ApplyLabels creates missing labels and updates changed labels, matching names
+// case-insensitively and preserving undeclared labels. It collects access errors
+// in ApplyResult so other labels can continue. Rate limits stop further requests
+// and return the counts of applied and remaining changes.
 func ApplyLabels(client *api.RESTClient, owner, repo string, desired, current []model.LabelEntry) (*ApplyResult, error) {
 	result := &ApplyResult{}
 
@@ -96,14 +87,11 @@ func ApplyLabels(client *api.RESTClient, owner, repo string, desired, current []
 
 		if !found {
 			if err := createLabel(client, owner, repo, d); err != nil {
-				opName := CreateLabelOp(d.Name)
-				if limitErr := labelRateLimitError(err, opName, applied, remainingLabelChanges(desired[i:], currentMap)); limitErr != nil {
-					return nil, limitErr
-				}
-				if recordAccessError(result, opName, err) {
+				skip, writeErr := labelWriteError(result, CreateLabelOp(d.Name), err, applied, remainingLabelChanges(desired[i:], currentMap))
+				if skip {
 					continue
 				}
-				return nil, err
+				return nil, writeErr
 			}
 			applied++
 			continue
@@ -111,14 +99,11 @@ func ApplyLabels(client *api.RESTClient, owner, repo string, desired, current []
 
 		if model.LabelNeedsUpdate(existing, d) {
 			if err := updateLabel(client, owner, repo, existing.Name, d); err != nil {
-				opName := UpdateLabelOp(d.Name)
-				if limitErr := labelRateLimitError(err, opName, applied, remainingLabelChanges(desired[i:], currentMap)); limitErr != nil {
-					return nil, limitErr
-				}
-				if recordAccessError(result, opName, err) {
+				skip, writeErr := labelWriteError(result, UpdateLabelOp(d.Name), err, applied, remainingLabelChanges(desired[i:], currentMap))
+				if skip {
 					continue
 				}
-				return nil, err
+				return nil, writeErr
 			}
 			applied++
 		}
@@ -136,6 +121,20 @@ func remainingLabelChanges(desired []model.LabelEntry, current map[string]model.
 		}
 	}
 	return remaining
+}
+
+// labelWriteError handles a failed label create or update. A rate-limit error
+// is returned wrapped with the partial-completion report. An access error is
+// recorded in result and skip is true, so the caller moves to the next label.
+// Every other error is returned unchanged with skip false.
+func labelWriteError(result *ApplyResult, operation Operation, err error, applied, remaining int) (skip bool, writeErr error) {
+	if limitErr := labelRateLimitError(err, operation, applied, remaining); limitErr != nil {
+		return false, limitErr
+	}
+	if recordAccessError(result, operation, err) {
+		return true, nil
+	}
+	return false, err
 }
 
 // labelRateLimitError classifies err and, when it is a rate-limit error,
@@ -156,19 +155,14 @@ func createLabel(client *api.RESTClient, owner, repo string, label model.LabelEn
 		Color:       label.Color,
 		Description: label.Description,
 	}
-	payload, err := json.Marshal(body)
-	if err != nil {
-		return fmt.Errorf("marshalling label %q: %w", label.Name, err)
-	}
-
 	path := fmt.Sprintf("repos/%s/%s/labels", owner, repo)
-	if err := boundedHTTPError(client.Post(path, bytes.NewReader(payload), nil)); err != nil {
+	if err := sendJSON(client, http.MethodPost, path, body); err != nil {
 		return fmt.Errorf("creating label %q: %w", label.Name, err)
 	}
 	return nil
 }
 
-// updateLabel sends a PATCH to update an existing label's colour or description.
+// updateLabel sends a PATCH to update an existing label's name, colour or description.
 // The name parameter is the current name on GitHub (used in the URL path).
 func updateLabel(client *api.RESTClient, owner, repo, name string, label model.LabelEntry) error {
 	body := map[string]string{
@@ -176,13 +170,8 @@ func updateLabel(client *api.RESTClient, owner, repo, name string, label model.L
 		"color":       label.Color,
 		"description": label.Description,
 	}
-	payload, err := json.Marshal(body)
-	if err != nil {
-		return fmt.Errorf("marshalling label update %q: %w", name, err)
-	}
-
 	path := fmt.Sprintf("repos/%s/%s/labels/%s", owner, repo, url.PathEscape(name))
-	if err := boundedHTTPError(client.Patch(path, bytes.NewReader(payload), nil)); err != nil {
+	if err := sendJSON(client, http.MethodPatch, path, body); err != nil {
 		return fmt.Errorf("updating label %q: %w", name, err)
 	}
 	return nil

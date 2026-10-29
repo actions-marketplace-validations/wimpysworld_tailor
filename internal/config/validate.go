@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"maps"
+	"net"
 	"reflect"
 	"regexp"
 	"slices"
@@ -24,12 +25,90 @@ var (
 const maxLabels = 1000
 
 func validateTopLevelSettings(cfg *Config) error {
-	if len(cfg.Extra) == 0 {
+	valid := []string{"actions", "code_quality", "code_scanning", "immutable_releases", "labels", "languages", "license", "mcp", "pages", "repository", "ruleset", "swatches", "variables"}
+	return rejectExtra("top-level", cfg.Extra, valid)
+}
+
+// ValidatePages checks syntax only. Source files are checked before Pages writes.
+func ValidatePages(cfg *Config) error {
+	p := cfg.Pages
+	if p == nil {
 		return nil
 	}
+	if err := rejectExtra("pages", p.Extra, []string{"enabled", "generator", "path", "branch", "cname", "links"}); err != nil {
+		return err
+	}
+	if p.Generator != nil && !slices.Contains([]string{"static", "hugo", "jekyll"}, *p.Generator) {
+		return fmt.Errorf("pages.generator must be static, hugo, or jekyll")
+	}
+	if err := validatePagesPath(p.Path); err != nil {
+		return err
+	}
+	if err := validatePagesBranch(p.Branch); err != nil {
+		return err
+	}
+	if err := validatePagesCNAME(p.CNAME); err != nil {
+		return err
+	}
+	return validatePagesLinks(p)
+}
 
-	valid := []string{"actions", "labels", "license", "repository", "swatches"}
-	return unrecognisedSettingError("top-level", cfg.Extra, valid)
+func validatePagesPath(value *string) error {
+	if value != nil {
+		path := *value
+		if path == "" || strings.HasPrefix(path, "/") || strings.ContainsAny(path, "\\\\\n\r\x00:$`\"'") || strings.Contains(path, "${{") {
+			return fmt.Errorf("pages.path must be a safe project-relative directory")
+		}
+		for part := range strings.SplitSeq(path, "/") {
+			if part == "" || part == "." || part == ".." {
+				return fmt.Errorf("pages.path must not contain empty, dot, or traversal components")
+			}
+		}
+		if strings.ContainsFunc(path, unicode.IsControl) {
+			return fmt.Errorf("pages.path must not contain control characters")
+		}
+	}
+	return nil
+}
+
+func validatePagesBranch(value *string) error {
+	if value != nil {
+		branch := *value
+		if branch == "" || branch == "@" || strings.HasPrefix(branch, "-") || strings.HasSuffix(branch, ".") || strings.Contains(branch, "..") || strings.Contains(branch, "@{") || strings.ContainsAny(branch, " ~^:?*[\\\\\x7f") || strings.ContainsFunc(branch, unicode.IsControl) {
+			return fmt.Errorf("pages.branch must be a valid branch name")
+		}
+		for part := range strings.SplitSeq(branch, "/") {
+			if part == "" || strings.HasPrefix(part, ".") || strings.HasSuffix(part, ".lock") {
+				return fmt.Errorf("pages.branch must be a valid branch name")
+			}
+		}
+	}
+	return nil
+}
+
+func validatePagesCNAME(value *string) error {
+	if value != nil && *value != "" {
+		domain := *value
+		if len(domain) > 253 || !strings.Contains(domain, ".") || net.ParseIP(domain) != nil {
+			return fmt.Errorf("pages.cname must be a domain without a scheme or path")
+		}
+		for label := range strings.SplitSeq(domain, ".") {
+			if len(label) == 0 || len(label) > 63 || strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") || !domainLabelRegexp.MatchString(label) {
+				return fmt.Errorf("pages.cname must be a domain without a scheme or path")
+			}
+		}
+	}
+	return nil
+}
+
+var domainLabelRegexp = regexp.MustCompile(`^[A-Za-z0-9-]+$`)
+
+// ValidateImmutableReleases rejects unsupported release immutability keys.
+func ValidateImmutableReleases(cfg *Config) error {
+	if cfg.ImmutableReleases == nil {
+		return nil
+	}
+	return rejectExtra("immutable_releases", cfg.ImmutableReleases.Extra, []string{"enabled"})
 }
 
 // ValidatePaths checks that every swatch path in cfg matches a known embedded
@@ -66,10 +145,7 @@ func ValidateRepoSettings(cfg *Config) error {
 		return nil
 	}
 
-	if len(cfg.Repository.Extra) > 0 {
-		return unrecognisedSettingError("repository", cfg.Repository.Extra, repoSettingNames())
-	}
-	return nil
+	return rejectExtra("repository", cfg.Repository.Extra, settingNames(model.RepositorySettingFields(nil)))
 }
 
 // ValidateWorkflowPermissions checks that default_workflow_permissions, if set,
@@ -78,30 +154,145 @@ func ValidateWorkflowPermissions(cfg *Config) error {
 	if cfg.Repository == nil || cfg.Repository.DefaultWorkflowPermissions == nil {
 		return nil
 	}
-	v := *cfg.Repository.DefaultWorkflowPermissions
-	if v != "read" && v != "write" {
-		return fmt.Errorf("invalid default_workflow_permissions %q; must be %q or %q", v, "read", "write")
+	return validateEnum("default_workflow_permissions", cfg.Repository.DefaultWorkflowPermissions, "read", "write")
+}
+
+// ValidateSecretScanning checks that secret_scanning,
+// secret_scanning_push_protection, and secret_scanning_non_provider_patterns,
+// if set, are either "enabled" or "disabled".
+func ValidateSecretScanning(cfg *Config) error {
+	if cfg.Repository == nil {
+		return nil
+	}
+	for _, setting := range []struct {
+		name  string
+		value *string
+	}{
+		{"secret_scanning", cfg.Repository.SecretScanning},
+		{"secret_scanning_push_protection", cfg.Repository.SecretScanningPushProtection},
+		{"secret_scanning_non_provider_patterns", cfg.Repository.SecretScanningNonProviderPatterns},
+	} {
+		if err := validateEnum(setting.name, setting.value, "enabled", "disabled"); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-// ValidateActions checks the Actions policy field names, enum values, and
-// selected-action field combinations, and rejects patterns_allowed entries
-// containing control characters.
+// ValidateCodeScanning checks the code scanning field names, enum values, and
+// language list.
+func ValidateCodeScanning(cfg *Config) error {
+	if cfg.CodeScanning == nil {
+		return nil
+	}
+	if err := rejectExtra("code_scanning", cfg.CodeScanning.Extra, settingNames(model.CodeScanningSettingFields(nil))); err != nil {
+		return err
+	}
+
+	c := cfg.CodeScanning
+	if err := validateEnum("code_scanning.state", c.State, "configured", "not-configured"); err != nil {
+		return err
+	}
+	if err := validateEnum("code_scanning.query_suite", c.QuerySuite, "default", "extended"); err != nil {
+		return err
+	}
+	if err := validateEnum("code_scanning.threat_model", c.ThreatModel, "remote", "remote_and_local"); err != nil {
+		return err
+	}
+	return validateLanguages("code_scanning", c.Languages, model.CodeScanningLanguages)
+}
+
+// ValidateCodeQuality checks the Code Quality field names, enum values, and
+// language list.
+func ValidateCodeQuality(cfg *Config) error {
+	if cfg.CodeQuality == nil {
+		return nil
+	}
+	if err := rejectExtra("code_quality", cfg.CodeQuality.Extra, settingNames(model.CodeQualitySettingFields(nil))); err != nil {
+		return err
+	}
+
+	c := cfg.CodeQuality
+	if err := validateEnum("code_quality.state", c.State, "configured", "not-configured"); err != nil {
+		return err
+	}
+	return validateLanguages("code_quality", c.Languages, model.CodeQualityLanguages)
+}
+
+// validateEnum checks that value, if set, is one of the allowed values. The
+// error lists the allowed values as `"a" or "b"` for two values and as
+// `"a", "b", or "c"` for three or more.
+func validateEnum(name string, value *string, allowed ...string) error {
+	if value == nil || slices.Contains(allowed, *value) {
+		return nil
+	}
+	quoted := make([]string, len(allowed))
+	for i, v := range allowed {
+		quoted[i] = fmt.Sprintf("%q", v)
+	}
+	separator := " or "
+	if len(quoted) > 2 {
+		separator = ", or "
+	}
+	list := strings.Join(quoted[:len(quoted)-1], ", ") + separator + quoted[len(quoted)-1]
+	return fmt.Errorf("invalid %s %q; must be %s", name, *value, list)
+}
+
+// validateLanguages checks that every language, if set, is in the valid list
+// and appears only once.
+func validateLanguages(section string, languages *[]string, valid []string) error {
+	if languages == nil {
+		return nil
+	}
+	return validateMembers(section+".languages", "language", *languages, valid)
+}
+
+// validateMembers checks that every value in list is in the valid list and
+// appears only once. The noun names one value in the error messages.
+func validateMembers(list, noun string, values, valid []string) error {
+	seen := make(map[string]bool, len(values))
+	for i, value := range values {
+		if !slices.Contains(valid, value) {
+			return fmt.Errorf("%s[%d]: unrecognised %s %q; valid %ss: %s",
+				list, i, noun, value, noun, strings.Join(valid, ", "))
+		}
+		if seen[value] {
+			return fmt.Errorf("%s[%d]: duplicate %s %q", list, i, noun, value)
+		}
+		seen[value] = true
+	}
+	return nil
+}
+
+// ValidateActions checks Actions policy keys, values, retention limits and selected-action field combinations.
+// It also rejects control characters in allowed patterns.
 func ValidateActions(cfg *Config) error {
 	if cfg.Actions == nil {
 		return nil
 	}
-	if len(cfg.Actions.Extra) > 0 {
-		return unrecognisedSettingError("actions", cfg.Actions.Extra, settingNames(model.ActionsSettingFields(nil)))
+	if err := rejectExtra("actions", cfg.Actions.Extra, settingNames(model.ActionsSettingFields(nil))); err != nil {
+		return err
 	}
 
 	a := cfg.Actions
-	if a.AllowedActions != nil {
-		v := *a.AllowedActions
-		if v != "all" && v != "local_only" && v != "selected" {
-			return fmt.Errorf("invalid allowed_actions %q; must be %q, %q, or %q", v, "all", "local_only", "selected")
+	if approval := a.ForkPRContributorApproval; approval != nil {
+		if err := rejectExtra("actions.fork_pr_contributor_approval", approval.Extra, []string{"approval_policy"}); err != nil {
+			return err
 		}
+		if err := validateEnum("actions.fork_pr_contributor_approval.approval_policy", approval.ApprovalPolicy, model.ForkPRContributorApprovalPolicies...); err != nil {
+			return err
+		}
+	}
+	if retention := a.ArtifactAndLogRetention; retention != nil {
+		if err := rejectExtra("actions.artifact_and_log_retention", retention.Extra, []string{"days"}); err != nil {
+			return err
+		}
+		if retention.Days != nil && (*retention.Days < 1 || *retention.Days > 90) {
+			return fmt.Errorf("actions.artifact_and_log_retention.days must be between 1 and 90")
+		}
+	}
+	if err := validateEnum("allowed_actions", a.AllowedActions, "all", "local_only", "selected"); err != nil {
+		return err
 	}
 	selectedFieldsSet := a.GitHubOwnedAllowed != nil || a.VerifiedAllowed != nil || a.PatternsAllowed != nil
 	if selectedFieldsSet && (a.AllowedActions == nil || *a.AllowedActions != "selected") {
@@ -117,7 +308,7 @@ func ValidateActions(cfg *Config) error {
 	return nil
 }
 
-func unrecognisedSettingError(section string, extra map[string]interface{}, valid []string) error {
+func unrecognisedSettingError(section string, extra map[string]any, valid []string) error {
 	keys := slices.Sorted(maps.Keys(extra))
 	return fmt.Errorf("unrecognised %s setting %q in config; valid settings: %s",
 		section, keys[0], strings.Join(valid, ", "))
@@ -166,9 +357,8 @@ func containsControl(s string) bool {
 	return strings.ContainsFunc(s, unicode.IsControl)
 }
 
-// ValidateRepoStringSettings checks repository string enum values and rejects
-// control characters, which could inject terminal control sequences into
-// output. Topics carry their own stricter format validation in ValidateTopics.
+// ValidateRepoStringSettings checks repository string enums and rejects control characters to prevent terminal control sequences in output.
+// ValidateTopics applies stricter validation to topics.
 func ValidateRepoStringSettings(cfg *Config) error {
 	if cfg.Repository == nil {
 		return nil
@@ -185,19 +375,9 @@ func ValidateRepoStringSettings(cfg *Config) error {
 		{"merge_commit_message", cfg.Repository.MergeCommitMessage, []string{"PR_TITLE", "PR_BODY", "BLANK"}},
 	}
 	for _, setting := range enumSettings {
-		if setting.value == nil || slices.Contains(setting.allowed, *setting.value) {
-			continue
+		if err := validateEnum(setting.name, setting.value, setting.allowed...); err != nil {
+			return err
 		}
-		quoted := make([]string, len(setting.allowed))
-		for i, value := range setting.allowed {
-			quoted[i] = fmt.Sprintf("%q", value)
-		}
-		separator := " or "
-		if len(quoted) > 2 {
-			separator = ", or "
-		}
-		allowed := strings.Join(quoted[:len(quoted)-1], ", ") + separator + quoted[len(quoted)-1]
-		return fmt.Errorf("invalid %s %q; must be %s", setting.name, *setting.value, allowed)
 	}
 
 	for _, field := range model.RepositorySettingFields(cfg.Repository) {
@@ -256,12 +436,6 @@ func ValidateLabels(cfg *Config) error {
 	return nil
 }
 
-// repoSettingNames returns the sorted list of recognised yaml tag names from
-// RepositorySettings, excluding the inline Extra field.
-func repoSettingNames() []string {
-	return settingNames(model.RepositorySettingFields(nil))
-}
-
 // settingNames returns the sorted yaml tag names for fields.
 func settingNames(fields []model.SettingField) []string {
 	names := make([]string, 0, len(fields))
@@ -270,4 +444,440 @@ func settingNames(fields []model.SettingField) []string {
 	}
 	slices.Sort(names)
 	return names
+}
+
+// rulesetEnterpriseEnforcement is the enforcement level that GitHub offers
+// only on GitHub Enterprise plans.
+const rulesetEnterpriseEnforcement = "evaluate"
+
+// maxRulesetReviewCount is the largest required_approving_review_count that
+// the rulesets API accepts.
+const maxRulesetReviewCount = 10
+
+// ValidateRuleset checks ruleset keys, values, bypass actors, branch conditions and rule parameters.
+// It checks fields supplied by default merging only when set. ValidateCompleteRuleset checks their presence after merging.
+func ValidateRuleset(cfg *Config) error {
+	r := cfg.Ruleset
+	if r == nil {
+		return nil
+	}
+	if err := rejectExtra("ruleset", r.Extra, model.RulesetSettingNames); err != nil {
+		return err
+	}
+	if err := validateRulesetEnforcement(r.Enforcement); err != nil {
+		return err
+	}
+	if err := validateBypassActors(r.BypassActors); err != nil {
+		return err
+	}
+	if err := validateRulesetConditions(r.Conditions); err != nil {
+		return err
+	}
+	return validateRulesetRules(r.Rules)
+}
+
+func validateRulesetEnforcement(enforcement *string) error {
+	if enforcement != nil && *enforcement == rulesetEnterpriseEnforcement {
+		return fmt.Errorf("invalid ruleset.enforcement %q; evaluate is available only on GitHub Enterprise", *enforcement)
+	}
+	return validateEnum("ruleset.enforcement", enforcement, model.RulesetEnforcements...)
+}
+
+// validateBypassActors checks every bypass actor and rejects duplicate
+// actors, which share an actor_type and actor_id.
+func validateBypassActors(actors *[]model.RulesetBypassActor) error {
+	if actors == nil {
+		return nil
+	}
+	seen := make(map[string]bool, len(*actors))
+	for i, actor := range *actors {
+		name := fmt.Sprintf("ruleset.bypass_actors[%d]", i)
+		if err := rejectExtra(name, actor.Extra, model.RulesetBypassActorNames); err != nil {
+			return err
+		}
+		if actor.ActorType == nil {
+			return fmt.Errorf("%s: actor_type must not be empty", name)
+		}
+		if err := validateEnum(name+".actor_type", actor.ActorType, model.RulesetActorTypes...); err != nil {
+			return err
+		}
+		if actor.BypassMode == nil {
+			return fmt.Errorf("%s: bypass_mode must not be empty", name)
+		}
+		if err := validateEnum(name+".bypass_mode", actor.BypassMode, model.RulesetBypassModes...); err != nil {
+			return err
+		}
+		key := *actor.ActorType
+		if *actor.ActorType == "DeployKey" {
+			if actor.ActorID != nil {
+				return fmt.Errorf("%s: actor_id must be absent for a DeployKey actor", name)
+			}
+			if *actor.BypassMode == "pull_request" {
+				return fmt.Errorf("%s: bypass_mode %q is not valid for a DeployKey actor", name, *actor.BypassMode)
+			}
+		} else {
+			if actor.ActorID == nil {
+				return fmt.Errorf("%s: actor_id is required for a %s actor", name, *actor.ActorType)
+			}
+			key = fmt.Sprintf("%s:%d", *actor.ActorType, *actor.ActorID)
+		}
+		if seen[key] {
+			return fmt.Errorf("%s: duplicate bypass actor %s", name, key)
+		}
+		seen[key] = true
+	}
+	return nil
+}
+
+func validateRulesetConditions(conditions *model.RulesetConditions) error {
+	if conditions == nil {
+		return nil
+	}
+	if err := rejectExtra("ruleset.conditions", conditions.Extra, model.RulesetConditionsNames); err != nil {
+		return err
+	}
+	refName := conditions.RefName
+	if refName == nil {
+		return nil
+	}
+	if err := rejectExtra("ruleset.conditions.ref_name", refName.Extra, model.RulesetRefNameNames); err != nil {
+		return err
+	}
+	if refName.Include != nil && len(*refName.Include) == 0 {
+		return fmt.Errorf("ruleset.conditions.ref_name.include must contain at least one entry")
+	}
+	if err := validateRefPatterns("ruleset.conditions.ref_name.include", refName.Include); err != nil {
+		return err
+	}
+	if err := validateRefPatterns("ruleset.conditions.ref_name.exclude", refName.Exclude); err != nil {
+		return err
+	}
+	return rejectIncludeTokens(refName.Exclude)
+}
+
+// rulesetIncludeTokens are the special values that GitHub accepts in the
+// include list only.
+var rulesetIncludeTokens = []string{"~DEFAULT_BRANCH", "~ALL"}
+
+// rejectIncludeTokens rejects the include-only special values in the
+// exclude list, where GitHub treats them as a plain pattern that matches
+// no branch.
+func rejectIncludeTokens(exclude *[]string) error {
+	if exclude == nil {
+		return nil
+	}
+	for i, pattern := range *exclude {
+		if slices.Contains(rulesetIncludeTokens, pattern) {
+			return fmt.Errorf("ruleset.conditions.ref_name.exclude[%d]: %s is valid in include only", i, pattern)
+		}
+	}
+	return nil
+}
+
+// validateRefPatterns rejects empty, control-bearing, and duplicate
+// patterns in a branch condition list.
+func validateRefPatterns(name string, patterns *[]string) error {
+	if patterns == nil {
+		return nil
+	}
+	seen := make(map[string]bool, len(*patterns))
+	for i, pattern := range *patterns {
+		if pattern == "" {
+			return fmt.Errorf("%s[%d]: pattern must not be empty", name, i)
+		}
+		if containsControl(pattern) {
+			return fmt.Errorf("%s[%d]: pattern %q contains control characters", name, i, pattern)
+		}
+		if seen[pattern] {
+			return fmt.Errorf("%s[%d]: duplicate pattern %q", name, i, pattern)
+		}
+		seen[pattern] = true
+	}
+	return nil
+}
+
+func validateRulesetRules(rules *model.RulesetRules) error {
+	if rules == nil {
+		return nil
+	}
+	if err := rejectExtra("ruleset.rules", rules.Extra, model.RulesetRulesNames); err != nil {
+		return err
+	}
+	if err := validateRulesetPullRequest(rules.PullRequest); err != nil {
+		return err
+	}
+	if err := validateLinearHistoryMergeMethods(rules); err != nil {
+		return err
+	}
+	if err := validateRulesetStatusChecks(rules.RequiredStatusChecks); err != nil {
+		return err
+	}
+	return validateRulesetCodeScanning(rules.CodeScanning)
+}
+
+// validateLinearHistoryMergeMethods rejects an enabled pull request rule that permits only merge commits when required_linear_history is true.
+// Linear history requires squash or rebase, so that combination blocks every pull request merge.
+func validateLinearHistoryMergeMethods(rules *model.RulesetRules) error {
+	pr := rules.PullRequest
+	if rules.RequiredLinearHistory == nil || !*rules.RequiredLinearHistory ||
+		pr == nil || pr.Enabled == nil || !*pr.Enabled || pr.Parameters == nil || pr.Parameters.AllowedMergeMethods == nil {
+		return nil
+	}
+	methods := *pr.Parameters.AllowedMergeMethods
+	if slices.Contains(methods, "squash") || slices.Contains(methods, "rebase") {
+		return nil
+	}
+	return fmt.Errorf("ruleset.rules.required_linear_history requires pull_request.parameters.allowed_merge_methods to include squash or rebase")
+}
+
+func validateRulesetPullRequest(rule *model.RulesetPullRequest) error {
+	if rule == nil {
+		return nil
+	}
+	const name = "ruleset.rules.pull_request"
+	if err := rejectExtra(name, rule.Extra, model.RulesetRuleNames); err != nil {
+		return err
+	}
+	p := rule.Parameters
+	if p == nil {
+		return nil
+	}
+	if err := rejectExtra(name+".parameters", p.Extra, model.RulesetPullRequestParameterNames); err != nil {
+		return err
+	}
+	if p.RequiredApprovingReviewCount != nil && (*p.RequiredApprovingReviewCount < 0 || *p.RequiredApprovingReviewCount > maxRulesetReviewCount) {
+		return fmt.Errorf("%s.parameters.required_approving_review_count must be between 0 and %d, got %d", name, maxRulesetReviewCount, *p.RequiredApprovingReviewCount)
+	}
+	if p.AllowedMergeMethods == nil {
+		return nil
+	}
+	if len(*p.AllowedMergeMethods) == 0 {
+		return fmt.Errorf("%s.parameters.allowed_merge_methods must contain at least one method", name)
+	}
+	return validateMembers(name+".parameters.allowed_merge_methods", "method", *p.AllowedMergeMethods, model.RulesetMergeMethods)
+}
+
+func validateRulesetStatusChecks(rule *model.RulesetStatusChecks) error {
+	if rule == nil {
+		return nil
+	}
+	const name = "ruleset.rules.required_status_checks"
+	if err := rejectExtra(name, rule.Extra, model.RulesetRuleNames); err != nil {
+		return err
+	}
+	p := rule.Parameters
+	if p == nil {
+		return nil
+	}
+	if err := rejectExtra(name+".parameters", p.Extra, model.RulesetStatusChecksParameterNames); err != nil {
+		return err
+	}
+	if p.RequiredStatusChecks == nil {
+		return nil
+	}
+	seen := make(map[string]bool, len(*p.RequiredStatusChecks))
+	for i, check := range *p.RequiredStatusChecks {
+		entry := fmt.Sprintf("%s.parameters.required_status_checks[%d]", name, i)
+		if check.IntegrationID != nil && *check.IntegrationID <= 0 {
+			return fmt.Errorf("%s: integration_id must be positive, got %d", entry, *check.IntegrationID)
+		}
+		if err := validateListEntry(entry, check.Extra, model.RulesetStatusCheckNames, "context", check.Context, seen); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateListEntry checks one entry of a keyed list: no unrecognised
+// setting, and a key value that is not empty, carries no control
+// characters, and appears once. It records the value in seen.
+func validateListEntry(entry string, extra map[string]any, valid []string, field, value string, seen map[string]bool) error {
+	if err := rejectExtra(entry, extra, valid); err != nil {
+		return err
+	}
+	if value == "" {
+		return fmt.Errorf("%s: %s must not be empty", entry, field)
+	}
+	if containsControl(value) {
+		return fmt.Errorf("%s: %s %q contains control characters", entry, field, value)
+	}
+	if seen[value] {
+		return fmt.Errorf("%s: duplicate %s %q", entry, field, value)
+	}
+	seen[value] = true
+	return nil
+}
+
+func validateRulesetCodeScanning(rule *model.RulesetCodeScanning) error {
+	if rule == nil {
+		return nil
+	}
+	const name = "ruleset.rules.code_scanning"
+	if err := rejectExtra(name, rule.Extra, model.RulesetRuleNames); err != nil {
+		return err
+	}
+	p := rule.Parameters
+	if p == nil {
+		return nil
+	}
+	if err := rejectExtra(name+".parameters", p.Extra, model.RulesetCodeScanningParameterNames); err != nil {
+		return err
+	}
+	if p.CodeScanningTools == nil {
+		return nil
+	}
+	seen := make(map[string]bool, len(*p.CodeScanningTools))
+	for i, tool := range *p.CodeScanningTools {
+		entry := fmt.Sprintf("%s.parameters.code_scanning_tools[%d]", name, i)
+		if err := validateEnum(entry+".alerts_threshold", &tool.AlertsThreshold, model.RulesetAlertsThresholds...); err != nil {
+			return err
+		}
+		if err := validateEnum(entry+".security_alerts_threshold", &tool.SecurityAlertsThreshold, model.RulesetSecurityAlertsThresholds...); err != nil {
+			return err
+		}
+		if err := validateListEntry(entry, tool.Extra, model.RulesetCodeScanningToolNames, "tool", tool.Tool, seen); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ValidateCompleteRuleset requires the fields that Tailor needs for a complete ruleset write after default merging.
+// It requires parameters only for enabled rules. Missing fields can clear live values without a report line because writes replace the whole ruleset.
+func ValidateCompleteRuleset(cfg *Config) error {
+	r := cfg.Ruleset
+	if r == nil {
+		return nil
+	}
+	if r.Enforcement == nil {
+		return fmt.Errorf("ruleset requires enforcement")
+	}
+	if r.BypassActors == nil {
+		return fmt.Errorf("ruleset requires bypass_actors")
+	}
+	if r.Conditions == nil || r.Conditions.RefName == nil || r.Conditions.RefName.Include == nil {
+		return fmt.Errorf("ruleset requires conditions.ref_name.include")
+	}
+	if r.Conditions.RefName.Exclude == nil {
+		return fmt.Errorf("ruleset requires conditions.ref_name.exclude")
+	}
+	if r.Rules == nil {
+		return fmt.Errorf("ruleset requires rules")
+	}
+	if err := validateCompleteBooleanRules(r.Rules); err != nil {
+		return err
+	}
+	if err := validateCompletePullRequest(r.Rules.PullRequest); err != nil {
+		return err
+	}
+	if err := validateCompleteStatusChecks(r.Rules.RequiredStatusChecks); err != nil {
+		return err
+	}
+	return validateCompleteCodeScanning(r.Rules.CodeScanning)
+}
+
+// validateCompleteBooleanRules requires the six Boolean rule keys.
+// Writes send only true rules, so an absent key removes the live rule without a report line.
+func validateCompleteBooleanRules(rules *model.RulesetRules) error {
+	for _, rule := range []struct {
+		key   string
+		value *bool
+	}{
+		{"creation", rules.Creation},
+		{"update", rules.Update},
+		{"deletion", rules.Deletion},
+		{"required_linear_history", rules.RequiredLinearHistory},
+		{"required_signatures", rules.RequiredSignatures},
+		{"non_fast_forward", rules.NonFastForward},
+	} {
+		if rule.value == nil {
+			return fmt.Errorf("ruleset.rules requires %s", rule.key)
+		}
+	}
+	return nil
+}
+
+func validateCompletePullRequest(rule *model.RulesetPullRequest) error {
+	const name = "ruleset.rules.pull_request"
+	if rule == nil || rule.Enabled == nil {
+		return fmt.Errorf("%s requires enabled", name)
+	}
+	if !*rule.Enabled {
+		return nil
+	}
+	p := rule.Parameters
+	if p == nil || p.RequiredApprovingReviewCount == nil || p.DismissStaleReviewsOnPush == nil ||
+		p.RequireCodeOwnerReview == nil || p.RequireLastPushApproval == nil ||
+		p.RequiredReviewThreadResolution == nil || p.RequireExtraApprovalForUnattributedChanges == nil ||
+		p.AllowedMergeMethods == nil {
+		return fmt.Errorf("%s requires every parameter when enabled: %s", name, strings.Join(model.RulesetPullRequestParameterNames, ", "))
+	}
+	return nil
+}
+
+func validateCompleteStatusChecks(rule *model.RulesetStatusChecks) error {
+	const name = "ruleset.rules.required_status_checks"
+	if rule == nil || rule.Enabled == nil {
+		return fmt.Errorf("%s requires enabled", name)
+	}
+	if !*rule.Enabled {
+		return nil
+	}
+	p := rule.Parameters
+	if p == nil || p.StrictRequiredStatusChecksPolicy == nil || p.DoNotEnforceOnCreate == nil || p.RequiredStatusChecks == nil {
+		return fmt.Errorf("%s requires every parameter when enabled: %s", name, strings.Join(model.RulesetStatusChecksParameterNames, ", "))
+	}
+	return nil
+}
+
+// validateCompleteCodeScanning requires a non-empty tool list when the rule is enabled.
+// GitHub rejects a code scanning rule with no tools.
+func validateCompleteCodeScanning(rule *model.RulesetCodeScanning) error {
+	const name = "ruleset.rules.code_scanning"
+	if rule == nil || rule.Enabled == nil {
+		return fmt.Errorf("%s requires enabled", name)
+	}
+	if !*rule.Enabled {
+		return nil
+	}
+	p := rule.Parameters
+	if p == nil || p.CodeScanningTools == nil || len(*p.CodeScanningTools) == 0 {
+		return fmt.Errorf("%s requires at least one entry in parameters.code_scanning_tools when enabled", name)
+	}
+	return nil
+}
+
+// RulesetMergeMethodWarnings reports configured merge methods that the repository settings disable, even when the pull request rule is disabled.
+// It leaves both settings unchanged.
+func RulesetMergeMethodWarnings(cfg *Config) []string {
+	if cfg.Ruleset == nil || cfg.Repository == nil || cfg.Ruleset.Rules == nil ||
+		cfg.Ruleset.Rules.PullRequest == nil || cfg.Ruleset.Rules.PullRequest.Parameters == nil ||
+		cfg.Ruleset.Rules.PullRequest.Parameters.AllowedMergeMethods == nil {
+		return nil
+	}
+	repositoryFields := map[string]struct {
+		field string
+		value *bool
+	}{
+		"merge":  {"allow_merge_commit", cfg.Repository.AllowMergeCommit},
+		"squash": {"allow_squash_merge", cfg.Repository.AllowSquashMerge},
+		"rebase": {"allow_rebase_merge", cfg.Repository.AllowRebaseMerge},
+	}
+	var warnings []string
+	for _, method := range *cfg.Ruleset.Rules.PullRequest.Parameters.AllowedMergeMethods {
+		setting, ok := repositoryFields[method]
+		if !ok || setting.value == nil || *setting.value {
+			continue
+		}
+		warnings = append(warnings, fmt.Sprintf("warning: ruleset allows %s merging but repository.%s is false", method, setting.field))
+	}
+	return warnings
+}
+
+// rejectExtra returns the unrecognised setting error when extra holds keys.
+func rejectExtra(section string, extra map[string]any, valid []string) error {
+	if len(extra) == 0 {
+		return nil
+	}
+	return unrecognisedSettingError(section, extra, valid)
 }

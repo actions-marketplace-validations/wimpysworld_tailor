@@ -1,0 +1,336 @@
+package alter
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"slices"
+	"sort"
+	"strings"
+
+	"github.com/wimpysworld/tailor/internal/config"
+	"github.com/wimpysworld/tailor/internal/output"
+)
+
+type managedRenderer func([]managedSelection) (managedRenderedFiles, error)
+
+type managedExecution struct {
+	plan    managedPlan
+	planned []SwatchResult
+}
+
+func prepareManagedExecution(cfg *config.Config, dir string, renderer managedRenderer) (*managedExecution, error) {
+	selections, err := selectManagedFiles(cfg)
+	if err != nil {
+		return nil, err
+	}
+	rendered, err := renderer(slices.Clone(selections))
+	if err != nil {
+		return nil, fmt.Errorf("rendering managed files: %w", err)
+	}
+	if err := validateManagedRecipeNames(rendered); err != nil {
+		return nil, err
+	}
+	plan, err := preflightManagedFiles(dir, selections, rendered)
+	if err != nil {
+		return nil, err
+	}
+	planned, err := managedPlannedResults(dir, plan)
+	if err != nil {
+		return nil, err
+	}
+	planned, err = appendPreservedManagedRoots(dir, planned)
+	if err != nil {
+		return nil, err
+	}
+
+	return &managedExecution{plan: plan, planned: planned}, nil
+}
+
+func managedExcludedPaths() map[string]struct{} {
+	excluded := make(map[string]struct{})
+	for _, entry := range fixedManagedRegistry() {
+		excluded[entry.Path] = struct{}{}
+	}
+	return excluded
+}
+
+func validateManagedRecipeNames(rendered managedRenderedFiles) error {
+	paths := make([]string, 0, len(rendered))
+	for name := range rendered {
+		if name == "justfile" || strings.HasSuffix(name, ".just") {
+			paths = append(paths, name)
+		}
+	}
+	sort.Strings(paths)
+
+	owners := make(map[string]string)
+	for _, name := range paths {
+		for line := range strings.SplitSeq(string(rendered[name]), "\n") {
+			if line == "" || strings.TrimLeft(line, " \t") != line || strings.HasPrefix(line, "#") {
+				continue
+			}
+			colon := strings.IndexByte(line, ':')
+			if colon < 1 || (colon+1 < len(line) && line[colon+1] == '=') {
+				continue
+			}
+			fields := strings.Fields(line[:colon])
+			if len(fields) == 0 || !validManagedRecipeName(fields[0]) {
+				continue
+			}
+			recipe := fields[0]
+			if owner, exists := owners[recipe]; exists {
+				return fmt.Errorf("generated managed files contain duplicate recipe %q in %q and %q", recipe, owner, name)
+			}
+			owners[recipe] = name
+		}
+	}
+	return nil
+}
+
+func validManagedRecipeName(name string) bool {
+	for index, character := range name {
+		if character >= 'a' && character <= 'z' || character >= 'A' && character <= 'Z' || character == '_' || index > 0 && (character >= '0' && character <= '9' || character == '-') {
+			continue
+		}
+		return false
+	}
+	return name != ""
+}
+
+func managedPlannedResults(dir string, plan managedPlan) (results []SwatchResult, retErr error) {
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return nil, fmt.Errorf("opening managed project root %q for reporting: %w", dir, err)
+	}
+	defer func() {
+		if err := root.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("closing managed project root %q after reporting: %w", dir, err))
+		}
+	}()
+
+	results = make([]SwatchResult, 0, len(plan.Files))
+	for _, file := range plan.Files {
+		result := SwatchResult{Path: file.Selection.Entry.Path}
+		switch file.Operation {
+		case managedOperationWrite:
+			_, err := root.Lstat(result.Path)
+			switch {
+			case errors.Is(err, os.ErrNotExist):
+				result.Category = WouldCopy
+			case err != nil:
+				return nil, fmt.Errorf("checking managed destination %q for reporting: %w", result.Path, err)
+			default:
+				result.Category = WouldOverwrite
+			}
+		case managedOperationRemove:
+			result.Category = WouldRemove
+		case managedOperationNoop:
+			result.Category = NoChange
+		case managedOperationPreserve:
+			result.Category = Skipped
+			switch file.Selection.Entry.Policy {
+			case managedPolicyRoot:
+				result.Reason = SkipManagedRootExists
+			case managedPolicySharedStarter:
+				result.Reason = SkipManagedSharedExists
+			}
+		default:
+			return nil, fmt.Errorf("managed destination %q has an invalid reporting operation", result.Path)
+		}
+		results = append(results, result)
+	}
+	return results, nil
+}
+
+func appendPreservedManagedRoots(dir string, results []SwatchResult) (_ []SwatchResult, retErr error) {
+	reported := make(map[string]struct{}, len(results))
+	for _, result := range results {
+		reported[result.Path] = struct{}{}
+	}
+
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return nil, fmt.Errorf("opening managed project root %q for protected root reporting: %w", dir, err)
+	}
+	defer func() {
+		if err := root.Close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("closing managed project root %q after protected root reporting: %w", dir, err))
+		}
+	}()
+
+	for _, entry := range fixedManagedRegistry() {
+		if entry.Policy != managedPolicyRoot {
+			continue
+		}
+		if _, exists := reported[entry.Path]; exists {
+			continue
+		}
+		snapshot, err := snapshotManagedDestination(root, managedSelection{Entry: entry})
+		if err != nil {
+			return nil, err
+		}
+		switch snapshot.Kind {
+		case managedDestinationMissing:
+			continue
+		case managedDestinationRegular, managedDestinationSymlink:
+			results = append(results, SwatchResult{Path: entry.Path, Category: Skipped, Reason: SkipManagedRootExists})
+		case managedDestinationDirectory:
+			return nil, fmt.Errorf("managed destination %q is a directory", entry.Path)
+		case managedDestinationSpecial:
+			return nil, fmt.Errorf("managed destination %q is not a regular file or symlink", entry.Path)
+		default:
+			return nil, fmt.Errorf("managed destination %q has an invalid snapshot kind", entry.Path)
+		}
+	}
+	return results, nil
+}
+
+func managedConfirmedResults(planned []SwatchResult, confirmed []managedApplyResult) ([]SwatchResult, error) {
+	byPath := make(map[string]SwatchResult, len(planned))
+	results := make([]SwatchResult, 0, len(planned))
+	for _, result := range planned {
+		if _, exists := byPath[result.Path]; exists {
+			return nil, fmt.Errorf("managed reporting contains duplicate destination %q", result.Path)
+		}
+		byPath[result.Path] = result
+		if result.Category == NoChange || result.Category == Skipped {
+			results = append(results, result)
+		}
+	}
+
+	seen := make(map[string]struct{}, len(confirmed))
+	for _, applied := range confirmed {
+		if _, exists := seen[applied.Path]; exists {
+			return nil, fmt.Errorf("managed confirmed results contain duplicate destination %q", applied.Path)
+		}
+		seen[applied.Path] = struct{}{}
+		result, ok := byPath[applied.Path]
+		if !ok {
+			return nil, fmt.Errorf("managed confirmed destination %q was not planned", applied.Path)
+		}
+		switch applied.Operation {
+		case managedOperationWrite:
+			if result.Category != WouldCopy && result.Category != WouldOverwrite {
+				return nil, fmt.Errorf("managed confirmed write for %q does not match its planned result", applied.Path)
+			}
+		case managedOperationRemove:
+			if result.Category != WouldRemove {
+				return nil, fmt.Errorf("managed confirmed removal for %q does not match its planned result", applied.Path)
+			}
+		default:
+			return nil, fmt.Errorf("managed confirmed destination %q has an invalid operation", applied.Path)
+		}
+		results = append(results, result)
+	}
+	return results, nil
+}
+
+func managedConflictResult(err error) (SwatchResult, bool) {
+	var ownershipErr *managedOwnershipError
+	if !errors.As(err, &ownershipErr) {
+		return SwatchResult{}, false
+	}
+	return SwatchResult{Path: ownershipErr.Path, Category: ManagedConflict, Reason: ManagedNotOwned}, true
+}
+
+func appendManagedReporting(report *Report, cfg *config.Config, results []SwatchResult) {
+	appendManagedReportingFromMCPRegistry(report, cfg, results, fixedManagedMCPRegistry())
+}
+
+func appendManagedReportingFromMCPRegistry(report *Report, cfg *config.Config, results []SwatchResult, mcpRegistry []managedMCPServerDefinition) {
+	var newNix []string
+	var guidance []string
+	for _, result := range results {
+		if result.Category == WouldCopy && (result.Path == "flake.nix" || strings.HasSuffix(result.Path, ".nix") || strings.HasPrefix(result.Path, "nix/patches/")) {
+			newNix = append(newNix, result.Path)
+		}
+		if result.Category != Skipped {
+			continue
+		}
+		switch result.Reason {
+		case SkipManagedRootExists:
+			switch result.Path {
+			case "justfile":
+				guidance = append(guidance, "If absent, add `import 'just/loader.just'` to the preserved `justfile`.")
+			case "flake.nix":
+				guidance = append(guidance, "If absent, add `++ import ./nix/loader.nix { inherit pkgs; }` to the existing package list in the preserved `flake.nix`.")
+				guidance = append(guidance, "Manually compose `shellHook = (import ./nix/hooks.nix { inherit pkgs; }) + \"\\n\" + existingHook;` in the preserved `flake.nix`, with your existing hook last. Pass the same `pkgs` and Go override to both loaders. Tailor does not overwrite existing roots.")
+			}
+		case SkipManagedSharedExists:
+			guidance = append(guidance, managedMCPAdoptionGuidance(cfg, result.Path, mcpRegistry)...)
+		}
+	}
+	if cfg.EbitengineEnabled() && slices.ContainsFunc(report.Document.Items, func(item output.Item) bool {
+		return item.Domain == "Files" && item.Name == ".envrc" && item.Outcome == output.Preserved && item.Reason == string(SkipFirstFitExists)
+	}) {
+		guidance = append(guidance, "Adopt watches for `nix/lib`, `nix/shells`, and their `*.nix` files in existing `.envrc` files. Review before normal direnv approval; Tailor never grants trust.")
+	}
+	if cfg.EbitengineAndroidEnabled() {
+		guidance = append(guidance, "Android SDK licence consent is scoped to the generated Android shell. Enter it only after review. No SDK installation or licence acceptance runs during alteration.")
+		guidance = append(guidance, "In project-owned Android recipes, replace the temporary ebitenmobile build and invocation with `tailor-ebitenmobile bind`, retaining all bind arguments, package paths, and output paths. Keep Gradle packaging project-owned and use `-Pandroid.aapt2FromMavenOverride=\"$ANDROID_BUILD_TOOLS/aapt2\"`. Tailor does not generate application identifiers, signing configuration, or deployment recipes. After separate SDK approval, verify binding and unsigned Gradle packaging; tool availability alone does not validate Android builds.")
+		if slices.ContainsFunc(results, func(result SwatchResult) bool {
+			return result.Path == "flake.nix" && result.Reason == SkipManagedRootExists
+		}) {
+			guidance = append(guidance, "Extend the per-system devShells attribute set, not its package list, with `// pkgs.lib.optionalAttrs (system == \"x86_64-linux\" && builtins.pathExists ./nix/shells/go-ebitengine-android.nix) { android = import ./nix/shells/go-ebitengine-android.nix { inherit pkgs; }; }`. Pass the same overridden `pkgs`. Do not overwrite an existing `android` output; compose or migrate it manually.")
+			guidance = append(guidance, "For an existing `android` output, first compare its SDK versions and overrides. After review, replace its shell body with `import ./nix/shells/go-ebitengine-android.nix { inherit pkgs; }` and retain required project settings through `.overrideAttrs (old: { shellHook = old.shellHook + \"\\n\" + projectHook; })`. Remove duplicate SDK, adb, Java, and shared hook declarations. Keep custom hooks last and retain host-driver precedence. Do not add another `android` attribute.")
+		}
+	}
+	if cfg.BlenderEnabled() && slices.ContainsFunc(results, func(result SwatchResult) bool {
+		return result.Path == "flake.nix" && result.Reason == SkipManagedRootExists
+	}) {
+		guidance = append(guidance, "In the preserved flake's per-system packages, manually add `blender-agent-bridge-extension = (import ./nix/lib/blender.nix { inherit pkgs; }).extension;` inside `pkgs.lib.optionalAttrs (builtins.pathExists ./nix/lib/blender.nix)`. Preserve existing outputs and use the same overridden `pkgs`. Build with `nix build .#blender-agent-bridge-extension`. Install the ZIP separately after approval; Tailor does not install Blender or start its bridge.")
+	}
+	if len(newNix) != 0 {
+		sort.Strings(newNix)
+		appendManagedNotice(report, "review and add new Nix files to Git because Nix flakes exclude untracked files: "+managedPathList(newNix))
+	}
+	playwrightRemovalReported := slices.ContainsFunc(results, func(result SwatchResult) bool {
+		return result.Path == "nix/playwright.nix" && (result.Category == NoChange || result.Category == WouldRemove)
+	})
+	if cfg.PlaywrightDeclared() && !cfg.PlaywrightEnabled() && playwrightRemovalReported {
+		appendManagedNotice(report, "mcp.playwright is false, so Tailor removes `nix/playwright.nix` but preserves MCP client settings. Disable or remove their Playwright servers to avoid a missing `playwright-mcp` executable")
+	}
+	blenderRemovalReported := slices.ContainsFunc(results, func(result SwatchResult) bool {
+		return result.Path == "nix/blender.nix" && (result.Category == NoChange || result.Category == WouldRemove)
+	})
+	if cfg.BlenderDeclared() && !cfg.BlenderEnabled() && blenderRemovalReported {
+		appendManagedNotice(report, "mcp.blender is false, so Tailor removes the owned Blender fragment, helper, and patch but preserves MCP client settings. Disable or remove their blender-agent-bridge servers to avoid a missing `blender-bridge` executable")
+	}
+	if len(guidance) != 0 {
+		appendGuidance(report, strings.Join(guidance, "\n")+"\n")
+	}
+}
+
+func managedMCPAdoptionGuidance(cfg *config.Config, destination string, registry []managedMCPServerDefinition) []string {
+	provider, supported := managedMCPProviderForDestination(destination)
+	if !supported {
+		return nil
+	}
+	definitions := enabledManagedMCPDefinitions(cfg, provider, registry)
+	guidance := make([]string, 0, len(definitions))
+	for _, definition := range definitions {
+		switch destination {
+		case ".mcp.json", ".pi/mcp.json":
+			guidance = append(guidance, "If absent, add Tailor's `mcpServers."+definition.Name+"` starter entry to the preserved `"+destination+"`.")
+		case ".codex/config.toml":
+			guidance = append(guidance, "If absent, add Tailor's `[mcp_servers."+managedMCPTOMLKey(definition.Name)+"]` starter table to the preserved `.codex/config.toml`.")
+		case "opencode.json":
+			guidance = append(guidance, "If absent, add Tailor's `mcp."+definition.Name+"` starter entry to the preserved `opencode.json`.")
+		}
+	}
+	return guidance
+}
+
+func appendManagedNotice(report *Report, text string) {
+	report.Plain += "warning: " + text + "\n"
+	report.Document.Notices = append(report.Document.Notices, output.Notice{Level: "warning", Text: text})
+}
+
+func managedPathList(paths []string) string {
+	quoted := make([]string, len(paths))
+	for i, path := range paths {
+		quoted[i] = "`" + path + "`"
+	}
+	return strings.Join(quoted, ", ")
+}

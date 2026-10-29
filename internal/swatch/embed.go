@@ -8,7 +8,11 @@ import (
 
 // Content returns the embedded bytes for the swatch identified by path.
 // The path is relative to swatches/, for example ".github/dependabot.yml".
+// The Pages destination renders the static workflow with source pages and branch main.
 func Content(path string) ([]byte, error) {
+	if path == PagesDestination {
+		return PagesContent("static", "pages", "main")
+	}
 	fsPath := "swatches/" + path
 	data, err := tailor.SwatchFS.ReadFile(fsPath)
 	if err != nil {

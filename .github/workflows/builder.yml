@@ -27,11 +27,9 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-      - name: Check cyclomatic complexity
-        run: |
-          go install github.com/fzipp/gocyclo/cmd/gocyclo@v0.6.0
-          gocyclo -over 30 -top 20 -avg -ignore '_test\.go$' .
       - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          args: --config .golangci.yml
 
   lint-actions:
     name: Lint Action ⚙️
@@ -56,7 +54,13 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+      - name: Install just
+        run: nix profile add --inputs-from . --no-write-lock-file nixpkgs#just
       - uses: robherley/go-test-action@2f859e0c8769d755d3174eecb9af8f64660827f3 # v1.1.0
+        env:
+          TAILOR_TEST_PLAYWRIGHT_NIX_BUILDS: "1"
         with:
           testArguments: -coverprofile=coverage.out -covermode=atomic ./...
           omit: untested
@@ -79,12 +83,83 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
+      - name: Install Nix
+        if: runner.os != 'macOS' || runner.arch != 'X64'
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+      - name: Install Nix on Intel macOS
+        if: runner.os == 'macOS' && runner.arch == 'X64'
+        shell: bash
+        run: |
+          installer="$RUNNER_TEMP/install-nix-2.35.2"
+          curl --fail --location --retry 5 \
+            --output "$installer" \
+            https://releases.nixos.org/nix/nix-2.35.2/install
+          echo "9adda97297d9e8ab360df95c729eabff4f4f93d6db091953c3a68f29e3fb130c  $installer" \
+            | shasum -a 256 --check
+          cat > "$RUNNER_TEMP/nix.conf" <<EOF
+          experimental-features = nix-command flakes
+          ssl-cert-file = /etc/ssl/cert.pem
+          trusted-users = root $USER
+          EOF
+          sh "$installer" --daemon --no-channel-add \
+            --nix-extra-conf-file "$RUNNER_TEMP/nix.conf"
+          echo "/nix/var/nix/profiles/default/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.nix-profile/bin" >> "$GITHUB_PATH"
+      - name: Install just
+        if: runner.os != 'macOS' || runner.arch != 'X64'
+        run: nix profile add --inputs-from . --no-write-lock-file nixpkgs#just
+      - name: Install just on Intel macOS
+        if: runner.os == 'macOS' && runner.arch == 'X64'
+        shell: bash
+        run: |
+          archive="$RUNNER_TEMP/just-1.58.0-x86_64-apple-darwin.tar.gz"
+          curl --fail --location --retry 5 \
+            --output "$archive" \
+            https://github.com/casey/just/releases/download/1.58.0/just-1.58.0-x86_64-apple-darwin.tar.gz
+          echo "9a09cfef66aaa79da58203970103a0684307716caaabd3e9844cacc4dc0f4023  $archive" \
+            | shasum -a 256 --check
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/bin" just
+          "$RUNNER_TEMP/bin/just" --version
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Fetch verified Blender test source
+        if: matrix.runner == 'ubuntu-24.04'
+        shell: bash
+        run: |
+          command -v patch
+          command -v python3
+          source=$(nix build --impure --no-link --print-out-paths --expr '
+            let
+              flake = builtins.getFlake (toString ./.);
+              pkgs = import flake.inputs.nixpkgs { system = "x86_64-linux"; };
+              blender = import ./swatches/nix/lib/blender.nix { inherit pkgs; };
+            in blender.bridge.src.src
+          ')
+          test -d "$source"
+          echo "TAILOR_BLENDER_TEST_SOURCE=$source" >> "$GITHUB_ENV"
       - name: Test
-        run: go test ./...
+        env:
+          TAILOR_TEST_PLAYWRIGHT_NIX_BUILDS: "1"
+        run: just test
       - name: Build tailor
         run: go build -o tailor ./cmd/tailor
       - name: Measure
         run: ./tailor measure
+      - name: Test container
+        if: runner.os == 'Linux'
+        run: |
+          context=$(mktemp -d)
+          arch=$(go env GOARCH)
+          mkdir -p "$context/linux/$arch" "$context/repository"
+          CGO_ENABLED=0 go build -o "$context/linux/$arch/tailor" ./cmd/tailor
+          docker build --platform "linux/$arch" -t tailor:container-test -f Dockerfile "$context"
+          test "$(docker image inspect --format '{{.Config.User}}' tailor:container-test)" = 65532
+          docker run --rm --entrypoint git tailor:container-test --version
+          git -C "$context/repository" init
+          git -C "$context/repository" remote add origin https://github.com/octocat/container-test.git
+          docker run --rm --network none --user "$(id -u):$(id -g)" \
+            -v "$context/repository:/work:ro" -w /work \
+            tailor:container-test docket | grep -Eq '^repository: +octocat/container-test$'
 
   security:
     name: Security 🔒
@@ -99,21 +174,43 @@ jobs:
         if: github.event_name == 'pull_request'
         with:
           fail-on-severity: moderate
-          allow-licenses: 0BSD, AFL-2.0, AFL-2.1, AFL-3.0, ANTLR-PD, ANTLR-PD-fallback, Apache-1.0, Apache-1.1, Apache-2.0, Artistic-2.0, BlueOak-1.0.0, BSD-1-Clause, BSD-2-Clause, BSD-2-Clause-FreeBSD, BSD-2-Clause-NetBSD, BSD-2-Clause-Patent, BSD-2-Clause-Views, BSD-3-Clause, BSD-3-Clause-Attribution, BSD-3-Clause-Clear, BSD-3-Clause-HP, BSD-3-Clause-LBNL, BSD-3-Clause-Modification, BSD-3-Clause-No-Nuclear-License-2014, BSD-3-Clause-No-Nuclear-Warranty, BSD-3-Clause-Open-MPI, BSD-3-Clause-Sun, BSD-4-Clause, BSD-4-Clause-Shortened, BSD-4-Clause-UC, BSD-Source-Code, BSL-1.0, bzip2-1.0.5, bzip2-1.0.6, CC0-1.0, CNRI-Python, CNRI-Python-GPL-Compatible, curl, ECL-2.0, FTL, HPND-Fenneberg-Livingston, HPND-sell-regexpr, HTMLTIDY, ICU, ImageMagick, Info-ZIP, Intel, Intel-ACPI, ISC, JasPer-2.0, Libpng, libpng-2.0, libtiff, LicenseRef-scancode-google-patent-license-golang, Linux-OpenIB, LZMA-SDK-9.22, MIT, MIT-0, MIT-advertising, MIT-CMU, MIT-Modern-Variant, MIT-open-group, MITNFA, MS-PL, MulanPSL-1.0, MulanPSL-2.0, Multics, NCSA, Net-SNMP, NetCDF, NIST-Software, NTP, OLDAP-2.7, OLDAP-2.8, OpenSSL, PostgreSQL, PSF-2.0, SGI-B-2.0, SHL-0.5, Spencer-99, SunPro, TCL, TCP-wrappers, UCAR, Unicode-DFS-2015, Unicode-DFS-2016, UnixCrypt, Unlicense, UPL-1.0, W3C, X11, XFree86-1.1, Xnet, Zlib, zlib-acknowledgement, ZPL-2.0, ZPL-2.1
-          allow-dependencies-licenses: pkg:githubactions/DeterminateSystems/nix-installer-action
+          license-check: false
           fail-on-scopes: runtime
           comment-summary-in-pr: on-failure
 
       - name: Run govulncheck
+        id: govulncheck
+        if: ${{ !cancelled() }}
         uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1.1.0
         with:
           go-version-file: go.mod
-          output-format: sarif
-          output-file: govulncheck.sarif
+          repo-checkout: false
+          output-format: json
+          output-file: govulncheck.json
+
+      - name: Check vulnerabilities
+        if: ${{ !cancelled() && steps.govulncheck.outcome == 'success' }}
+        run: govulncheck -mode convert -format text < govulncheck.json
+
+      - name: Generate SARIF
+        if: >-
+          !cancelled()
+          && steps.govulncheck.outcome == 'success'
+          && !github.event.repository.private
+          && github.actor != 'dependabot[bot]'
+          && (github.event_name != 'pull_request'
+              || github.event.pull_request.head.repo.full_name == github.repository)
+        run: govulncheck -mode convert -format sarif < govulncheck.json > govulncheck.sarif
 
       - name: Upload SARIF
-        uses: github/codeql-action/upload-sarif@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
-        if: always()
+        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        if: >-
+          always() && !cancelled()
+          && !github.event.repository.private
+          && github.actor != 'dependabot[bot]'
+          && (github.event_name != 'pull_request'
+              || github.event.pull_request.head.repo.full_name == github.repository)
+          && hashFiles('govulncheck.sarif') != ''
         with:
           sarif_file: govulncheck.sarif
           category: govulncheck
@@ -126,22 +223,14 @@ jobs:
     permissions: {}
     steps:
       - name: Check results
-        run: |
-          results='${{ toJSON(needs.*.result) }}'
-          echo "Job results: ${results}"
-          if echo "${results}" | jq -e 'any(. == "failure" or . == "cancelled")' > /dev/null 2>&1; then
-            echo "One or more jobs failed or were cancelled"
-            exit 1
-          fi
-          echo "All jobs passed"
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
 
   snapshot:
     name: Snapshot 📦
     needs: [sentinel]
     if: >-
-      always()
-      && needs.sentinel.result == 'success'
-      && github.repository_owner == 'wimpysworld'
+      github.repository_owner == 'wimpysworld'
       && github.event_name != 'schedule'
       && (github.ref == 'refs/heads/main' || github.event_name == 'pull_request')
     runs-on: ubuntu-latest
@@ -174,15 +263,12 @@ jobs:
     name: Release 📦
     needs: [sentinel]
     if: >-
-      always()
-      && needs.sentinel.result == 'success'
-      && github.repository_owner == 'wimpysworld'
+      github.repository_owner == 'wimpysworld'
       && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
       contents: write
       packages: write
-      pull-requests: write
       id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

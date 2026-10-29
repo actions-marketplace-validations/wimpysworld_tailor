@@ -51,7 +51,7 @@ func TestTestTransportRedirectsArbitraryHost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRequestWithContext: %v", err)
 	}
-	httpClient := &http.Client{Transport: &TestTransport{Server: server}}
+	httpClient := &http.Client{Transport: &testTransport{Server: server}}
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		t.Fatalf("Do: %v", err)
@@ -78,7 +78,7 @@ func TestTestTransportDoesNotMutateRequest(t *testing.T) {
 	}
 	req.Header.Set("Authorization", "token test-token")
 
-	transport := &TestTransport{Server: server}
+	transport := &testTransport{Server: server}
 	resp, err := transport.RoundTrip(req)
 	if err != nil {
 		t.Fatalf("RoundTrip: %v", err)
@@ -140,14 +140,12 @@ func TestWriteConfigCreatesFile(t *testing.T) {
 	}
 }
 
-func TestAssertPtrBool(t *testing.T) {
-	val := true
-	AssertPtr(t, &val, false, true, "bool_field")
-	AssertPtr(t, nil, true, false, "bool_field")
-}
-
-func TestAssertPtrString(t *testing.T) {
+func TestAssertPtrEqual(t *testing.T) {
 	val := "read"
-	AssertPtr(t, &val, false, "read", "string_field")
-	AssertPtr(t, nil, true, "", "string_field")
+	AssertPtrEqual(t, &val, &val, "string_field")
+	AssertPtrEqual(t, &val, new("read"), "string_field")
+	AssertPtrEqual[string](t, nil, nil, "string_field")
+	flag := true
+	AssertPtrEqual(t, &flag, new(true), "bool_field")
+	AssertPtrEqual[bool](t, nil, nil, "bool_field")
 }

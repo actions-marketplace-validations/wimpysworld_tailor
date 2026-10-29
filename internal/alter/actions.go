@@ -13,16 +13,25 @@ import (
 
 // actionsFieldGroup identifies the endpoint group an Actions policy field
 // belongs to: core fields write through the actions permissions endpoint,
-// selected fields through the selected-actions endpoint.
+// selected fields through selected-actions, and retention and fork approval
+// through their own endpoints.
 type actionsFieldGroup int
 
 const (
 	actionsCore actionsFieldGroup = iota
 	actionsSelected
+	actionsRetention
+	actionsForkApproval
 )
 
 // writeOperation returns the gh write operation kind for the group.
 func (g actionsFieldGroup) writeOperation() gh.OperationKind {
+	if g == actionsForkApproval {
+		return gh.OpSetForkPRContributorApproval
+	}
+	if g == actionsRetention {
+		return gh.OpSetActionsRetention
+	}
 	if g == actionsSelected {
 		return gh.OpSetSelectedActionsPermissions
 	}
@@ -41,6 +50,28 @@ type actionsFieldSpec struct {
 // actionsFieldTable is the single source of Actions field-to-group knowledge.
 // Entry order sets the comparison and skip output order.
 var actionsFieldTable = []actionsFieldSpec{
+	{
+		name:  "fork_pr_contributor_approval.approval_policy",
+		group: actionsForkApproval,
+		set: func(a *model.ActionsSettings) bool {
+			return a.ForkPRContributorApproval != nil && a.ForkPRContributorApproval.ApprovalPolicy != nil
+		},
+		compare: func(declared, live *model.ActionsSettings) (string, bool) {
+			policy := *declared.ForkPRContributorApproval.ApprovalPolicy
+			return policy, live.ForkPRContributorApproval != nil && live.ForkPRContributorApproval.ApprovalPolicy != nil && policy == *live.ForkPRContributorApproval.ApprovalPolicy
+		},
+	},
+	{
+		name:  "artifact_and_log_retention.days",
+		group: actionsRetention,
+		set: func(a *model.ActionsSettings) bool {
+			return a.ArtifactAndLogRetention != nil && a.ArtifactAndLogRetention.Days != nil
+		},
+		compare: func(declared, live *model.ActionsSettings) (string, bool) {
+			days := *declared.ArtifactAndLogRetention.Days
+			return fmt.Sprint(days), live.ArtifactAndLogRetention != nil && live.ArtifactAndLogRetention.Days != nil && days == *live.ArtifactAndLogRetention.Days
+		},
+	},
 	{
 		name:  "enabled",
 		group: actionsCore,
@@ -140,16 +171,70 @@ func ProcessActions(cfg *config.Config, mode ApplyMode, target RepoTarget) ([]Re
 	}
 
 	selected := actionsGroupSet(cfg.Actions, actionsSelected)
-	live, warnings, err := gh.ReadActionsPolicy(target.Client, target.Owner, target.Name, selected)
-	if err != nil {
-		return nil, err
+	live := &model.ActionsSettings{}
+	var warnings []error
+	if actionsGroupSet(cfg.Actions, actionsCore) || selected {
+		var err error
+		live, warnings, err = gh.ReadActionsPolicy(target.Client, target.Owner, target.Name, selected)
+		if err != nil {
+			return nil, err
+		}
+	}
+	var retention *gh.ActionsRetentionResponse
+	if actionsGroupSet(cfg.Actions, actionsRetention) {
+		var retentionWarnings []error
+		var err error
+		retention, retentionWarnings, err = gh.ReadActionsRetention(target.Client, target.Owner, target.Name)
+		if err != nil {
+			return nil, err
+		}
+		warnings = append(warnings, retentionWarnings...)
+		if retention != nil {
+			if err := retention.ValidateDays(*cfg.Actions.ArtifactAndLogRetention.Days); err != nil {
+				return nil, err
+			}
+			live.ArtifactAndLogRetention = &model.ArtifactAndLogRetentionSettings{Days: retention.Days}
+		}
+	}
+	var approval *gh.ForkPRContributorApprovalResponse
+	if actionsGroupSet(cfg.Actions, actionsForkApproval) {
+		var approvalWarnings []error
+		var err error
+		approval, approvalWarnings, err = gh.ReadForkPRContributorApproval(target.Client, target.Owner, target.Name)
+		if err != nil {
+			return nil, err
+		}
+		warnings = append(warnings, approvalWarnings...)
+		if approval != nil {
+			live.ForkPRContributorApproval = &model.ForkPRContributorApprovalSettings{ApprovalPolicy: approval.ApprovalPolicy}
+		}
 	}
 	results := compareActions(cfg.Actions, live)
 	results = suppressActionsReadWarnings(results, warnings, cfg.Actions, live)
 
-	coreChanged, selectedChanged := actionsChanges(results)
+	coreChanged, selectedChanged, retentionChanged, approvalChanged := actionsChanges(results)
 	if mode.ShouldWrite() && (coreChanged || selectedChanged) {
 		applied, err := gh.ApplyActionsPolicy(target.Client, target.Owner, target.Name, cfg.Actions, live, coreChanged, selectedChanged)
+		if err != nil {
+			return nil, err
+		}
+		for _, result := range skippedToResults(applied) {
+			result.Section = "actions"
+			results = append(results, result)
+		}
+	}
+	if mode.ShouldWrite() && retentionChanged {
+		applied, err := gh.ApplyActionsRetention(target.Client, target.Owner, target.Name, *cfg.Actions.ArtifactAndLogRetention.Days, retention)
+		if err != nil {
+			return nil, err
+		}
+		for _, result := range skippedToResults(applied) {
+			result.Section = "actions"
+			results = append(results, result)
+		}
+	}
+	if mode.ShouldWrite() && approvalChanged {
+		applied, err := gh.ApplyForkPRContributorApproval(target.Client, target.Owner, target.Name, *cfg.Actions.ForkPRContributorApproval.ApprovalPolicy, approval)
 		if err != nil {
 			return nil, err
 		}
@@ -162,7 +247,7 @@ func ProcessActions(cfg *config.Config, mode ApplyMode, target RepoTarget) ([]Re
 }
 
 func actionsConfigured(a *model.ActionsSettings) bool {
-	return actionsGroupSet(a, actionsCore) || actionsGroupSet(a, actionsSelected)
+	return actionsGroupSet(a, actionsCore) || actionsGroupSet(a, actionsSelected) || actionsGroupSet(a, actionsRetention) || actionsGroupSet(a, actionsForkApproval)
 }
 
 func compareActions(declared, live *model.ActionsSettings) []RepoSettingResult {
@@ -176,19 +261,75 @@ func compareActions(declared, live *model.ActionsSettings) []RepoSettingResult {
 		if equal {
 			category = RepoNoChange
 		}
-		results = append(results, RepoSettingResult{Section: "actions", Field: spec.name, Category: category, Value: display})
+		results = append(results, RepoSettingResult{Section: "actions", Field: spec.name, Category: category, Value: display, Before: actionsLiveValue(spec.name, live)})
 	}
 	return results
 }
 
+func actionsLiveValue(name string, live *model.ActionsSettings) string {
+	switch name {
+	case "fork_pr_contributor_approval.approval_policy":
+		if live.ForkPRContributorApproval != nil && live.ForkPRContributorApproval.ApprovalPolicy != nil {
+			return *live.ForkPRContributorApproval.ApprovalPolicy
+		}
+	case "artifact_and_log_retention.days":
+		if live.ArtifactAndLogRetention != nil && live.ArtifactAndLogRetention.Days != nil {
+			return fmt.Sprint(*live.ArtifactAndLogRetention.Days)
+		}
+	case "enabled":
+		if live.Enabled != nil {
+			return fmt.Sprint(*live.Enabled)
+		}
+	case "allowed_actions":
+		if live.AllowedActions != nil {
+			return *live.AllowedActions
+		}
+	case "sha_pinning_required":
+		if live.SHAPinningRequired != nil {
+			return fmt.Sprint(*live.SHAPinningRequired)
+		}
+	case "github_owned_allowed":
+		if live.GitHubOwnedAllowed != nil {
+			return fmt.Sprint(*live.GitHubOwnedAllowed)
+		}
+	case "verified_allowed":
+		if live.VerifiedAllowed != nil {
+			return fmt.Sprint(*live.VerifiedAllowed)
+		}
+	case "patterns_allowed":
+		if live.PatternsAllowed != nil {
+			patterns := slices.Clone(*live.PatternsAllowed)
+			slices.Sort(patterns)
+			if len(patterns) == 0 {
+				return "[]"
+			}
+			return strings.Join(patterns, ", ")
+		}
+	}
+	return ""
+}
+
 func suppressActionsReadWarnings(results []RepoSettingResult, warnings []error, declared, live *model.ActionsSettings) []RepoSettingResult {
 	for _, warning := range warnings {
+		var skipped *gh.ErrSetupSkipped
+		if errors.As(warning, &skipped) && skipped.Operation.Kind == gh.OpFetchForkPRContributorApproval {
+			for i, result := range results {
+				if group, ok := actionsFieldGroupFor(result.Field); ok && group == actionsForkApproval {
+					results[i] = skipResult(result, WouldSkipSetup, string(skipped.Reason))
+				}
+			}
+			continue
+		}
 		var scopeErr *gh.ErrInsufficientScope
 		if !errors.As(warning, &scopeErr) {
 			continue
 		}
 		fields := actionsFieldNames(actionsCore)
 		switch scopeErr.Operation.Kind {
+		case gh.OpFetchForkPRContributorApproval:
+			fields = actionsFieldNames(actionsForkApproval)
+		case gh.OpFetchActionsRetention:
+			fields = actionsFieldNames(actionsRetention)
 		case gh.OpFetchActionsPermissions:
 			fields = actionsFieldNames(actionsCore, actionsSelected)
 		case gh.OpFetchSelectedActionsPermissions:
@@ -200,14 +341,7 @@ func suppressActionsReadWarnings(results []RepoSettingResult, warnings []error, 
 			}
 		}
 		for _, field := range fields {
-			index := slices.IndexFunc(results, func(result RepoSettingResult) bool {
-				return result.Field == field
-			})
-			if index == -1 {
-				continue
-			}
-			results = slices.Delete(results, index, index+1)
-			results = append(results, RepoSettingResult{Section: "actions", Field: field, Category: WouldSkipScope, Annotation: skipAnnotation})
+			results = replaceWithScopeSkip(results, "actions", field)
 		}
 	}
 	return results
@@ -228,7 +362,7 @@ func actionsCoreBroadening(result RepoSettingResult, declared, live *model.Actio
 	}
 }
 
-func actionsChanges(results []RepoSettingResult) (core, selected bool) {
+func actionsChanges(results []RepoSettingResult) (core, selected, retention, approval bool) {
 	for _, result := range results {
 		if result.Category != WouldSet {
 			continue
@@ -242,7 +376,11 @@ func actionsChanges(results []RepoSettingResult) (core, selected bool) {
 			core = true
 		case actionsSelected:
 			selected = true
+		case actionsRetention:
+			retention = true
+		case actionsForkApproval:
+			approval = true
 		}
 	}
-	return core, selected
+	return core, selected, retention, approval
 }

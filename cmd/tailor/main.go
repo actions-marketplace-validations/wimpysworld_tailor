@@ -15,7 +15,9 @@ import (
 	"github.com/wimpysworld/tailor/internal/gh"
 	"github.com/wimpysworld/tailor/internal/measure"
 	"github.com/wimpysworld/tailor/internal/model"
+	"github.com/wimpysworld/tailor/internal/output"
 	"github.com/wimpysworld/tailor/internal/swatch"
+	"github.com/wimpysworld/tailor/internal/termtext"
 )
 
 // version is set at release time by GoReleaser via -X main.version.
@@ -23,28 +25,52 @@ var version = "dev"
 
 // CLI is the root command structure parsed by Kong.
 type CLI struct {
-	Version kong.VersionFlag `help:"Show version."`
-	Fit     FitCmd           `cmd:"" help:"Create a new project with default configuration."`
-	Alter   AlterCmd         `cmd:"" help:"Apply swatch templates to the current project."`
-	Baste   BasteCmd         `cmd:"" help:"Preview what alter would do without making any changes."`
-	Measure MeasureCmd       `cmd:"" help:"Assess project health files and configuration alignment."`
-	Docket  DocketCmd        `cmd:"" help:"Display GitHub authentication state and repository context."`
+	Version    kong.VersionFlag `help:"Show version."`
+	Format     output.Format    `help:"Output format." default:"auto" enum:"auto,plain"`
+	Color      output.Color     `help:"Colour policy." default:"auto" enum:"auto,always,never"`
+	Verbose    bool             `help:"Show every result and stage."`
+	Quiet      bool             `help:"Print only the final summary."`
+	NoProgress bool             `help:"Disable live progress."`
+	Fit        FitCmd           `cmd:"" help:"Create a new project with default configuration."`
+	Alter      AlterCmd         `cmd:"" help:"Apply swatch templates to the current project."`
+	Baste      BasteCmd         `cmd:"" help:"Preview what alter would do without making any changes."`
+	Measure    MeasureCmd       `cmd:"" help:"Assess project health files and configuration alignment."`
+	Docket     DocketCmd        `cmd:"" help:"Display GitHub authentication state and repository context."`
 }
 
-// FitCmd creates a new project directory with a default .tailor.yml.
+// FitCmd writes a default .tailor.yml in a new or existing project directory.
 type FitCmd struct {
-	Path        string `arg:"" help:"Project directory to create."`
-	License     string `help:"Licence identifier." default:"BlueOak-1.0.0"`
-	Description string `help:"Repository description."`
+	Path        string  `arg:"" help:"Project directory to create."`
+	License     string  `help:"Licence identifier." default:"BlueOak-1.0.0"`
+	Description *string `help:"Repository description."`
 
+	stdout io.Writer
 	stderr io.Writer
+	output *output.Policy
 }
 
 // Run executes the fit command.
-func (f *FitCmd) Run() error {
-	// Resolve the repository context before the auth check so the check
-	// verifies a token for the host that will be written to. The path may
-	// not exist yet; a fresh directory has no repository context.
+func (f *FitCmd) Run() (runErr error) {
+	policy := f.output
+	if policy == nil {
+		policy = output.New(f.stdout, f.stderr, output.Auto)
+	}
+	progress := policy.StartProgress()
+	defer progress.Stop()
+	stageID, stageLabel := "repository", "Finding repository"
+	observe := func(event output.StageEvent) {
+		stageID, stageLabel = event.ID, event.Label
+		progress.Observe(event)
+	}
+	defer func() {
+		if runErr != nil {
+			progress.Observe(output.StageEvent{ID: stageID, Label: stageLabel, Phase: "error", Err: runErr})
+		}
+	}()
+	f.stderr = progress.WarningWriter(policy.Stderr())
+	observe(output.StageEvent{ID: stageID, Label: stageLabel, Phase: "start"})
+	// Resolve repository context first to verify a token for the metadata host.
+	// A path that does not exist has no repository context.
 	var repo gh.Repo
 	var ok bool
 	if info, statErr := os.Stat(f.Path); statErr == nil && info.IsDir() {
@@ -55,12 +81,15 @@ func (f *FitCmd) Run() error {
 		}
 	}
 
+	observe(output.StageEvent{ID: "repository", Label: "Repository found", Phase: "complete"})
 	// Verify the token against the API before creating the project
 	// directory, so an invalid token cannot leave a partial fit behind.
+	observe(output.StageEvent{ID: "auth", Label: "Verifying GitHub authentication", Phase: "start"})
 	client, _, err := gh.VerifyAuth(repo.Host)
 	if err != nil {
 		return err
 	}
+	observe(output.StageEvent{ID: "auth", Label: "GitHub authentication verified", Phase: "complete"})
 
 	if err := os.MkdirAll(f.Path, 0o755); err != nil {
 		return err
@@ -80,36 +109,35 @@ func (f *FitCmd) Run() error {
 	}
 
 	if ok {
-		live, warnings, err := gh.ReadRepoSettings(client, repo.Owner, repo.Name)
+		live, err := gh.ReadRepoMetadata(client, repo.Owner, repo.Name)
 		if err != nil {
 			return err
 		}
-		stderr := f.stderr
-		if stderr == nil {
-			stderr = os.Stderr
-		}
-		for _, w := range warnings {
-			fmt.Fprintf(stderr, "warning: %v\n", w)
-		}
-		config.MergeRepoSettings(cfg, live, f.Description)
-		homepage := fmt.Sprintf("https://%s/%s/%s", repo.Host, repo.Owner, repo.Name)
-		config.ApplyRepoDefaults(cfg, repo.Name, homepage)
+		config.MergeRepoMetadata(cfg, live, f.Description)
 	} else {
-		if f.Description != "" {
+		if f.Description != nil {
 			if cfg.Repository == nil {
 				cfg.Repository = &model.RepositorySettings{}
 			}
-			cfg.Repository.Description = &f.Description
+			cfg.Repository.Description = f.Description
 		}
 		config.ApplyRepoDefaults(cfg, projectName(f.Path), "")
 	}
 
 	today := time.Now().Format("2006-01-02")
+	observe(output.StageEvent{ID: "write", Label: "Creating configuration", Phase: "start"})
 	if err := config.Write(f.Path, cfg, today, "Initially fitted"); err != nil {
 		return err
 	}
 
-	fmt.Printf("Fitted %s with .tailor.yml\n", f.Path)
+	observe(output.StageEvent{ID: "write", Label: "Configuration created", Phase: "complete"})
+	progress.Stop()
+	renderedPath := f.Path
+	if policy.Rich() {
+		renderedPath = termtext.EscapeControlText(renderedPath)
+	}
+	doc := output.Document{Command: "fit", Context: renderedPath, Items: []output.Item{{Domain: "Configuration", Outcome: output.Created, Action: "create", Name: ".tailor.yml", Provenance: renderedPath}}, Guidance: []output.Guidance{{Order: 1, Text: "Change into the project directory, then run `tailor alter`."}}}
+	policy.Print(doc, fmt.Sprintf("Fitted %s with .tailor.yml\n", f.Path))
 	return nil
 }
 
@@ -121,50 +149,70 @@ func projectName(path string) string {
 	return filepath.Base(path)
 }
 
-// AlterCmd applies swatch templates to the current project.
+// AlterCmd applies configured swatches and GitHub settings to the current project.
 type AlterCmd struct {
-	Recut  bool `help:"Overwrite existing first-fit swatches and merge missing .tailor.yml defaults (never swatches and the licence stay untouched)." name:"recut"`
-	run    func(alter.ApplyMode) error
-	stdout io.Writer
-	stderr io.Writer
+	Recut     bool     `help:"Overwrite existing first-fit swatches and merge missing .tailor.yml defaults (never swatches and the licence stay untouched)." name:"recut"`
+	LocalOnly bool     `help:"Refresh only explicitly selected existing owned files without authentication or network access."`
+	Path      []string `help:"Existing owned destination to refresh (repeatable; requires --local-only)."`
+	Directory string   `help:"Project directory (requires --local-only)."`
+	stdout    io.Writer
+	stderr    io.Writer
+	output    *output.Policy
 }
 
 // Run executes the alter command.
 func (a *AlterCmd) Run() error {
+	if a.LocalOnly {
+		if a.Recut {
+			return fmt.Errorf("local-only alteration does not support --recut")
+		}
+		return a.runLocal()
+	}
+	if len(a.Path) != 0 || a.Directory != "" {
+		return fmt.Errorf("--path and --directory require --local-only")
+	}
 	mode := alter.Apply
 	if a.Recut {
 		mode = alter.Recut
 	}
-	if a.run != nil {
-		return a.run(mode)
-	}
-	return runAlter(mode, a.stdout, a.stderr)
+	return runAlterWithPolicy(mode, a.output, a.stdout, a.stderr)
 }
 
 // BasteCmd previews what alter would do without making any changes.
 type BasteCmd struct {
-	run    func(alter.ApplyMode) error
 	stdout io.Writer
 	stderr io.Writer
+	output *output.Policy
 }
 
 // Run executes the baste command.
 func (b *BasteCmd) Run() error {
-	if b.run != nil {
-		return b.run(alter.DryRun)
-	}
-	return runAlter(alter.DryRun, b.stdout, b.stderr)
+	return runAlterWithPolicy(alter.DryRun, b.output, b.stdout, b.stderr)
 }
 
-// runAlter performs auth check, resolves the working directory, loads the
-// tailor config, and runs alter with the given mode.
+// runAlter uses plain output for callers without a command output policy.
 func runAlter(mode alter.ApplyMode, stdout, stderr io.Writer) error {
-	if stdout == nil {
-		stdout = os.Stdout
+	return runAlterWithPolicy(mode, output.New(stdout, stderr, output.Plain), stdout, stderr)
+}
+
+func runAlterWithPolicy(mode alter.ApplyMode, policy *output.Policy, stdout, stderr io.Writer) (runErr error) {
+	if policy == nil {
+		policy = output.New(stdout, stderr, output.Auto)
 	}
-	if stderr == nil {
-		stderr = os.Stderr
+	stderr = policy.Stderr()
+	progress := policy.StartProgress()
+	defer progress.Stop()
+	stageID, stageLabel, stagePhase := "preflight", "Preparing command", "start"
+	observe := func(event output.StageEvent) {
+		stageID, stageLabel, stagePhase = event.ID, event.Label, event.Phase
+		progress.Observe(event)
 	}
+	defer func() {
+		if runErr != nil && stagePhase != "error" {
+			progress.Observe(output.StageEvent{ID: stageID, Label: stageLabel, Phase: "error", Err: runErr})
+		}
+	}()
+	observe(output.StageEvent{ID: stageID, Label: stageLabel, Phase: "start"})
 
 	dir, err := os.Getwd()
 	if err != nil {
@@ -186,15 +234,36 @@ func runAlter(mode alter.ApplyMode, stdout, stderr io.Writer) error {
 		return fmt.Errorf(".tailor.yml is missing or malformed: %w. Run 'tailor fit <path>' to create a valid configuration, or edit .tailor.yml directly to correct it", err)
 	}
 
-	return alter.Run(cfg, dir, mode, nil, stdout, stderr)
+	observe(output.StageEvent{ID: "preflight", Label: "Command prepared", Phase: "complete"})
+	stderr = progress.WarningWriter(stderr)
+	report, err := alter.Execute(cfg, dir, mode, nil, stderr, alter.Options{Observer: observe})
+	progress.Stop()
+	policy.Print(report.Document, report.Plain)
+	return err
 }
 
 // MeasureCmd checks community health files and, when a config is present,
 // compares it against the built-in default swatch set.
-type MeasureCmd struct{}
+type MeasureCmd struct {
+	stdout io.Writer
+	stderr io.Writer
+	output *output.Policy
+}
 
 // Run executes the measure command.
-func (m *MeasureCmd) Run() error {
+func (m *MeasureCmd) Run() (runErr error) {
+	policy := m.output
+	if policy == nil {
+		policy = output.New(m.stdout, m.stderr, output.Auto)
+	}
+	progress := policy.StartProgress()
+	defer progress.Stop()
+	defer func() {
+		if runErr != nil {
+			progress.Observe(output.StageEvent{ID: "measure", Label: "Measuring local files", Phase: "error", Err: runErr})
+		}
+	}()
+	progress.Observe(output.StageEvent{ID: "measure", Label: "Measuring local files", Phase: "start"})
 	dir, err := os.Getwd()
 	if err != nil {
 		return fmt.Errorf("getting working directory: %w", err)
@@ -213,24 +282,118 @@ func (m *MeasureCmd) Run() error {
 			return fmt.Errorf("loading config: %w", err)
 		}
 		diff = measure.CheckConfigDiff(cfg, swatch.All())
+		if cfg.PythonEnabled() {
+			for _, name := range []string{"ruff.toml", "pyrightconfig.json"} {
+				skipped := false
+				for _, entry := range cfg.Swatches {
+					if entry.Path == name && entry.Alteration == swatch.Never {
+						skipped = true
+					}
+				}
+				if skipped {
+					continue
+				}
+				pythonPolicy, err := alter.InspectPythonPolicy(dir, name)
+				if err != nil {
+					health = append(health, measure.HealthResult{Path: name, Status: measure.Warning, Detail: err.Error()})
+					continue
+				}
+				if pythonPolicy.Reason != "" {
+					filtered := diff[:0]
+					for _, finding := range diff {
+						if finding.Path != name || finding.Category != measure.NotConfigured {
+							filtered = append(filtered, finding)
+						}
+					}
+					diff = filtered
+				}
+				status := measure.Present
+				if pythonPolicy.AdoptionRequired {
+					status = measure.Warning
+				}
+				info, err := os.Lstat(filepath.Join(dir, name))
+				switch {
+				case os.IsNotExist(err):
+					if pythonPolicy.Reason == "" {
+						status = measure.Missing
+					}
+				case err != nil:
+					status = measure.Warning
+					pythonPolicy.Reason = fmt.Sprintf("cannot inspect Python policy %q: %v; check file permissions", name, err)
+				case !info.Mode().IsRegular():
+					status = measure.Warning
+					pythonPolicy.Reason = fmt.Sprintf("unsafe Python policy %q; replace it with a regular file, not a directory or symlink", name)
+				}
+				health = append(health, measure.HealthResult{Path: name, Status: status, Detail: pythonPolicy.Reason})
+			}
+		}
 	}
 
-	fmt.Print(measure.FormatOutput(health, diff, hasConfig))
+	progress.Observe(output.StageEvent{ID: "measure", Label: "Local files measured", Phase: "complete"})
+	progress.Stop()
+	doc := measureDocument(filepath.Base(dir), health, diff, hasConfig)
+	policy.Print(doc, measure.FormatOutput(health, diff, hasConfig))
 	return nil
+}
+
+func measureDocument(context string, health []measure.HealthResult, diff []measure.DiffResult, hasConfig bool) output.Document {
+	doc := output.Document{Command: "measure", Context: context}
+	for _, result := range health {
+		outcome := output.Unchanged
+		if result.Status != measure.Present {
+			outcome = output.Attention
+		}
+		doc.Items = append(doc.Items, output.Item{Domain: "Files", Category: "Community health", Outcome: outcome, Action: string(result.Status), Name: result.Path, Reason: result.Detail, Provenance: result.Path})
+	}
+	for _, result := range diff {
+		doc.Items = append(doc.Items, output.Item{Domain: "Configuration", Category: "Swatches", Outcome: output.Attention, Action: string(result.Category), Name: result.Path, Reason: result.Detail, Provenance: result.Path})
+	}
+	if !hasConfig {
+		doc.Notices = append(doc.Notices, output.Notice{Level: "notice", Text: "No .tailor.yml found."})
+		doc.Guidance = append(doc.Guidance, output.Guidance{Order: 1, Text: "Run `tailor fit <path>` to initialise."})
+	}
+	doc.Summary = output.Count(doc.Items)
+	return doc
 }
 
 // DocketCmd displays GitHub authentication state and repository context.
 type DocketCmd struct {
 	client *api.RESTClient
+	stdout io.Writer
+	stderr io.Writer
+	output *output.Policy
 }
 
 // Run executes the docket command.
-func (d *DocketCmd) Run() error {
+func (d *DocketCmd) Run() (runErr error) {
+	policy := d.output
+	if policy == nil {
+		policy = output.New(d.stdout, d.stderr, output.Auto)
+	}
+	progress := policy.StartProgress()
+	defer progress.Stop()
+	defer func() {
+		if runErr != nil {
+			progress.Observe(output.StageEvent{ID: "identity", Label: "Verifying GitHub identity", Phase: "error", Err: runErr})
+		}
+	}()
+	progress.Observe(output.StageEvent{ID: "identity", Label: "Verifying GitHub identity", Phase: "start"})
 	result, err := docket.Run(d.client)
 	if err != nil {
 		return err
 	}
-	fmt.Print(docket.FormatOutput(result))
+	progress.Observe(output.StageEvent{ID: "identity", Label: "GitHub identity checked", Phase: "complete"})
+	progress.Stop()
+	context := result.Repository
+	if context == "(none)" {
+		context = ""
+	}
+	doc := output.Document{Command: "docket", Context: context, Items: []output.Item{
+		{Domain: "Identity", Outcome: output.Unchanged, Name: "User", After: result.User},
+		{Domain: "Identity", Outcome: output.Unchanged, Name: "Repository", After: result.Repository},
+		{Domain: "Identity", Outcome: output.Unchanged, Name: "Authentication", After: result.Auth},
+	}}
+	policy.Print(doc, docket.FormatOutput(result))
 	return nil
 }
 
@@ -267,14 +430,25 @@ func run(args []string, stdout, stderr io.Writer) (code int) {
 		panic(err)
 	}
 
-	cli.Fit.stderr = stderr
-	cli.Alter.stdout = stdout
-	cli.Alter.stderr = stderr
-	cli.Baste.stdout = stdout
-	cli.Baste.stderr = stderr
-
 	ctx, err := parser.Parse(args)
 	parser.FatalIfErrorf(err)
+
+	policy := output.New(stdout, stderr, cli.Format, output.WithColor(cli.Color), output.WithVerbose(cli.Verbose), output.WithQuiet(cli.Quiet), output.WithNoProgress(cli.NoProgress))
+	cli.Fit.stdout = stdout
+	cli.Fit.stderr = stderr
+	cli.Fit.output = policy
+	cli.Alter.stdout = stdout
+	cli.Alter.stderr = stderr
+	cli.Alter.output = policy
+	cli.Baste.stdout = stdout
+	cli.Baste.stderr = stderr
+	cli.Baste.output = policy
+	cli.Measure.stdout = stdout
+	cli.Measure.stderr = stderr
+	cli.Measure.output = policy
+	cli.Docket.stdout = stdout
+	cli.Docket.stderr = stderr
+	cli.Docket.output = policy
 
 	err = ctx.Run()
 	ctx.FatalIfErrorf(err)

@@ -2,19 +2,16 @@ package config
 
 import (
 	"fmt"
-	"io/fs"
+	"slices"
 
-	"github.com/wimpysworld/tailor"
 	"github.com/wimpysworld/tailor/internal/model"
+	"github.com/wimpysworld/tailor/internal/swatch"
 )
 
-const embeddedConfigPath = "swatches/.tailor.yml"
-
-// DefaultConfig returns the embedded default configuration with the given
-// license. It parses swatches/.tailor.yml from the embedded filesystem,
-// validates its contents, and overrides the license field.
+// DefaultConfig validates the embedded configuration and applies the requested licence.
+// It clears project metadata and omits language swatches that are not enabled.
 func DefaultConfig(license string) (*Config, error) {
-	data, err := fs.ReadFile(tailor.SwatchFS, embeddedConfigPath)
+	data, err := swatch.Content(".tailor.yml")
 	if err != nil {
 		return nil, fmt.Errorf("reading embedded config: %w", err)
 	}
@@ -29,20 +26,22 @@ func DefaultConfig(license string) (*Config, error) {
 		return nil, fmt.Errorf("license must not be empty")
 	}
 
-	// Nil out the project-specific description and homepage defaults.
-	// MergeRepoSettings replaces them with live GitHub values when available.
+	// The description and homepage must not come from the embedded defaults.
+	// MergeRepoMetadata replaces them with live GitHub values when available.
 	if cfg.Repository != nil {
 		cfg.Repository.Description = nil
 		cfg.Repository.Homepage = nil
 	}
+	cfg.InferredHomepage = ""
+	cfg.Swatches = slices.DeleteFunc(cfg.Swatches, func(entry SwatchEntry) bool {
+		return !cfg.SwatchActive(entry.Path)
+	})
 
 	return cfg, nil
 }
 
-// ApplyRepoDefaults fills an absent description and homepage so the generated
-// config always carries both keys. The description falls back to name and the
-// homepage to url. An empty url leaves the homepage omitted, which covers a
-// project without repository context.
+// ApplyRepoDefaults fills an absent description from name and an absent homepage from url.
+// Empty fallback values leave the corresponding fields omitted.
 func ApplyRepoDefaults(cfg *Config, name, url string) {
 	if cfg.Repository == nil {
 		cfg.Repository = &model.RepositorySettings{}
@@ -52,24 +51,26 @@ func ApplyRepoDefaults(cfg *Config, name, url string) {
 	}
 	if cfg.Repository.Homepage == nil && url != "" {
 		cfg.Repository.Homepage = &url
+		cfg.InferredHomepage = url
 	}
 }
 
-// MergeRepoSettings assigns live to cfg.Repository and mutates live in place.
-// The description flag, when non-empty, overrides whatever the live settings
-// carried. Empty string pointer fields for Description and Homepage are
-// normalised to nil so they are omitted from YAML.
-func MergeRepoSettings(cfg *Config, live *model.RepositorySettings, description string) {
-	cfg.Repository = live
-
-	if description != "" {
-		cfg.Repository.Description = &description
+// MergeRepoMetadata imports project metadata without changing managed defaults.
+// An explicit homepage declaration takes precedence over the imported value.
+func MergeRepoMetadata(cfg *Config, live *model.RepositorySettings, description *string) {
+	if cfg.Repository == nil {
+		cfg.Repository = &model.RepositorySettings{}
 	}
-
-	if cfg.Repository.Description != nil && *cfg.Repository.Description == "" {
-		cfg.Repository.Description = nil
+	declaredHomepage := cfg.HomepageDeclared()
+	cfg.Repository.Description = live.Description
+	if description != nil {
+		cfg.Repository.Description = description
 	}
-	if cfg.Repository.Homepage != nil && *cfg.Repository.Homepage == "" {
-		cfg.Repository.Homepage = nil
+	if !declaredHomepage {
+		cfg.Repository.Homepage = live.Homepage
+		cfg.InferredHomepage = ""
+		if live.Homepage != nil {
+			cfg.InferredHomepage = *live.Homepage
+		}
 	}
 }

@@ -71,6 +71,9 @@ func TestRepositorySettingFieldsMetadata(t *testing.T) {
 		"topics",
 		"default_workflow_permissions",
 		"can_approve_pull_request_reviews",
+		"secret_scanning",
+		"secret_scanning_push_protection",
+		"secret_scanning_non_provider_patterns",
 	}
 
 	if len(fields) != len(wantKeys) {
@@ -99,6 +102,8 @@ func TestActionsSettingFieldsMetadata(t *testing.T) {
 		"github_owned_allowed",
 		"verified_allowed",
 		"patterns_allowed",
+		"artifact_and_log_retention",
+		"fork_pr_contributor_approval",
 	}
 
 	if len(fields) != len(wantKeys) {
@@ -150,5 +155,39 @@ func TestRepositorySettingFieldsValues(t *testing.T) {
 
 	if seen["homepage"].Set {
 		t.Error("homepage Set = true, want false")
+	}
+}
+
+func TestRulesetNames(t *testing.T) {
+	tests := []struct {
+		name string
+		got  []string
+		want []string
+	}{
+		{name: "settings", got: RulesetSettingNames, want: []string{"bypass_actors", "conditions", "enforcement", "rules"}},
+		{name: "bypass actor", got: RulesetBypassActorNames, want: []string{"actor_id", "actor_type", "bypass_mode"}},
+		{name: "conditions", got: RulesetConditionsNames, want: []string{"ref_name"}},
+		{name: "ref_name", got: RulesetRefNameNames, want: []string{"exclude", "include"}},
+		{name: "rules", got: RulesetRulesNames, want: []string{"code_scanning", "creation", "deletion", "non_fast_forward", "pull_request", "required_linear_history", "required_signatures", "required_status_checks", "update"}},
+		{name: "rule", got: RulesetRuleNames, want: []string{"enabled", "parameters"}},
+		{name: "pull request parameters", got: RulesetPullRequestParameterNames, want: []string{"allowed_merge_methods", "dismiss_stale_reviews_on_push", "require_code_owner_review", "require_extra_approval_for_unattributed_changes", "require_last_push_approval", "required_approving_review_count", "required_review_thread_resolution"}},
+		{name: "status checks parameters", got: RulesetStatusChecksParameterNames, want: []string{"do_not_enforce_on_create", "required_status_checks", "strict_required_status_checks_policy"}},
+		{name: "status check", got: RulesetStatusCheckNames, want: []string{"context", "integration_id"}},
+		{name: "code scanning parameters", got: RulesetCodeScanningParameterNames, want: []string{"code_scanning_tools"}},
+		{name: "code scanning tool", got: RulesetCodeScanningToolNames, want: []string{"alerts_threshold", "security_alerts_threshold", "tool"}},
+		{name: "alerts thresholds", got: RulesetAlertsThresholds, want: []string{"none", "errors", "errors_and_warnings", "all"}},
+		{name: "security alerts thresholds", got: RulesetSecurityAlertsThresholds, want: []string{"none", "critical", "high_or_higher", "medium_or_higher", "all"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if len(tt.got) != len(tt.want) {
+				t.Fatalf("names = %v, want %v", tt.got, tt.want)
+			}
+			for i := range tt.want {
+				if tt.got[i] != tt.want[i] {
+					t.Errorf("names[%d] = %q, want %q", i, tt.got[i], tt.want[i])
+				}
+			}
+		})
 	}
 }

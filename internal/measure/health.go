@@ -1,13 +1,11 @@
+// Package measure inspects local project health and compares configuration with built-in swatches without network access.
 package measure
 
 import (
-	"cmp"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	"regexp"
-	"slices"
 	"strings"
 
 	"github.com/wimpysworld/tailor/internal/swatch"
@@ -31,20 +29,17 @@ type HealthResult struct {
 	Detail string
 }
 
-var (
-	placeholderWhitespaceRe = regexp.MustCompile(`[ \t\n\v\f\r]+`)
-	placeholderNames        = map[string]struct{}{
-		"year":                     {},
-		"yyyy":                     {},
-		"fullname":                 {},
-		"name of copyright owner":  {},
-		"name of copyright holder": {},
-		"software name":            {},
-		"project":                  {},
-		"projecturl":               {},
-		"email":                    {},
-	}
-)
+var placeholderNames = map[string]struct{}{
+	"year":                     {},
+	"yyyy":                     {},
+	"fullname":                 {},
+	"name of copyright owner":  {},
+	"name of copyright holder": {},
+	"software name":            {},
+	"project":                  {},
+	"projecturl":               {},
+	"email":                    {},
+}
 
 // completeInlineLinks returns, for each '(' in data, whether it starts a
 // balanced Markdown inline-link destination. Backslashes escape the
@@ -71,7 +66,7 @@ func completeInlineLinks(data []byte) []bool {
 // hasUnresolvedPlaceholders reports whether data contains a known unresolved
 // token inside matching square or curly delimiters. A single forward pass
 // pairs each closing delimiter with the nearest unconsumed opener of its
-// kind; an earlier opener cannot match because its content contains another
+// kind. An earlier opener cannot match because its content contains another
 // opening delimiter, which no placeholder name allows.
 func hasUnresolvedPlaceholders(data []byte) bool {
 	inlineLinks := completeInlineLinks(data)
@@ -94,8 +89,7 @@ func hasUnresolvedPlaceholders(data []byte) bool {
 				continue
 			}
 
-			name := placeholderWhitespaceRe.ReplaceAllString(string(data[start+1:end]), " ")
-			name = strings.ToLower(strings.Trim(name, " "))
+			name := strings.ToLower(strings.Join(strings.Fields(string(data[start+1:end])), " "))
 			if _, ok := placeholderNames[name]; ok {
 				return true
 			}
@@ -161,7 +155,7 @@ func isRegularFile(root *os.Root, path string) bool {
 }
 
 // CheckHealth checks whether each health swatch path, the LICENSE file, and
-// README.md exist in dir as regular files; symlinks, paths whose parents
+// README.md exist in dir as regular files. Symlinks, paths whose parents
 // resolve outside dir, and other non-regular files count as absent. LICENSE
 // files containing unresolved placeholder tokens are reported as warnings
 // rather than present, as are LICENSE files that exist but could not be
@@ -193,8 +187,7 @@ func CheckHealth(dir string) []HealthResult {
 		if p == swatch.LicenseDestination {
 			data, err := readLicence(root, p)
 			if err != nil {
-				// The licence exists but was not inspected, so present
-				// would overstate what the check verified. Warn instead.
+				// Warn because present implies that the licence passed inspection.
 				detail := "(not inspected: read failed)"
 				if errors.Is(err, errLicenceTooLarge) {
 					detail = "(not inspected: exceeds 1 MiB)"
@@ -227,12 +220,6 @@ func CheckHealth(dir string) []HealthResult {
 		})
 	}
 
-	sortByPath := func(a, b HealthResult) int {
-		return cmp.Compare(a.Path, b.Path)
-	}
-	slices.SortFunc(missing, sortByPath)
-	slices.SortFunc(warning, sortByPath)
-	slices.SortFunc(present, sortByPath)
-
-	return slices.Concat(missing, warning, present)
+	return concatSortedByPath(func(r HealthResult) string { return r.Path },
+		missing, warning, present)
 }

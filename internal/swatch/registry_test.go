@@ -1,16 +1,30 @@
 package swatch_test
 
 import (
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/wimpysworld/tailor/internal/swatch"
 	"gopkg.in/yaml.v3"
 )
 
-func TestAllReturns16Swatches(t *testing.T) {
+func TestPagesStarterPathsMatchRegistry(t *testing.T) {
+	var paths []string
+	for _, entry := range swatch.All() {
+		if strings.HasPrefix(entry.Path, "pages/") {
+			paths = append(paths, entry.Path)
+		}
+	}
+	if !slices.Equal(swatch.PagesStarterPaths, paths) {
+		t.Fatalf("PagesStarterPaths = %v, registry paths = %v", swatch.PagesStarterPaths, paths)
+	}
+}
+
+func TestAllReturns31Swatches(t *testing.T) {
 	all := swatch.All()
-	if len(all) != 16 {
-		t.Fatalf("All() returned %d swatches, want 16", len(all))
+	if len(all) != 31 {
+		t.Fatalf("All() returned %d swatches, want 31", len(all))
 	}
 }
 
@@ -45,6 +59,12 @@ func TestSwatchAttributes(t *testing.T) {
 		{"flake.nix", swatch.FirstFit, swatch.Development},
 		{"cubic.yaml", swatch.FirstFit, swatch.Development},
 		{"justfile", swatch.FirstFit, swatch.Development},
+		{"ruff.toml", swatch.FirstFit, swatch.Development},
+		{"pyrightconfig.json", swatch.FirstFit, swatch.Development},
+		{swatch.GoLintDestination, swatch.FirstFit, swatch.Development},
+		{swatch.GoReleaseDestination, swatch.FirstFit, swatch.Development},
+		{"Dockerfile", swatch.FirstFit, swatch.Development},
+		{swatch.GoWorkflowDestination, swatch.FirstFit, swatch.Development},
 		{".github/FUNDING.yml", swatch.FirstFit, swatch.Health},
 		{".github/dependabot.yml", swatch.FirstFit, swatch.Health},
 		{".github/ISSUE_TEMPLATE/bug_report.yml", swatch.Always, swatch.Health},
@@ -52,6 +72,15 @@ func TestSwatchAttributes(t *testing.T) {
 		{".github/ISSUE_TEMPLATE/config.yml", swatch.FirstFit, swatch.Health},
 		{".github/pull_request_template.md", swatch.Never, swatch.Health},
 		{".tailor.yml", swatch.Always, swatch.Development},
+		{swatch.PagesDestination, swatch.Always, swatch.Development},
+		{"pages/index.html", swatch.FirstFit, swatch.Development},
+		{"pages/style.css", swatch.FirstFit, swatch.Development},
+		{"pages/theme.js", swatch.FirstFit, swatch.Development},
+		{"pages/icon.svg", swatch.FirstFit, swatch.Development},
+		{"wiki/Home.md", swatch.FirstFit, swatch.Development},
+		{"wiki/_Sidebar.md", swatch.FirstFit, swatch.Development},
+		{"wiki/_Footer.md", swatch.FirstFit, swatch.Development},
+		{swatch.WikiDestination, swatch.Always, swatch.Development},
 	}
 
 	all := swatch.All()
@@ -127,7 +156,7 @@ func TestEmbeddedConfigSwatchesMatchRegistry(t *testing.T) {
 func TestHealthSwatchesReturnsCorrectSubset(t *testing.T) {
 	health := swatch.HealthSwatches()
 
-	// The spec lists 10 health swatches (excluding LICENSE, which is not embedded).
+	// LICENSE is fetched separately, so the embedded health subset excludes it.
 	if len(health) != 10 {
 		t.Fatalf("HealthSwatches() returned %d swatches, want 10", len(health))
 	}
@@ -141,8 +170,8 @@ func TestHealthSwatchesReturnsCorrectSubset(t *testing.T) {
 
 func TestPathsReturnsSortedList(t *testing.T) {
 	names := swatch.Paths()
-	if len(names) != 16 {
-		t.Fatalf("Paths() returned %d names, want 16", len(names))
+	if len(names) != 31 {
+		t.Fatalf("Paths() returned %d names, want 31", len(names))
 	}
 	for i := 1; i < len(names); i++ {
 		if names[i] < names[i-1] {

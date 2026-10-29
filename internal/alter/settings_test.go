@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -20,6 +21,7 @@ import (
 // repoJSON mirrors the repoResponse struct in the gh package for building
 // mock GET /repos/{owner}/{repo} responses.
 type repoJSON struct {
+	DefaultBranch            string   `json:"default_branch,omitempty"`
 	Description              string   `json:"description"`
 	Homepage                 string   `json:"homepage"`
 	HasWiki                  bool     `json:"has_wiki"`
@@ -41,6 +43,18 @@ type repoJSON struct {
 	Permissions              struct {
 		Admin bool `json:"admin"`
 	} `json:"permissions"`
+	// Omission of SecurityAndAnalysis simulates a token that cannot read security settings, independently of repository admin access.
+	SecurityAndAnalysis *securityAndAnalysisJSON `json:"security_and_analysis,omitempty"`
+}
+
+type securityStatusJSON struct {
+	Status string `json:"status"`
+}
+
+type securityAndAnalysisJSON struct {
+	SecretScanning                    securityStatusJSON  `json:"secret_scanning"`
+	SecretScanningPushProtection      securityStatusJSON  `json:"secret_scanning_push_protection"`
+	SecretScanningNonProviderPatterns *securityStatusJSON `json:"secret_scanning_non_provider_patterns,omitempty"`
 }
 
 // settingsServer creates an httptest server that responds to repo settings
@@ -84,13 +98,6 @@ func settingsServer(repo repoJSON, patchCalled *atomic.Int32) *httptest.Server {
 			w.WriteHeader(http.StatusNotFound)
 			fmt.Fprintf(w, `{"message":"Not Found: %s %s"}`, r.Method, path) //nolint:gosec // test HTTP handler, not exposed to user input
 		}
-	}))
-}
-
-func failingSettingsServer() *httptest.Server {
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Fprint(w, `{"message":"Internal Server Error"}`)
 	}))
 }
 
@@ -295,9 +302,7 @@ func TestProcessRepoSettingsNoApplyWhenAllMatch(t *testing.T) {
 func TestProcessRepoSettingsErrorPropagated(t *testing.T) {
 	ghfake.FakeRepo(t, "testowner", "testrepo")
 
-	server := failingSettingsServer()
-	t.Cleanup(server.Close)
-	client := testutil.NewTestClient(t, server)
+	client := testutil.NewTestClient(t, testutil.FailingServer(t))
 
 	cfg := &config.Config{
 		Repository: &model.RepositorySettings{
@@ -338,10 +343,10 @@ func TestProcessRepoSettingsMixedResults(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	want := []alter.RepoSettingResult{
-		{Field: "description", Category: alter.WouldSet, Value: "New"},
-		{Field: "has_wiki", Category: alter.WouldSet, Value: "false"},
-		{Field: "has_issues", Category: alter.RepoNoChange, Value: "true"},
-		{Field: "delete_branch_on_merge", Category: alter.WouldSet, Value: "true"},
+		{Field: "description", Category: alter.WouldSet, Value: "New", Before: "My project"},
+		{Field: "has_wiki", Category: alter.WouldSet, Value: "false", Before: "true"},
+		{Field: "has_issues", Category: alter.RepoNoChange, Value: "true", Before: "true"},
+		{Field: "delete_branch_on_merge", Category: alter.WouldSet, Value: "true", Before: "false"},
 	}
 	if len(results) != len(want) {
 		t.Fatalf("got %d results, want %d", len(results), len(want))
@@ -533,6 +538,13 @@ func TestProcessRepoSettingsTopicsOrderIgnored(t *testing.T) {
 	if results[0].Value != "go, cli" {
 		t.Errorf("value = %q, want declared order %q", results[0].Value, "go, cli")
 	}
+	if results[0].Before != results[0].Value {
+		t.Errorf("unchanged topics show a transition: %+v", results[0])
+	}
+	want := fmt.Sprintf("%-37s%s\n", "no change:", "repository.topics (already go, cli)")
+	if got := alter.FormatOutput(results, nil, nil, nil, alter.DryRun); got != want {
+		t.Errorf("plain output = %q, want %q", got, want)
+	}
 }
 
 func TestProcessRepoSettingsTopicsWouldSet(t *testing.T) {
@@ -566,19 +578,21 @@ func TestProcessRepoSettingsTopicsWouldSet(t *testing.T) {
 	if results[0].Value != "go, cli, github" {
 		t.Errorf("value = %q, want %q", results[0].Value, "go, cli, github")
 	}
+	if results[0].Before != "go, cli" {
+		t.Errorf("before = %q, want live order %q", results[0].Before, "go, cli")
+	}
 }
 
 func TestProcessRepoSettingsTopicsEmptyVsNil(t *testing.T) {
 	ghfake.FakeRepo(t, "testowner", "testrepo")
 
-	// Live has no topics (nil from JSON unmarshalling)
+	// JSON null decodes to nil, unlike an explicit empty topics list.
 	live := repoJSON{}
 	server := settingsServer(live, nil)
 	t.Cleanup(server.Close)
 	client := testutil.NewTestClient(t, server)
 
-	// Declared: empty slice (clear all topics)
-	// The set comparison treats nil and empty as equal, so this is no change
+	// An empty declaration clears topics, but the live nil list is already empty under set comparison.
 	topics := []string{}
 	cfg := &config.Config{
 		Repository: &model.RepositorySettings{
@@ -607,7 +621,6 @@ func TestProcessRepoSettingsTopicsEmptyVsNil(t *testing.T) {
 func TestProcessRepoSettingsTopicsEmptyMatchesEmpty(t *testing.T) {
 	ghfake.FakeRepo(t, "testowner", "testrepo")
 
-	// Live has empty topics from JSON
 	live := repoJSON{Topics: []string{}}
 	server := settingsServer(live, nil)
 	t.Cleanup(server.Close)
@@ -758,7 +771,7 @@ func TestProcessRepoSettingsSecurityFeaturesDryRun(t *testing.T) {
 	}
 }
 
-func TestProcessRepoSettingsAppliesOnlyChangedSecurityEndpoints(t *testing.T) {
+func TestProcessRepoSettingsReappliesAlertsWithoutOtherUnchangedSecurityEndpoints(t *testing.T) {
 	ghfake.FakeRepo(t, "testowner", "testrepo")
 	var patchWrites atomic.Int32
 	var securityWrites atomic.Int32
@@ -779,6 +792,9 @@ func TestProcessRepoSettingsAppliesOnlyChangedSecurityEndpoints(t *testing.T) {
 			w.WriteHeader(http.StatusNoContent)
 		case r.Method == http.MethodPut || r.Method == http.MethodDelete:
 			securityWrites.Add(1)
+			if r.Method != http.MethodPut || r.URL.Path != "/repos/testowner/testrepo/vulnerability-alerts" {
+				t.Errorf("unexpected security write: %s %s", r.Method, r.URL.Path)
+			}
 			w.WriteHeader(http.StatusNoContent)
 		default:
 			http.NotFound(w, r)
@@ -794,8 +810,159 @@ func TestProcessRepoSettingsAppliesOnlyChangedSecurityEndpoints(t *testing.T) {
 	if _, err := alter.ProcessRepoSettings(cfg, alter.Apply, repoTarget(testutil.NewTestClient(t, server), "testowner", "testrepo", true)); err != nil {
 		t.Fatal(err)
 	}
-	if patchWrites.Load() != 1 || securityWrites.Load() != 0 {
-		t.Fatalf("patch writes = %d, security writes = %d, want 1 and 0", patchWrites.Load(), securityWrites.Load())
+	if patchWrites.Load() != 1 || securityWrites.Load() != 1 {
+		t.Fatalf("patch writes = %d, security writes = %d, want 1 and 1", patchWrites.Load(), securityWrites.Load())
+	}
+}
+
+func TestProcessRepoSettingsReconcilesDependencyGraph(t *testing.T) {
+	const alertsPath = "/repos/testowner/testrepo/vulnerability-alerts"
+	const fixesPath = "/repos/testowner/testrepo/automated-security-fixes"
+	tests := []struct {
+		name          string
+		mode          alter.ApplyMode
+		alertsDesired *bool
+		alertsLive    bool
+		fixesDesired  *bool
+		fixesLive     bool
+		normalise     bool
+		readStatus    int
+		writeStatus   int
+		wantError     bool
+		wantCategory  alter.RepoSettingCategory
+		wantWrites    []string
+	}{
+		{
+			name: "apply", mode: alter.Apply, alertsDesired: new(true), alertsLive: true,
+			fixesDesired: new(true), fixesLive: true, wantCategory: alter.WouldSet, wantWrites: []string{"PUT " + alertsPath},
+		},
+		{
+			name: "recut", mode: alter.Recut, alertsDesired: new(true), alertsLive: true,
+			wantCategory: alter.WouldSet, wantWrites: []string{"PUT " + alertsPath},
+		},
+		{
+			name: "preview", mode: alter.DryRun, alertsDesired: new(true), alertsLive: true,
+			wantCategory: alter.WouldSet,
+		},
+		{name: "unmanaged", mode: alter.Apply, alertsLive: true},
+		{
+			name: "already disabled", mode: alter.Apply, alertsDesired: new(false),
+			wantCategory: alter.RepoNoChange,
+		},
+		{
+			name: "normalised prerequisite", mode: alter.Apply, alertsLive: true,
+			fixesDesired: new(true), fixesLive: true, normalise: true,
+			wantCategory: alter.WouldSet, wantWrites: []string{"PUT " + alertsPath},
+		},
+		{
+			name: "enable fixes after repeated alerts", mode: alter.Apply, alertsDesired: new(true), alertsLive: true,
+			fixesDesired: new(true), wantCategory: alter.WouldSet,
+			wantWrites: []string{"PUT " + alertsPath, "PUT " + fixesPath},
+		},
+		{
+			name: "alerts read denied", mode: alter.Apply, alertsDesired: new(true), alertsLive: true,
+			fixesDesired: new(true), readStatus: http.StatusForbidden, wantCategory: alter.WouldSkipScope,
+		},
+		{
+			name: "alerts enable denied", mode: alter.Apply, alertsDesired: new(true), alertsLive: true,
+			fixesDesired: new(true), writeStatus: http.StatusForbidden,
+			wantCategory: alter.WouldSet, wantWrites: []string{"PUT " + alertsPath},
+		},
+		{
+			name: "alerts enable fails", mode: alter.Apply, alertsDesired: new(true), alertsLive: true,
+			fixesDesired: new(true), writeStatus: http.StatusUnprocessableEntity,
+			wantError: true, wantWrites: []string{"PUT " + alertsPath},
+		},
+		{
+			name: "disable fixes before alerts", mode: alter.Apply, alertsDesired: new(false), alertsLive: true,
+			fixesDesired: new(false), fixesLive: true, wantCategory: alter.WouldSet,
+			wantWrites: []string{"DELETE " + fixesPath, "DELETE " + alertsPath},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var graphEnabled atomic.Bool
+			var writes []string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet {
+					writes = append(writes, r.Method+" "+r.URL.Path)
+					if r.URL.Path == alertsPath && tt.writeStatus != 0 {
+						w.WriteHeader(tt.writeStatus)
+						fmt.Fprint(w, `{"message":"Resource not accessible by integration"}`)
+						return
+					}
+					if r.URL.Path == alertsPath && r.Method == http.MethodPut {
+						graphEnabled.Store(true)
+					}
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
+				switch r.URL.Path {
+				case "/repos/testowner/testrepo":
+					fmt.Fprint(w, `{"permissions":{"admin":true}}`)
+				case "/repos/testowner/testrepo/actions/permissions/workflow":
+					fmt.Fprint(w, `{"default_workflow_permissions":"read","can_approve_pull_request_reviews":false}`)
+				case "/repos/testowner/testrepo/private-vulnerability-reporting":
+					fmt.Fprint(w, `{"enabled":false}`)
+				case alertsPath:
+					switch {
+					case tt.readStatus != 0:
+						w.WriteHeader(tt.readStatus)
+					case tt.alertsLive:
+						w.WriteHeader(http.StatusNoContent)
+					default:
+						w.WriteHeader(http.StatusNotFound)
+					}
+				case fixesPath:
+					fmt.Fprintf(w, `{"enabled":%t,"paused":false}`, tt.fixesLive)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			t.Cleanup(server.Close)
+			cfg := &config.Config{Repository: &model.RepositorySettings{
+				VulnerabilityAlertsEnabled: tt.alertsDesired, AutomatedSecurityFixesEnabled: tt.fixesDesired,
+			}}
+			if tt.normalise && !config.NormaliseSecurityPrerequisites(cfg) {
+				t.Fatal("expected prerequisite normalisation")
+			}
+			target := repoTarget(testutil.NewTestClient(t, server), "testowner", "testrepo", true)
+			for attempt := range 2 {
+				writes = nil
+				results, err := alter.ProcessRepoSettings(cfg, tt.mode, target)
+				if (err != nil) != tt.wantError {
+					t.Fatalf("attempt %d: error = %v, want error %t", attempt, err, tt.wantError)
+				}
+				if !slices.Equal(writes, tt.wantWrites) {
+					t.Fatalf("attempt %d: writes = %v, want %v", attempt, writes, tt.wantWrites)
+				}
+				wantGraph := slices.Contains(tt.wantWrites, "PUT "+alertsPath) && tt.writeStatus == 0
+				if graphEnabled.Load() != wantGraph {
+					t.Fatalf("attempt %d: Dependency Graph enabled = %t, want %t", attempt, graphEnabled.Load(), wantGraph)
+				}
+				if tt.wantError {
+					continue
+				}
+				index := slices.IndexFunc(results, func(result alter.RepoSettingResult) bool {
+					return result.Field == "vulnerability_alerts_enabled"
+				})
+				if tt.wantCategory == "" {
+					if index != -1 {
+						t.Fatalf("unmanaged alerts result = %+v", results[index])
+					}
+					continue
+				}
+				if index == -1 || results[index].Category != tt.wantCategory {
+					t.Fatalf("results = %+v, want alerts category %q", results, tt.wantCategory)
+				}
+				result := results[index]
+				if tt.wantCategory == alter.WouldSet && cfg.Repository.VulnerabilityAlertsEnabled != nil && *cfg.Repository.VulnerabilityAlertsEnabled {
+					if result.Before != "true" || result.Value != "true" || result.Annotation != "reapply enable request for Dependency Graph" {
+						t.Fatalf("repeated enable result = %+v", result)
+					}
+				}
+			}
+		})
 	}
 }
 
@@ -947,7 +1114,7 @@ func TestProcessRepoSettingsUnknownSecurityPrerequisiteSkipsDependent(t *testing
 			if writes.Load() != 0 || len(results) != 1 || results[0].Field != tt.dependentField || results[0].Category != alter.WouldSkipScope {
 				t.Fatalf("results = %+v, writes = %d, want one dependent skip", results, writes.Load())
 			}
-			if output := alter.FormatOutput(results, nil, nil, alter.Apply); strings.Contains(output, "set:") {
+			if output := alter.FormatOutput(results, nil, nil, nil, alter.Apply); strings.Contains(output, "set:") {
 				t.Fatalf("output = %q, want no set result", output)
 			}
 		})
@@ -964,6 +1131,14 @@ func TestProcessRepoSettingsSkippedSecurityWriteSkipsDependentOutput(t *testing.
 	}{
 		{
 			name: "alerts write blocks fixes",
+			settings: &model.RepositorySettings{
+				VulnerabilityAlertsEnabled: new(true), AutomatedSecurityFixesEnabled: new(true),
+			},
+			dependent: "enable automated security fixes",
+		},
+		{
+			name:          "repeated alerts write blocks fixes",
+			alertsEnabled: true,
 			settings: &model.RepositorySettings{
 				VulnerabilityAlertsEnabled: new(true), AutomatedSecurityFixesEnabled: new(true),
 			},
@@ -1017,7 +1192,7 @@ func TestProcessRepoSettingsSkippedSecurityWriteSkipsDependentOutput(t *testing.
 			if writes.Load() != 1 {
 				t.Fatalf("writes = %d, want one prerequisite attempt", writes.Load())
 			}
-			output := alter.FormatOutput(results, nil, nil, alter.Apply)
+			output := alter.FormatOutput(results, nil, nil, nil, alter.Apply)
 			if strings.Contains(output, "set:") || !strings.Contains(output, tt.dependent) {
 				t.Fatalf("output = %q, want skipped dependent %q", output, tt.dependent)
 			}
@@ -1028,7 +1203,6 @@ func TestProcessRepoSettingsSkippedSecurityWriteSkipsDependentOutput(t *testing.
 func TestProcessRepoSettingsPatch403ScopeProducesSkipScope(t *testing.T) {
 	ghfake.FakeRepo(t, "testowner", "testrepo")
 
-	// Server that returns 403 on PATCH (simulating insufficient scope on the main settings call).
 	live := repoJSON{HasWiki: true}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
@@ -1043,7 +1217,7 @@ func TestProcessRepoSettingsPatch403ScopeProducesSkipScope(t *testing.T) {
 			fmt.Fprint(w, `{"default_workflow_permissions":"read","can_approve_pull_request_reviews":false}`)
 
 		case r.Method == http.MethodPatch && path == "/repos/testowner/testrepo":
-			// Return 403 to simulate insufficient scope on PATCH.
+			// Scope headers distinguish insufficient scope from other forbidden responses.
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("X-OAuth-Scopes", "public_repo")
 			w.Header().Set("X-Accepted-OAuth-Scopes", "repo")
@@ -1165,7 +1339,7 @@ func TestProcessRepoSettingsReadPath403DoesNotProduceWouldSet(t *testing.T) {
 		}
 	}
 
-	// Both fields should have skip results.
+	// Both fields share the failed workflow permissions read, so both need skip results.
 	skipCount := 0
 	for _, r := range results {
 		if r.Category == alter.WouldSkipScope {

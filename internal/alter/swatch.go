@@ -16,20 +16,36 @@ import (
 type SwatchCategory string
 
 const (
+	// WouldUpdateConfig marks a config rewrite, not replacement with the embedded swatch.
 	WouldUpdateConfig SwatchCategory = "would update"
-	WouldCopy         SwatchCategory = "would copy"
-	WouldOverwrite    SwatchCategory = "would overwrite"
-	WouldRemove       SwatchCategory = "would remove"
-	NoChange          SwatchCategory = "no change"
-	Skipped           SwatchCategory = "skipped"
+	// WouldCopy marks creation of an absent destination.
+	WouldCopy SwatchCategory = "would copy"
+	// WouldOverwrite marks replacement of existing file content.
+	WouldOverwrite SwatchCategory = "would overwrite"
+	// WouldRemove marks removal of a managed or retired workflow.
+	WouldRemove SwatchCategory = "would remove"
+	// NoChange marks content that already matches.
+	NoChange SwatchCategory = "no change"
+	// Skipped marks a file that Tailor preserves under its alteration rules.
+	Skipped SwatchCategory = "skipped"
+	// ManagedConflict marks a managed destination that needs manual resolution.
+	ManagedConflict SwatchCategory = "conflict"
 )
 
 // SwatchReason explains why a swatch was skipped.
 type SwatchReason string
 
 const (
+	// SkipFirstFitExists preserves an existing first-fit destination.
 	SkipFirstFitExists SwatchReason = "first-fit, exists"
-	SkipModeNever      SwatchReason = "mode never"
+	// SkipModeNever preserves a destination excluded from alterations.
+	SkipModeNever SwatchReason = "mode never"
+	// SkipManagedRootExists preserves a root that needs manual loader adoption.
+	SkipManagedRootExists SwatchReason = "existing root preserved"
+	// SkipManagedSharedExists preserves shared settings that Tailor does not own.
+	SkipManagedSharedExists SwatchReason = "existing shared settings preserved"
+	// ManagedNotOwned identifies an unmarked managed destination.
+	ManagedNotOwned SwatchReason = "not owned by Tailor"
 )
 
 // SwatchResult records the path and categorised outcome for one swatch entry.
@@ -39,12 +55,25 @@ type SwatchResult struct {
 	Reason   SwatchReason
 }
 
-// configPath is the path of the config swatch entry.
-const configPath = config.ConfigSwatchPath
+const (
+	configPath     = config.ConfigSwatchPath
+	ignoreRootPath = ".gitignore"
+)
 
-// ProcessSwatches evaluates each swatch entry in cfg and returns results.
-// When mode is Apply or Recut, it writes files to disk.
-func ProcessSwatches(cfg *config.Config, dir string, mode ApplyMode, tokens *TokenContext) ([]SwatchResult, error) {
+// processSwatches previews or writes active ordinary swatches after token substitution.
+// Config, managed, Pages and wiki files use separate processors.
+func processSwatches(cfg *config.Config, dir string, mode ApplyMode, tokens *TokenContext, excluded map[string]struct{}) ([]SwatchResult, error) {
+	if tokens == nil {
+		tokens = &TokenContext{}
+	}
+	contents := tokens.rendered
+	if contents == nil {
+		var err error
+		contents, err = prepareGoSwatches(cfg, dir, mode, tokens.DefaultBranch)
+		if err != nil {
+			return nil, err
+		}
+	}
 	results := make([]SwatchResult, 0, len(cfg.Swatches))
 	root, err := os.OpenRoot(dir)
 	if err != nil {
@@ -53,13 +82,36 @@ func ProcessSwatches(cfg *config.Config, dir string, mode ApplyMode, tokens *Tok
 	defer root.Close()
 
 	for _, entry := range cfg.Swatches {
-		if entry.Path == configPath {
+		if !cfg.SwatchActive(entry.Path) {
+			continue
+		}
+		if _, skip := excluded[entry.Path]; skip {
+			continue
+		}
+		if entry.Path == dependabotPath {
+			continue
+		}
+		if entry.Path == configPath || entry.Path == swatch.PagesDestination || swatch.IsWiki(entry.Path) || swatch.IsPagesStarter(entry.Path) {
 			continue
 		}
 
-		content, err := swatch.Content(entry.Path)
-		if err != nil {
-			return nil, fmt.Errorf("reading swatch %q: %w", entry.Path, err)
+		if entry.Alteration != swatch.Never {
+			reason, err := PythonPolicyReason(dir, entry.Path)
+			if err != nil {
+				return nil, err
+			}
+			if reason != "" {
+				results = append(results, SwatchResult{Path: entry.Path, Category: Skipped, Reason: SwatchReason(reason)})
+				continue
+			}
+		}
+
+		content, rendered := contents[entry.Path]
+		if !rendered {
+			content, err = swatch.Content(entry.Path)
+			if err != nil {
+				return nil, fmt.Errorf("reading swatch %q: %w", entry.Path, err)
+			}
 		}
 
 		content = tokens.Substitute(content, entry.Path)
@@ -74,16 +126,22 @@ func ProcessSwatches(cfg *config.Config, dir string, mode ApplyMode, tokens *Tok
 	return results, nil
 }
 
-// processSwatch determines the category for a single swatch and writes
-// the file when the mode permits. Token substitution occurs upstream in
-// ProcessSwatches before this function is called.
-func processSwatch(root *os.Root, entry config.SwatchEntry, content []byte, mode ApplyMode) (SwatchResult, error) {
+// processSwatch previews or writes a swatch whose content the caller has already rendered.
+func processSwatch(root *os.Root, entry config.SwatchEntry, content []byte, mode ApplyMode, testHooks ...managedApplyHooks) (SwatchResult, error) {
 	// Never mode skips unconditionally, regardless of apply mode or file existence.
 	if entry.Alteration == swatch.Never {
 		return SwatchResult{Path: entry.Path, Category: Skipped, Reason: SkipModeNever}, nil
 	}
 
-	if err := validateSwatchParents(root, entry.Path); err != nil {
+	if entry.Path == ignoreRootPath {
+		var hooks managedApplyHooks
+		if len(testHooks) != 0 {
+			hooks = testHooks[0]
+		}
+		return processIgnoreRoot(root, entry, content, mode, hooks)
+	}
+
+	if err := checkParents(root, entry.Path, "swatch parent"); err != nil {
 		return SwatchResult{}, err
 	}
 
@@ -93,7 +151,11 @@ func processSwatch(root *os.Root, entry config.SwatchEntry, content []byte, mode
 	}
 
 	if mode == Recut {
-		return processRecut(root, entry, content, exists)
+		category := WouldOverwrite
+		if !exists {
+			category = WouldCopy
+		}
+		return writeSwatch(root, entry, content, category, true)
 	}
 
 	switch entry.Alteration {
@@ -109,40 +171,134 @@ func processSwatch(root *os.Root, entry config.SwatchEntry, content []byte, mode
 		return SwatchResult{}, fmt.Errorf("unknown alteration mode %q for swatch %q", entry.Alteration, entry.Path)
 	}
 
-	if mode.ShouldWrite() {
-		if err := writeFile(root, entry.Path, content); err != nil {
+	return writeSwatch(root, entry, content, WouldCopy, mode.ShouldWrite())
+}
+
+func processIgnoreRoot(root *os.Root, entry config.SwatchEntry, content []byte, mode ApplyMode, hooks managedApplyHooks) (SwatchResult, error) {
+	exists, err := checkIgnoreRoot(root)
+	if err != nil {
+		return SwatchResult{}, fmt.Errorf("checking swatch %q: %w", entry.Path, err)
+	}
+	if exists {
+		return SwatchResult{Path: entry.Path, Category: NoChange, Reason: SkipManagedRootExists}, nil
+	}
+
+	switch entry.Alteration {
+	case swatch.FirstFit, swatch.Always:
+	default:
+		return SwatchResult{}, fmt.Errorf("unknown alteration mode %q for swatch %q", entry.Alteration, entry.Path)
+	}
+	if !mode.ShouldWrite() {
+		return SwatchResult{Path: entry.Path, Category: WouldCopy}, nil
+	}
+
+	changed, err := writeManagedFile(root, entry.Path, content, true, hooks)
+	if err != nil {
+		return SwatchResult{}, err
+	}
+	if changed {
+		return SwatchResult{Path: entry.Path, Category: WouldCopy}, nil
+	}
+
+	exists, err = checkIgnoreRoot(root)
+	if err != nil {
+		return SwatchResult{}, fmt.Errorf("checking swatch %q after protected create: %w", entry.Path, err)
+	}
+	if !exists {
+		return SwatchResult{}, fmt.Errorf("swatch destination %q disappeared during protected create", entry.Path)
+	}
+	return SwatchResult{Path: entry.Path, Category: NoChange, Reason: SkipManagedRootExists}, nil
+}
+
+// writeSwatch writes content to the entry path when write is true and
+// returns the result with the given category.
+func writeSwatch(root *os.Root, entry config.SwatchEntry, content []byte, category SwatchCategory, write bool) (SwatchResult, error) {
+	return writeSwatchWithParentObserver(root, entry, content, category, write, nil)
+}
+
+func writeSwatchWithParentObserver(root *os.Root, entry config.SwatchEntry, content []byte, category SwatchCategory, write bool, observer *parentCreationObserver) (SwatchResult, error) {
+	if write {
+		if err := writeFileWithParentObserver(root, entry.Path, content, observer); err != nil {
 			return SwatchResult{}, err
 		}
 	}
-	return SwatchResult{Path: entry.Path, Category: WouldCopy}, nil
+	return SwatchResult{Path: entry.Path, Category: category}, nil
 }
 
-func validateSwatchParents(root *os.Root, path string) error {
+func preflightIgnoreRoot(cfg *config.Config, dir string) error {
+	configured := false
+	for _, entry := range cfg.Swatches {
+		if entry.Path == ignoreRootPath && cfg.SwatchActive(entry.Path) && entry.Alteration != swatch.Never {
+			configured = true
+			break
+		}
+	}
+	if !configured {
+		return nil
+	}
+
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return fmt.Errorf("opening project root %q: %w", dir, err)
+	}
+	defer root.Close()
+	if _, err := checkIgnoreRoot(root); err != nil {
+		return fmt.Errorf("checking protected ignore root: %w", err)
+	}
+	return nil
+}
+
+func checkIgnoreRoot(root *os.Root) (bool, error) {
+	if err := checkParents(root, ignoreRootPath, "swatch parent"); err != nil {
+		return false, err
+	}
+	info, err := root.Lstat(ignoreRootPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("checking swatch destination %q: %w", ignoreRootPath, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || info.Mode().IsRegular() {
+		return true, nil
+	}
+	if info.IsDir() {
+		return false, fmt.Errorf("swatch destination %q is a directory", ignoreRootPath)
+	}
+	return false, fmt.Errorf("swatch destination %q is not a regular file or symlink", ignoreRootPath)
+}
+
+// checkParents walks each parent directory of the root-relative path and
+// rejects a symlink or a non-directory. A missing parent is not an error.
+// subject prefixes each error message, for example "swatch parent".
+func checkParents(root *os.Root, path, subject string) error {
 	parent := filepath.Dir(path)
 	if parent == "." {
 		return nil
 	}
 
 	current := ""
-	for _, component := range strings.Split(parent, string(filepath.Separator)) {
+	for component := range strings.SplitSeq(parent, string(filepath.Separator)) {
 		current = filepath.Join(current, component)
 		info, err := root.Lstat(current)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				return nil
 			}
-			return fmt.Errorf("checking swatch parent %q: %w", current, err)
+			return fmt.Errorf("checking %s %q: %w", subject, current, err)
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("swatch parent %q is a symlink", current)
+			return fmt.Errorf("%s %q is a symlink", subject, current)
 		}
 		if !info.IsDir() {
-			return fmt.Errorf("swatch parent %q is not a directory", current)
+			return fmt.Errorf("%s %q is not a directory", subject, current)
 		}
 	}
 	return nil
 }
 
+// prepareSwatchDestination counts only regular files as existing destinations.
+// A write removes a destination symlink without following it.
 func prepareSwatchDestination(root *os.Root, path string, shouldWrite bool) (bool, error) {
 	info, err := root.Lstat(path)
 	if err != nil {
@@ -178,28 +334,16 @@ func processAlways(root *os.Root, entry config.SwatchEntry, content []byte, mode
 		return SwatchResult{Path: entry.Path, Category: NoChange}, nil
 	}
 
-	if mode.ShouldWrite() {
-		if err := writeFile(root, entry.Path, content); err != nil {
-			return SwatchResult{}, err
-		}
-	}
-	return SwatchResult{Path: entry.Path, Category: WouldOverwrite}, nil
-}
-
-func processRecut(root *os.Root, entry config.SwatchEntry, content []byte, exists bool) (SwatchResult, error) {
-	category := WouldOverwrite
-	if !exists {
-		category = WouldCopy
-	}
-	if err := writeFile(root, entry.Path, content); err != nil {
-		return SwatchResult{}, err
-	}
-	return SwatchResult{Path: entry.Path, Category: category}, nil
+	return writeSwatch(root, entry, content, WouldOverwrite, mode.ShouldWrite())
 }
 
 // writeFile creates parent directories and writes data to a root-relative path.
 func writeFile(root *os.Root, path string, data []byte) error {
-	if err := root.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	return writeFileWithParentObserver(root, path, data, nil)
+}
+
+func writeFileWithParentObserver(root *os.Root, path string, data []byte, observer *parentCreationObserver) error {
+	if err := rootedMkdirAll(root, filepath.Dir(path), 0o755, observer); err != nil {
 		return fmt.Errorf("creating directories for %q: %w", path, err)
 	}
 	if err := root.WriteFile(path, data, 0o644); err != nil {

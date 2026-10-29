@@ -16,29 +16,39 @@ import (
 type RepoSettingCategory string
 
 const (
-	WouldSet       RepoSettingCategory = "would set"
-	RepoNoChange   RepoSettingCategory = "no change"
+	// WouldSet marks a declared setting that needs a write.
+	WouldSet RepoSettingCategory = "would set"
+	// RepoNoChange marks a setting that already matches its declaration.
+	RepoNoChange RepoSettingCategory = "no change"
+	// WouldSkipScope marks a setting or operation blocked by insufficient access.
 	WouldSkipScope RepoSettingCategory = "would skip (insufficient scope)"
 )
 
 // RepoSettingResult records the field name, category, and display value for one
 // repository setting. Skip results for write operations leave Field empty and
 // carry the skipped Operation instead. Annotation carries optional context for
-// skip categories, embedded in the label (e.g. "token missing required scope").
+// skipped operations or repeated enable requests.
 type RepoSettingResult struct {
 	Section    string
 	Field      string
 	Category   RepoSettingCategory
 	Value      string
+	Before     string
 	Annotation string
 	Operation  gh.Operation
 }
 
-// ProcessRepoSettings compares declared settings against live settings
-// and optionally applies them. Returns results for output formatting.
+// ProcessRepoSettings compares declared repository settings and applies changes outside DryRun.
 func ProcessRepoSettings(cfg *config.Config, mode ApplyMode, target RepoTarget) ([]RepoSettingResult, error) {
 	if cfg.Repository == nil {
 		return nil, nil
+	}
+	if pagesEnabled(cfg) && !cfg.HomepageDeclared() && cfg.Repository.Homepage != nil {
+		copyConfig := *cfg
+		copyRepository := *cfg.Repository
+		copyRepository.Homepage = nil
+		copyConfig.Repository = &copyRepository
+		cfg = &copyConfig
 	}
 
 	if target.missingRepo("Repository settings") {
@@ -49,10 +59,9 @@ func ProcessRepoSettings(cfg *config.Config, mode ApplyMode, target RepoTarget) 
 	if err != nil {
 		return nil, err
 	}
-
-	// Convert read-path warnings into skip results and collect the affected
-	// field names so the corresponding WouldSet entries can be suppressed.
-	skipResults, skippedFields := readWarningsToResults(warnings, cfg.Repository, live)
+	if target.wikiEnabled {
+		live.HasWiki = new(true)
+	}
 
 	if cfg.Repository.AutomatedSecurityFixesEnabled != nil &&
 		*cfg.Repository.AutomatedSecurityFixesEnabled &&
@@ -62,25 +71,10 @@ func ProcessRepoSettings(cfg *config.Config, mode ApplyMode, target RepoTarget) 
 		fmt.Fprintln(target.stderr(), "warning: automated_security_fixes_enabled is true but vulnerability alerts are disabled on GitHub; enable vulnerability_alerts_enabled first")
 	}
 
-	results := compareSettings(cfg.Repository, live)
-
-	// Remove false-positive WouldSet entries for fields whose live value is
-	// nil only because the read returned a 403.
-	if len(skippedFields) > 0 {
-		filtered := results[:0]
-		for _, r := range results {
-			if skippedFields[r.Field] {
-				continue
-			}
-			filtered = append(filtered, r)
-		}
-		results = filtered
-	}
-
-	results = append(results, skipResults...)
+	results := readWarningsToResults(compareSettings(cfg.Repository, live), warnings, cfg.Repository, live)
 
 	if mode.ShouldWrite() && hasChanges(results) {
-		applyResult, err := gh.ApplyRepoSettingsWithCurrent(target.Client, target.Owner, target.Name, settingsForApply(cfg.Repository, results), live)
+		applyResult, err := gh.ApplyRepoSettings(target.Client, target.Owner, target.Name, changedSettings(cfg.Repository, results, model.RepositorySettingFields), live)
 		if err != nil {
 			return nil, err
 		}
@@ -90,7 +84,9 @@ func ProcessRepoSettings(cfg *config.Config, mode ApplyMode, target RepoTarget) 
 	return results, nil
 }
 
-func settingsForApply(declared *model.RepositorySettings, results []RepoSettingResult) *model.RepositorySettings {
+// changedSettings copies the fields of declared whose result is WouldSet into
+// a new settings value, so a write carries only actionable fields.
+func changedSettings[T any](declared *T, results []RepoSettingResult, fields func(*T) []model.SettingField) *T {
 	changed := make(map[string]bool)
 	for _, result := range results {
 		if result.Category == WouldSet {
@@ -98,9 +94,9 @@ func settingsForApply(declared *model.RepositorySettings, results []RepoSettingR
 		}
 	}
 
-	apply := new(model.RepositorySettings)
+	apply := new(T)
 	applyValue := reflect.ValueOf(apply).Elem()
-	for _, field := range model.RepositorySettingFields(declared) {
+	for _, field := range fields(declared) {
 		if changed[field.YAMLKey] {
 			applyValue.Field(field.Index).Set(field.Value)
 		}
@@ -125,8 +121,7 @@ func skippedToResults(ar *gh.ApplyResult) []RepoSettingResult {
 	return results
 }
 
-// compareSettings iterates non-nil pointer fields in declared and compares
-// each against the corresponding field in live. Returns a result per declared field.
+// compareSettings returns one result per declared field, including repeated vulnerability-alert enable requests for Dependency Graph.
 func compareSettings(declared, live *model.RepositorySettings) []RepoSettingResult {
 	var results []RepoSettingResult
 
@@ -139,7 +134,7 @@ func compareSettings(declared, live *model.RepositorySettings) []RepoSettingResu
 		dfv := field.Value
 		declaredVal := dfv.Elem().Interface()
 
-		var displayVal string
+		var displayVal, beforeVal string
 		var equal bool
 
 		lfv := liveFields[field.Index].Value
@@ -149,30 +144,43 @@ func compareSettings(declared, live *model.RepositorySettings) []RepoSettingResu
 			displayVal = strings.Join(dSlice, ", ")
 			if !lfv.IsNil() {
 				lSlice := lfv.Elem().Interface().([]string)
+				beforeVal = strings.Join(lSlice, ", ")
 				equal = equalStringSets(dSlice, lSlice)
+				if equal {
+					beforeVal = displayVal
+				}
 			}
 		} else {
 			displayVal = fmt.Sprintf("%v", declaredVal)
+			if !lfv.IsNil() {
+				beforeVal = fmt.Sprintf("%v", lfv.Elem().Interface())
+			}
 			equal = !lfv.IsNil() && lfv.Elem().Interface() == declaredVal
 		}
 
 		category := WouldSet
+		annotation := ""
 		if equal {
 			category = RepoNoChange
+			if field.YAMLKey == "vulnerability_alerts_enabled" && declaredVal == true {
+				category = WouldSet
+				annotation = "reapply enable request for Dependency Graph"
+			}
 		}
 		results = append(results, RepoSettingResult{
-			Field:    field.YAMLKey,
-			Category: category,
-			Value:    displayVal,
+			Field:      field.YAMLKey,
+			Category:   category,
+			Value:      displayVal,
+			Before:     beforeVal,
+			Annotation: annotation,
 		})
 	}
 
 	return results
 }
 
-// equalStringSets reports whether a and b contain the same elements regardless
-// of order. GitHub imposes no meaning on list order for topics or
-// patterns_allowed. Sorts copies; neither input is mutated.
+// equalStringSets compares sorted copies without changing either input.
+// GitHub ignores list order for topics and patterns_allowed. Duplicate counts must still match.
 func equalStringSets(a, b []string) bool {
 	as := slices.Clone(a)
 	bs := slices.Clone(b)
@@ -188,24 +196,12 @@ var readWarningOperationFields = map[gh.OperationKind][]string{
 	gh.OpFetchAutomatedSecurityFixes:        {"automated_security_fixes_enabled"},
 	gh.OpFetchPrivateVulnerabilityReporting: {"private_vulnerability_reporting_enabled"},
 	gh.OpFetchWorkflowPermissions:           {"default_workflow_permissions", "can_approve_pull_request_reviews"},
+	gh.OpFetchSecurityAnalysis:              {"secret_scanning", "secret_scanning_push_protection", "secret_scanning_non_provider_patterns"},
 }
 
-// readWarningsToResults converts read-path access-error warnings into
-// RepoSettingResult entries with the appropriate skip category. Only fields
-// that the user declared in their config produce results. Undeclared fields
-// are silently ignored. It also returns a set of field names that should be
-// suppressed from compareSettings output (because their nil live value is due
-// to a 403, not a real diff).
-func readWarningsToResults(warnings []error, declared, live *model.RepositorySettings) ([]RepoSettingResult, map[string]bool) {
-	if len(warnings) == 0 {
-		return nil, nil
-	}
-
-	declaredFields := declaredFieldNames(declared)
-
-	var results []RepoSettingResult
-	skippedFields := make(map[string]bool)
-
+// readWarningsToResults skips declared fields and dependent changes when an access error prevents a safe comparison.
+// An unreadable live value is not evidence that a setting differs. Undeclared fields produce no results.
+func readWarningsToResults(results []RepoSettingResult, warnings []error, declared, live *model.RepositorySettings) []RepoSettingResult {
 	for _, w := range warnings {
 		op := warningOperation(w)
 		fields, ok := readWarningOperationFields[op]
@@ -214,18 +210,7 @@ func readWarningsToResults(warnings []error, declared, live *model.RepositorySet
 		}
 
 		for _, f := range fields {
-			if !declaredFields[f] {
-				continue
-			}
-			if skippedFields[f] {
-				continue
-			}
-			skippedFields[f] = true
-			results = append(results, RepoSettingResult{
-				Field:      f,
-				Category:   WouldSkipScope,
-				Annotation: skipAnnotation,
-			})
+			results = replaceWithScopeSkip(results, "", f)
 		}
 
 		dependent := ""
@@ -237,38 +222,17 @@ func readWarningsToResults(warnings []error, declared, live *model.RepositorySet
 			live.VulnerabilityAlertsEnabled != nil && *live.VulnerabilityAlertsEnabled:
 			dependent = "vulnerability_alerts_enabled"
 		}
-		if dependent != "" && !skippedFields[dependent] {
-			skippedFields[dependent] = true
-			results = append(results, RepoSettingResult{
-				Field:      dependent,
-				Category:   WouldSkipScope,
-				Annotation: skipAnnotation,
-			})
+		if dependent != "" {
+			results = replaceWithScopeSkip(results, "", dependent)
 		}
 	}
 
-	return results, skippedFields
-}
-
-// declaredFieldNames returns the set of YAML field names that have non-nil
-// values in the given RepositorySettings.
-func declaredFieldNames(s *model.RepositorySettings) map[string]bool {
-	if s == nil {
-		return nil
-	}
-	names := make(map[string]bool)
-	for _, field := range model.RepositorySettingFields(s) {
-		if field.Set {
-			names[field.YAMLKey] = true
-		}
-	}
-	return names
+	return results
 }
 
 // warningOperation extracts the operation kind from a read-path warning.
 func warningOperation(err error) gh.OperationKind {
-	var scopeErr *gh.ErrInsufficientScope
-	if errors.As(err, &scopeErr) {
+	if scopeErr, ok := errors.AsType[*gh.ErrInsufficientScope](err); ok {
 		return scopeErr.Operation.Kind
 	}
 	return gh.OpNone

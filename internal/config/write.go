@@ -8,8 +8,10 @@ import (
 	"io/fs"
 	"os"
 	"reflect"
+	"slices"
 	"strings"
 	"text/template"
+	"unicode"
 
 	"github.com/wimpysworld/tailor/internal/model"
 	"gopkg.in/yaml.v3"
@@ -22,22 +24,43 @@ const yamlDoubleQuoted = "{}[]#&*!|>'\"%@`"
 // yamlVal encodes v as one YAML string scalar. Newlines use double quotes so
 // the result stays on one line when the template adds its indentation.
 func yamlVal(v string) (string, error) {
+	var style yaml.Style
+	if strings.ContainsAny(v, yamlDoubleQuoted) || strings.Contains(v, "\n") {
+		style = yaml.DoubleQuotedStyle
+	}
+	return yamlScalar(v, style)
+}
+
+func yamlQuoted(v string) (string, error) {
+	return yamlScalar(v, yaml.DoubleQuotedStyle)
+}
+
+func yamlScalar(v string, style yaml.Style) (string, error) {
 	var node yaml.Node
 	node.SetString(v)
-	if strings.ContainsAny(v, yamlDoubleQuoted) || strings.Contains(v, "\n") {
-		node.Style = yaml.DoubleQuotedStyle
-	}
+	node.Style = style
 
 	encoded, err := yaml.Marshal(&node)
 	if err != nil {
 		return "", fmt.Errorf("encoding YAML scalar: %w", err)
 	}
-	return strings.TrimSuffix(string(encoded), "\n"), nil
+	result := strings.TrimSuffix(string(encoded), "\n")
+	// yaml.v3 escapes all non-BMP characters, although YAML permits them.
+	// Match escaped backslashes first to preserve literal escape-looking text.
+	replacements := []string{`\\`, `\\`}
+	for _, r := range v {
+		if r > '\uFFFF' && unicode.IsPrint(r) {
+			replacements = append(replacements, fmt.Sprintf(`\U%08X`, r), string(r))
+		}
+	}
+	if len(replacements) > 2 {
+		result = strings.NewReplacer(replacements...).Replace(result)
+	}
+	return result, nil
 }
 
-// settingLines renders one "  key: value" line per set field. Scalar fields
-// keep struct order; list fields follow them, preserving the output order
-// that places topics last.
+// settingLines renders set fields as indented YAML. Scalars keep struct order,
+// followed by lists, so topics appear last in repository settings.
 func settingLines(fields []model.SettingField) ([]string, error) {
 	var lines, lists []string
 	for _, field := range fields {
@@ -67,52 +90,436 @@ func settingLines(fields []model.SettingField) ([]string, error) {
 
 // listLines renders a string-list field as a block sequence, or [] when empty.
 func listLines(key string, v reflect.Value) (string, error) {
-	if v.Len() == 0 {
-		return fmt.Sprintf("  %s: []", key), nil
+	values := make([]string, v.Len())
+	for i := range values {
+		values[i] = v.Index(i).String()
 	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "  %s:", key)
-	for i := range v.Len() {
-		value, err := yamlVal(v.Index(i).String())
-		if err != nil {
-			return "", err
-		}
-		fmt.Fprintf(&b, "\n    - %s", value)
-	}
-	return b.String(), nil
+	w := &rulesetWriter{}
+	w.list(2, key, values)
+	return strings.Join(w.lines, "\n"), w.err
 }
 
 // templateFuncs provides helpers for the config template.
 var templateFuncs = template.FuncMap{
-	"yamlVal": yamlVal,
-	"repositoryLines": func(r *model.RepositorySettings) ([]string, error) {
-		return settingLines(model.RepositorySettingFields(r))
+	"yamlVal":    yamlVal,
+	"yamlQuoted": yamlQuoted,
+	"languageLines": func(languages *LanguageSettings) ([]string, error) {
+		w := &rulesetWriter{}
+		if languages.GoOptions == nil {
+			w.boolean(2, "go", languages.Go)
+		} else {
+			w.line(2, "go:")
+			w.boolean(4, "enabled", languages.Go)
+			w.boolean(4, "cgo", languages.GoOptions.CGO)
+			w.boolean(4, "ffmpeg-statigo", languages.GoOptions.FFmpegStatigo)
+			if engine := languages.GoOptions.Ebitengine; engine != nil {
+				var buf bytes.Buffer
+				encoder := yaml.NewEncoder(&buf)
+				encoder.SetIndent(2)
+				if err := encoder.Encode(struct {
+					Ebitengine *EbitengineOptions `yaml:"ebitengine"`
+				}{engine}); err != nil {
+					return nil, err
+				}
+				for _, line := range strings.Split(strings.TrimSuffix(buf.String(), "\n"), "\n") {
+					w.line(4, "%s", line)
+				}
+			}
+		}
+		w.boolean(2, "rust", languages.Rust)
+		w.boolean(2, "python", languages.Python)
+		return w.lines, w.err
+	},
+	"repositoryLines": func(cfg *Config) ([]string, error) {
+		lines, err := settingLines(model.RepositorySettingFields(cfg.Repository))
+		if cfg.InferredHomepage != "" && !cfg.HomepageDeclared() {
+			for i, line := range lines {
+				if strings.HasPrefix(line, "  homepage:") {
+					lines[i] += " " + inferredHomepageMarker(cfg.InferredHomepage)
+				}
+			}
+		}
+		return lines, err
+	},
+	"pagesLines": func(p *model.PagesSettings) ([]string, error) {
+		lines, err := settingLines(model.PagesSettingFields(p))
+		if err != nil || p == nil || p.Links == nil {
+			return lines, err
+		}
+		w := &rulesetWriter{lines: lines}
+		if len(*p.Links) == 0 {
+			w.line(2, "links: {}")
+		} else {
+			w.line(2, "links:")
+			for _, link := range p.OrderedLinks() {
+				if value, ok := (*p.Links)[link.Key]; ok {
+					w.scalar(4, "", link.Key, value)
+				}
+			}
+		}
+		return w.lines, w.err
 	},
 	"actionsLines": func(a *model.ActionsSettings) ([]string, error) {
-		return settingLines(model.ActionsSettingFields(a))
+		lines, err := settingLines(model.ActionsSettingFields(a))
+		if err != nil {
+			return nil, err
+		}
+		if a != nil && a.ArtifactAndLogRetention != nil && a.ArtifactAndLogRetention.Days != nil {
+			w := &rulesetWriter{lines: lines}
+			w.line(2, "artifact_and_log_retention:")
+			w.line(4, "days: %d", *a.ArtifactAndLogRetention.Days)
+			lines = w.lines
+		}
+		if a != nil && a.ForkPRContributorApproval != nil && a.ForkPRContributorApproval.ApprovalPolicy != nil {
+			w := &rulesetWriter{lines: lines}
+			w.line(2, "fork_pr_contributor_approval:")
+			w.scalar(4, "", "approval_policy", *a.ForkPRContributorApproval.ApprovalPolicy)
+			return w.lines, w.err
+		}
+		return lines, nil
 	},
+	"codeScanningLines": func(c *model.CodeScanningSettings) ([]string, error) {
+		lines, err := settingLines(model.CodeScanningSettingFields(c))
+		return withLanguagesComment(lines, model.CodeScanningLanguages), err
+	},
+	"codeQualityLines": func(c *model.CodeQualitySettings) ([]string, error) {
+		lines, err := settingLines(model.CodeQualitySettingFields(c))
+		return withLanguagesComment(lines, model.CodeQualityLanguages), err
+	},
+	"rulesetLines": rulesetLines,
 }
 
-// configTemplate renders .tailor.yml in the exact format specified. It uses
-// text/template rather than yaml.Marshal to control key order, blank lines
-// between swatch entries, and omission of nil pointer fields.
+// rulesetWriter collects indented YAML lines and the first scalar encoding error.
+// Guidance comments use model slices so documented values match the values that validation accepts.
+type rulesetWriter struct {
+	lines []string
+	err   error
+}
+
+func (w *rulesetWriter) line(indent int, format string, args ...any) {
+	w.lines = append(w.lines, strings.Repeat(" ", indent)+fmt.Sprintf(format, args...))
+}
+
+// scalar renders one string scalar. prefix is "- " for the first line of a
+// sequence entry, "  " for a later line of that entry, and "" otherwise.
+func (w *rulesetWriter) scalar(indent int, prefix, key, value string) {
+	encoded, err := yamlVal(value)
+	if err != nil && w.err == nil {
+		w.err = err
+	}
+	w.line(indent, "%s%s: %s", prefix, key, encoded)
+}
+
+func (w *rulesetWriter) boolean(indent int, key string, value *bool) {
+	if value != nil {
+		w.line(indent, "%s: %t", key, *value)
+	}
+}
+
+// list renders a string list as a block sequence, or [] when empty.
+func (w *rulesetWriter) list(indent int, key string, values []string) {
+	if len(values) == 0 {
+		w.line(indent, "%s: []", key)
+		return
+	}
+	w.line(indent, "%s:", key)
+	for _, value := range values {
+		encoded, err := yamlVal(value)
+		if err != nil && w.err == nil {
+			w.err = err
+		}
+		w.line(indent+2, "- %s", encoded)
+	}
+}
+
+// rulesetLines renders the ruleset section, comments included, for the
+// config template.
+func rulesetLines(r *model.RulesetSettings) ([]string, error) {
+	w := &rulesetWriter{}
+	w.line(2, "# Tailor manages one ruleset named %q and owns it entirely.", model.RulesetName)
+	w.line(2, "# %s enforces the rules. %s keeps the ruleset on GitHub but", model.RulesetEnforcements[0], model.RulesetEnforcements[1])
+	w.line(2, "# GitHub ignores it, so a hand-made ruleset can govern instead.")
+	if r.Enforcement != nil {
+		w.scalar(2, "", "enforcement", *r.Enforcement)
+	}
+	if r.BypassActors != nil {
+		w.bypassActors(*r.BypassActors)
+	}
+	if r.Conditions != nil && r.Conditions.RefName != nil {
+		w.refName(r.Conditions.RefName)
+	}
+	if r.Rules != nil {
+		w.rules(r.Rules)
+	}
+	return w.lines, w.err
+}
+
+func (w *rulesetWriter) bypassActors(actors []model.RulesetBypassActor) {
+	roles := make([]string, 0, len(model.RulesetRepositoryRoles))
+	for _, role := range model.RulesetRepositoryRoles {
+		roles = append(roles, fmt.Sprintf("%d %s", role.ID, role.Name))
+	}
+	comments := []string{
+		"# actor_type: " + strings.Join(model.RulesetActorTypes, ", "),
+		"# RepositoryRole actor_id: " + strings.Join(roles, ", "),
+		"# bypass_mode: " + strings.Join(model.RulesetBypassModes, ", "),
+	}
+	if len(actors) == 0 {
+		for _, comment := range comments {
+			w.line(2, "%s", comment)
+		}
+		w.line(2, "bypass_actors: []")
+		return
+	}
+	w.line(2, "bypass_actors:")
+	for _, comment := range comments {
+		w.line(4, "%s", comment)
+	}
+	for _, actor := range actors {
+		prefix := "- "
+		if actor.ActorID != nil {
+			w.line(4, "%sactor_id: %d", prefix, *actor.ActorID)
+			prefix = "  "
+		}
+		if actor.ActorType != nil {
+			w.scalar(4, prefix, "actor_type", *actor.ActorType)
+			prefix = "  "
+		}
+		if actor.BypassMode != nil {
+			w.scalar(4, prefix, "bypass_mode", *actor.BypassMode)
+		}
+	}
+}
+
+func (w *rulesetWriter) refName(refName *model.RulesetRefName) {
+	w.line(2, "conditions:")
+	w.line(4, "ref_name:")
+	w.line(6, "# Branch names or fnmatch patterns in refs/heads/<name> form.")
+	w.line(6, "# include also accepts ~DEFAULT_BRANCH and ~ALL.")
+	if refName.Include != nil {
+		w.list(6, "include", *refName.Include)
+	}
+	if refName.Exclude != nil {
+		w.list(6, "exclude", *refName.Exclude)
+	}
+}
+
+func (w *rulesetWriter) rules(rules *model.RulesetRules) {
+	w.line(2, "rules:")
+	w.boolean(4, "creation", rules.Creation)
+	w.boolean(4, "update", rules.Update)
+	w.boolean(4, "deletion", rules.Deletion)
+	w.boolean(4, "required_linear_history", rules.RequiredLinearHistory)
+	w.boolean(4, "required_signatures", rules.RequiredSignatures)
+	w.boolean(4, "non_fast_forward", rules.NonFastForward)
+	if rules.PullRequest != nil {
+		w.pullRequest(rules.PullRequest)
+	}
+	if rules.RequiredStatusChecks != nil {
+		w.statusChecks(rules.RequiredStatusChecks)
+	}
+	if rules.CodeScanning != nil {
+		w.codeScanning(rules.CodeScanning)
+	}
+}
+
+func (w *rulesetWriter) pullRequest(rule *model.RulesetPullRequest) {
+	w.line(4, "pull_request:")
+	w.boolean(6, "enabled", rule.Enabled)
+	p := rule.Parameters
+	if p == nil {
+		return
+	}
+	w.line(6, "parameters:")
+	if p.RequiredApprovingReviewCount != nil {
+		w.line(8, "required_approving_review_count: %d", *p.RequiredApprovingReviewCount)
+	}
+	w.boolean(8, "dismiss_stale_reviews_on_push", p.DismissStaleReviewsOnPush)
+	w.boolean(8, "require_code_owner_review", p.RequireCodeOwnerReview)
+	w.boolean(8, "require_last_push_approval", p.RequireLastPushApproval)
+	w.boolean(8, "required_review_thread_resolution", p.RequiredReviewThreadResolution)
+	w.boolean(8, "require_extra_approval_for_unattributed_changes", p.RequireExtraApprovalForUnattributedChanges)
+	if p.AllowedMergeMethods != nil {
+		w.line(8, "# Any combination of %s. At least one.", strings.Join(model.RulesetMergeMethods, ", "))
+		w.list(8, "allowed_merge_methods", *p.AllowedMergeMethods)
+	}
+}
+
+func (w *rulesetWriter) statusChecks(rule *model.RulesetStatusChecks) {
+	w.line(4, "required_status_checks:")
+	w.boolean(6, "enabled", rule.Enabled)
+	p := rule.Parameters
+	if p == nil {
+		return
+	}
+	w.line(6, "parameters:")
+	if p.StrictRequiredStatusChecksPolicy != nil {
+		w.line(8, "# Require branches to be up to date before merging.")
+		w.boolean(8, "strict_required_status_checks_policy", p.StrictRequiredStatusChecksPolicy)
+	}
+	if p.DoNotEnforceOnCreate != nil {
+		w.line(8, "# Do not require status checks on creation.")
+		w.boolean(8, "do_not_enforce_on_create", p.DoNotEnforceOnCreate)
+	}
+	if p.RequiredStatusChecks == nil {
+		return
+	}
+	w.line(8, "# context is the check name as shown on a pull request. For a GitHub")
+	w.line(8, "# Actions job that is the job's name. integration_id is optional and")
+	w.line(8, "# restricts the check to one app; 15368 is GitHub Actions.")
+	if len(*p.RequiredStatusChecks) == 0 {
+		w.line(8, "required_status_checks: []")
+		return
+	}
+	w.line(8, "required_status_checks:")
+	for _, check := range *p.RequiredStatusChecks {
+		w.scalar(10, "- ", "context", check.Context)
+		if check.IntegrationID != nil {
+			w.line(10, "  integration_id: %d", *check.IntegrationID)
+		}
+	}
+}
+
+func (w *rulesetWriter) codeScanning(rule *model.RulesetCodeScanning) {
+	w.line(4, "code_scanning:")
+	w.boolean(6, "enabled", rule.Enabled)
+	p := rule.Parameters
+	if p == nil {
+		return
+	}
+	w.line(6, "parameters:")
+	if p.CodeScanningTools == nil {
+		return
+	}
+	w.line(8, "# tool is the tool name as GitHub shows it, for example CodeQL.")
+	w.line(8, "# alerts_threshold: %s", strings.Join(model.RulesetAlertsThresholds, ", "))
+	w.line(8, "# security_alerts_threshold: %s", strings.Join(model.RulesetSecurityAlertsThresholds, ", "))
+	if len(*p.CodeScanningTools) == 0 {
+		w.line(8, "code_scanning_tools: []")
+		return
+	}
+	w.line(8, "code_scanning_tools:")
+	for _, tool := range *p.CodeScanningTools {
+		w.scalar(10, "- ", "tool", tool.Tool)
+		w.scalar(10, "  ", "alerts_threshold", tool.AlertsThreshold)
+		w.scalar(10, "  ", "security_alerts_threshold", tool.SecurityAlertsThreshold)
+	}
+}
+
+// withLanguagesComment inserts the languages guidance comment before the
+// languages line, so the valid values in the config match the model.
+func withLanguagesComment(lines []string, valid []string) []string {
+	index := slices.IndexFunc(lines, func(line string) bool {
+		return strings.HasPrefix(line, "  languages:")
+	})
+	if index == -1 {
+		return lines
+	}
+	comment := []string{
+		"  # An empty list means GitHub detects the languages. Valid values:",
+		"  # " + strings.Join(valid, ", "),
+	}
+	return slices.Insert(lines, index, comment...)
+}
+
+// configTemplate uses text/template to control key order, blank lines between
+// swatch entries, guidance comments and omission of nil pointer fields.
 var configTemplate = template.Must(template.New("config").Funcs(templateFuncs).Parse(
 	`# {{ .Verb }} by tailor on {{ .Date }}
 license: {{ yamlVal .License }}
 
+{{- if .Languages }}
+{{- if or .GoDeclared .RustDeclared .PythonDeclared }}
+
+languages:
+{{- range languageLines .Languages }}
+{{ . }}
+{{- end }}
+{{- else }}
+
+languages: {}
+{{- end }}
+{{- end }}
+{{- if .MCP }}
+{{- if or .BlenderDeclared .PlaywrightDeclared }}
+
+# Model Context Protocol integrations are opt-in.
+mcp:
+{{- if .BlenderDeclared }}
+  blender: {{ .MCP.Blender }}
+{{- end }}
+{{- if .PlaywrightDeclared }}
+  playwright: {{ .MCP.Playwright }}
+{{- end }}
+{{- else }}
+
+mcp: {}
+{{- end }}
+{{- end }}
+
 {{- if .Repository }}
 
 repository:
-{{- range repositoryLines .Repository }}
+{{- range repositoryLines .Config }}
 {{ . }}
+{{- end }}
+{{- end }}
+{{- if .ImmutableReleases }}
+{{- if ne .ImmutableReleases.Enabled nil }}
+
+immutable_releases:
+  enabled: {{ .ImmutableReleases.Enabled }}
 {{- end }}
 {{- end }}
 {{- if .Actions }}
 
 actions:
+  # Options: all, local_only, selected. SHA pinning applies separately.
+  # selected requires github_owned_allowed, verified_allowed, and patterns_allowed.
 {{- range actionsLines .Actions }}
 {{ . }}
 {{- end }}
+{{- end }}
+{{- if .CodeScanning }}
+
+code_scanning:
+{{- range codeScanningLines .CodeScanning }}
+{{ . }}
+{{- end }}
+{{- end }}
+{{- if .CodeQuality }}
+
+code_quality:
+{{- range codeQualityLines .CodeQuality }}
+{{ . }}
+{{- end }}
+{{- end }}
+{{- if .Ruleset }}
+
+ruleset:
+{{- range rulesetLines .Ruleset }}
+{{ . }}
+{{- end }}
+{{- end }}
+{{- if .Pages }}
+
+# Pages is opt-in. Omission or enabled: false leaves Pages unmanaged.
+# generator: static (default) creates a starter in an empty path. Hugo and Jekyll need an existing site.
+# path: project-relative source directory, default pages.
+# branch: omit to use the current repository default branch.
+# cname: omit to preserve the domain, use "" to clear it, or set a domain.
+{{- $pagesLines := pagesLines .Pages }}
+pages:{{ if not $pagesLines }} {}{{ end }}
+{{- range $pagesLines }}
+{{ . }}
+{{- end }}
+  # branch: main
+  # cname: www.example.com
+  # Static only. Omit links to leave the page unchanged; {} clears its marked links.
+  # Use full HTTPS URLs, or a bare address for email. Empty values add no icon.
+  # links:
+  #   website: https://example.com
+  #   email: hello@example.com
 {{- end }}
 {{- if .Labels }}
 
@@ -125,6 +532,25 @@ labels:
 {{- end }}
 {{- end }}
 
+{{- if .Variables }}
+
+variables:
+{{- range $i, $v := .Variables }}
+{{ if $i }}
+{{ end }}  - name: {{ yamlVal $v.Name }}
+    value: {{ yamlQuoted $v.Value }}
+{{- end }}
+{{- else }}
+
+# Repository Actions variables are non-secret values.
+# Tailor creates or updates only declared variables and leaves others unchanged.
+# variables:
+#   - name: DEPLOY_REGION
+#     value: "eu-west-2"
+#   - name: RELEASE_SUFFIX
+#     value: ""
+{{- end }}
+
 swatches:
 {{- range $i, $s := .Swatches }}
 {{ if $i }}
@@ -134,6 +560,7 @@ swatches:
 `))
 
 // Write renders cfg to <dir>/.tailor.yml with the given header date and verb.
+// It replaces the file through a synced temporary file and preserves existing file permissions.
 func Write(dir string, cfg *Config, date string, verb string) (retErr error) {
 	var buf bytes.Buffer
 	if err := configTemplate.Execute(&buf, struct {
@@ -155,11 +582,11 @@ func Write(dir string, cfg *Config, date string, verb string) (retErr error) {
 	defer root.Close()
 
 	mode := os.FileMode(0o644)
-	info, err := root.Lstat(configPath)
+	info, err := root.Lstat(ConfigSwatchPath)
 	switch {
 	case err == nil:
 		if info.Mode()&os.ModeSymlink != 0 {
-			return fmt.Errorf("writing config: %s is a symbolic link", configPath)
+			return fmt.Errorf("writing config: %s is a symbolic link", ConfigSwatchPath)
 		}
 		if info.Mode().IsRegular() {
 			mode = info.Mode().Perm()
@@ -168,7 +595,7 @@ func Write(dir string, cfg *Config, date string, verb string) (retErr error) {
 		return fmt.Errorf("inspecting config: %w", err)
 	}
 
-	tempPath := configPath + ".tmp-" + rand.Text()
+	tempPath := ConfigSwatchPath + ".tmp-" + rand.Text()
 	temp, err := root.OpenFile(tempPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return fmt.Errorf("creating temporary config: %w", err)
@@ -202,7 +629,7 @@ func Write(dir string, cfg *Config, date string, verb string) (retErr error) {
 	}
 	tempOpen = false
 
-	if err := root.Rename(tempPath, configPath); err != nil {
+	if err := root.Rename(tempPath, ConfigSwatchPath); err != nil {
 		return fmt.Errorf("replacing config: %w", err)
 	}
 	tempPath = ""

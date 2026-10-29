@@ -16,14 +16,23 @@ import (
 	"github.com/wimpysworld/tailor/internal/config"
 	"github.com/wimpysworld/tailor/internal/gh"
 	"github.com/wimpysworld/tailor/internal/ghfake"
+	"github.com/wimpysworld/tailor/internal/output"
 	"github.com/wimpysworld/tailor/internal/swatch"
 	"github.com/wimpysworld/tailor/internal/testutil"
 )
 
-func TestFitNewDirectoryDefaultConfig(t *testing.T) {
+// fakeNoRepoAuth installs a valid token, a user API that returns octocat,
+// and no repository context.
+func fakeNoRepoAuth(t *testing.T) {
+	t.Helper()
+
 	ghfake.FakeAuth(t, "gho_test")
 	ghfake.FakeUserAPI(t, http.StatusOK, "octocat")
 	ghfake.FakeNoRepo(t)
+}
+
+func TestFitNewDirectoryDefaultConfig(t *testing.T) {
+	fakeNoRepoAuth(t)
 
 	dir := filepath.Join(t.TempDir(), "new-project")
 
@@ -39,17 +48,15 @@ func TestFitNewDirectoryDefaultConfig(t *testing.T) {
 	}
 	content := string(data)
 
-	// Licence uses the requested default.
 	if !strings.Contains(content, "license: BlueOak-1.0.0") {
 		t.Error("config missing 'license: BlueOak-1.0.0'")
 	}
 
-	// The default config includes all registered swatches.
-	if count := strings.Count(content, "- path:"); count != 16 {
-		t.Errorf("swatch count = %d, want 16", count)
+	// Go swatches stay out of the default config until Go is explicitly enabled.
+	if count := strings.Count(content, "- path:"); count != 25 {
+		t.Errorf("swatch count = %d, want 25", count)
 	}
 
-	// The default config includes the default repo settings.
 	wantSettings := []string{
 		"has_wiki:",
 		"has_discussions:",
@@ -70,21 +77,48 @@ func TestFitNewDirectoryDefaultConfig(t *testing.T) {
 			t.Errorf("config missing %q", s)
 		}
 	}
+}
 
-	// Default config omits merge_commit_title and merge_commit_message.
-	// Use leading newline+spaces to avoid matching squash_merge_commit_title.
-	if strings.Contains(content, "\n  merge_commit_title:") {
-		t.Error("default config should not contain merge_commit_title")
+func TestFitPlainOutputPreservesPathControls(t *testing.T) {
+	fakeNoRepoAuth(t)
+
+	dir := filepath.Join(t.TempDir(), "safe\ninjected")
+	var stdout, stderr strings.Builder
+	cmd := FitCmd{
+		Path: dir, License: "BlueOak-1.0.0",
+		output: output.New(&stdout, &stderr, output.Plain, output.WithTTY(true)),
 	}
-	if strings.Contains(content, "\n  merge_commit_message:") {
-		t.Error("default config should not contain merge_commit_message")
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("Run() error: %v", err)
+	}
+	want := fmt.Sprintf("Fitted %s with .tailor.yml\n", dir)
+	if got := stdout.String(); got != want {
+		t.Fatalf("plain fit output = %q, want exact legacy output %q", got, want)
+	}
+}
+
+func TestFitRichOutputEscapesPathControls(t *testing.T) {
+	fakeNoRepoAuth(t)
+	t.Setenv("TERM", "xterm-256color")
+	t.Setenv("NO_COLOR", "1")
+
+	dir := filepath.Join(t.TempDir(), "safe\ninjected")
+	var stdout, stderr strings.Builder
+	cmd := FitCmd{
+		Path: dir, License: "BlueOak-1.0.0",
+		output: output.New(&stdout, &stderr, output.Auto, output.WithTTY(true)),
+	}
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("Run() error: %v", err)
+	}
+	got := stdout.String()
+	if strings.Contains(got, "safe\ninjected") || !strings.Contains(got, `\x0a`) {
+		t.Fatalf("rich fit output did not escape the path newline:\n%q", got)
 	}
 }
 
 func TestFitExistingDirectoryWithoutConfig(t *testing.T) {
-	ghfake.FakeAuth(t, "gho_test")
-	ghfake.FakeUserAPI(t, http.StatusOK, "octocat")
-	ghfake.FakeNoRepo(t)
+	fakeNoRepoAuth(t)
 
 	dir := t.TempDir()
 
@@ -99,17 +133,66 @@ func TestFitExistingDirectoryWithoutConfig(t *testing.T) {
 	}
 }
 
-func TestFitExistingDirectoryWithConfigError(t *testing.T) {
+func TestFitDoesNotReadVariables(t *testing.T) {
 	ghfake.FakeAuth(t, "gho_test")
-	ghfake.FakeUserAPI(t, http.StatusOK, "octocat")
-	ghfake.FakeNoRepo(t)
+	ghfake.FakeRepo(t, "octocat", "my-project")
+	variableCalls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.Contains(r.URL.Path, "/actions/variables"):
+			variableCalls++
+			fmt.Fprint(w, `{"total_count":1,"variables":[{"name":"DEPLOY_REGION","value":"eu-west-2"}]}`)
+		case strings.HasSuffix(r.URL.Path, "/user"):
+			fmt.Fprint(w, `{"login":"octocat"}`)
+		case strings.HasSuffix(r.URL.Path, "/repos/octocat/my-project"):
+			fmt.Fprint(w, `{"squash_merge_commit_title":"PR_TITLE","squash_merge_commit_message":"PR_BODY","merge_commit_title":"PR_TITLE","merge_commit_message":"PR_BODY"}`)
+		default:
+			w.WriteHeader(http.StatusForbidden)
+			fmt.Fprint(w, `{"message":"Resource not accessible by personal access token"}`)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	restore := gh.SetNewRESTClientFunc(func(string) (*api.RESTClient, error) {
+		return testutil.NewTestClient(t, srv), nil
+	})
+	t.Cleanup(restore)
+	dir := t.TempDir()
+	var stdout, stderr strings.Builder
+	if code := run([]string{"fit", dir}, &stdout, &stderr); code != 0 {
+		t.Fatalf("fit = %d, stderr: %s", code, stderr.String())
+	}
+	if variableCalls != 0 {
+		t.Fatalf("variable requests = %d, want 0", variableCalls)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, ".tailor.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "\nvariables:") || !strings.Contains(string(data), "# variables:") {
+		t.Fatal("fit must write only the commented variables example")
+	}
+}
+
+func TestRunPlainFormatPreservesFitOutput(t *testing.T) {
+	fakeNoRepoAuth(t)
+	dir := filepath.Join(t.TempDir(), "plain-project")
+	var stdout, stderr strings.Builder
+	if code := run([]string{"--format=plain", "fit", dir}, &stdout, &stderr); code != 0 {
+		t.Fatalf("run() = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	want := fmt.Sprintf("Fitted %s with .tailor.yml\n", dir)
+	if got := stdout.String(); got != want {
+		t.Fatalf("stdout = %q, want %q", got, want)
+	}
+}
+
+func TestFitExistingDirectoryWithConfigError(t *testing.T) {
+	fakeNoRepoAuth(t)
 
 	dir := t.TempDir()
 
-	// Pre-create .tailor.yml.
-	if err := os.WriteFile(filepath.Join(dir, ".tailor.yml"), []byte("license: BlueOak-1.0.0\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
+	testutil.WriteConfig(t, dir, "license: BlueOak-1.0.0\n")
 
 	cmd := FitCmd{Path: dir, License: "BlueOak-1.0.0"}
 	err := cmd.Run()
@@ -127,9 +210,7 @@ func TestFitExistingDirectoryWithConfigError(t *testing.T) {
 }
 
 func TestFitLicenseNone(t *testing.T) {
-	ghfake.FakeAuth(t, "gho_test")
-	ghfake.FakeUserAPI(t, http.StatusOK, "octocat")
-	ghfake.FakeNoRepo(t)
+	fakeNoRepoAuth(t)
 
 	dir := filepath.Join(t.TempDir(), "license-none")
 
@@ -149,31 +230,25 @@ func TestFitLicenseNone(t *testing.T) {
 }
 
 func TestFitDescriptionNoRepoContext(t *testing.T) {
-	ghfake.FakeAuth(t, "gho_test")
-	ghfake.FakeUserAPI(t, http.StatusOK, "octocat")
-	ghfake.FakeNoRepo(t)
-
-	dir := filepath.Join(t.TempDir(), "with-desc")
-
-	cmd := FitCmd{Path: dir, License: "BlueOak-1.0.0", Description: "My project description"}
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("Run() error: %v", err)
-	}
-
-	data, err := os.ReadFile(filepath.Join(dir, ".tailor.yml"))
-	if err != nil {
-		t.Fatalf("ReadFile: %v", err)
-	}
-
-	if !strings.Contains(string(data), "description: My project description") {
-		t.Errorf("config does not contain description:\n%s", data)
+	for _, description := range []string{"My project description", ""} {
+		t.Run(description, func(t *testing.T) {
+			fakeNoRepoAuth(t)
+			dir := filepath.Join(t.TempDir(), "with-desc")
+			var stdout, stderr strings.Builder
+			if code := run([]string{"fit", dir, "--description=" + description}, &stdout, &stderr); code != 0 {
+				t.Fatalf("fit = %d, stderr: %s", code, stderr.String())
+			}
+			cfg, err := config.Load(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			testutil.AssertPtrEqual(t, cfg.Repository.Description, new(description), "description")
+		})
 	}
 }
 
 func TestFitNoRepoContextUsesDefaults(t *testing.T) {
-	ghfake.FakeAuth(t, "gho_test")
-	ghfake.FakeUserAPI(t, http.StatusOK, "octocat")
-	ghfake.FakeNoRepo(t)
+	fakeNoRepoAuth(t)
 
 	dir := filepath.Join(t.TempDir(), "defaults")
 
@@ -188,14 +263,12 @@ func TestFitNoRepoContextUsesDefaults(t *testing.T) {
 	}
 	content := string(data)
 
-	// Default repo settings should be present.
 	if !strings.Contains(content, "repository:") {
 		t.Error("config missing repository section")
 	}
 
-	// merge_commit_title and merge_commit_message should be absent
-	// because they are nil in the default embedded config.
-	// Use leading newline+spaces to avoid matching squash_merge_commit_title.
+	// The embedded defaults leave both merge_commit fields nil, so neither is written.
+	// The leading newline and spaces exclude squash_merge_commit_title matches.
 	if strings.Contains(content, "\n  merge_commit_title:") {
 		t.Error("default config should not contain merge_commit_title")
 	}
@@ -216,8 +289,13 @@ func TestFitNoRepoContextUsesDefaults(t *testing.T) {
 	}
 }
 
-func setupSwatchCommandTest(t *testing.T) (string, *strings.Builder, func(alter.ApplyMode) error) {
+// setupSwatchCommandTest fakes the auth and API paths that runAlter needs,
+// writes a three-swatch config with pre-existing first-fit and never files
+// into a fresh project directory, and changes into that directory.
+func setupSwatchCommandTest(t *testing.T) string {
 	t.Helper()
+
+	fakeNoRepoAuth(t)
 
 	dir := t.TempDir()
 	cfg := `license: none
@@ -229,36 +307,14 @@ swatches:
   - path: SUPPORT.md
     alteration: always
 `
-	if err := os.WriteFile(filepath.Join(dir, ".tailor.yml"), []byte(cfg), 0o644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
+	testutil.WriteConfig(t, dir, cfg)
+	if err := os.MkdirAll(filepath.Join(dir, ".github"), 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
 	}
-	for path, content := range map[string]string{
-		".envrc":                           "custom envrc\n",
-		".github/pull_request_template.md": "custom pull request template\n",
-	} {
-		fullPath := filepath.Join(dir, path)
-		if err := os.MkdirAll(filepath.Dir(fullPath), 0o755); err != nil {
-			t.Fatalf("MkdirAll: %v", err)
-		}
-		if err := os.WriteFile(fullPath, []byte(content), 0o644); err != nil {
-			t.Fatalf("WriteFile: %v", err)
-		}
-	}
-
-	var output strings.Builder
-	run := func(mode alter.ApplyMode) error {
-		cfg, err := config.Load(dir)
-		if err != nil {
-			return err
-		}
-		results, err := alter.ProcessSwatches(cfg, dir, mode, &alter.TokenContext{})
-		if err != nil {
-			return err
-		}
-		output.WriteString(alter.FormatOutput(nil, nil, results, mode))
-		return nil
-	}
-	return dir, &output, run
+	testutil.WriteFile(t, dir, ".envrc", "custom envrc\n")
+	testutil.WriteFile(t, dir, ".github/pull_request_template.md", "custom pull request template\n")
+	t.Chdir(dir)
+	return dir
 }
 
 func requireFileContent(t *testing.T, path, want string) {
@@ -272,18 +328,36 @@ func requireFileContent(t *testing.T, path, want string) {
 	}
 }
 
-func TestBasteCmdRun(t *testing.T) {
-	dir, output, run := setupSwatchCommandTest(t)
-	cmd := BasteCmd{run: run}
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("BasteCmd.Run() error: %v", err)
+func requireSwatchContent(t *testing.T, dir, path string) {
+	t.Helper()
+	want, err := swatch.Content(path)
+	if err != nil {
+		t.Fatalf("swatch.Content(%q): %v", path, err)
 	}
+	requireFileContent(t, filepath.Join(dir, path), string(want))
+}
 
+func TestRunBaste(t *testing.T) {
+	dir := setupSwatchCommandTest(t)
+
+	var stdout, stderr strings.Builder
+	code := run([]string{"baste"}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("run() = %d, want 0; stderr: %s", code, stderr.String())
+	}
 	want := "would copy:                          SUPPORT.md\n" +
+		"would copy:                          just/loader.just\n" +
+		"would copy:                          just/tailor.just\n" +
+		"would copy:                          nix/hooks.nix\n" +
+		"would copy:                          nix/hooks/core.nix\n" +
+		"would copy:                          nix/loader.nix\n" +
 		"skipped:                             .envrc (first-fit, exists)\n" +
-		"skipped:                             .github/pull_request_template.md (mode never)\n"
-	if output.String() != want {
-		t.Errorf("stdout =\n%s\nwant:\n%s", output.String(), want)
+		"skipped:                             .github/dependabot.yml (not configured or mode never)\n" +
+		"skipped:                             .github/pull_request_template.md (mode never)\n" +
+		"warning: review and add new Nix files to Git because Nix flakes exclude untracked files: `nix/hooks.nix`, `nix/hooks/core.nix`, `nix/loader.nix`\n"
+	if stdout.String() != want {
+		t.Errorf("stdout =\n%s\nwant:\n%s", stdout.String(), want)
 	}
 	requireFileContent(t, filepath.Join(dir, ".envrc"), "custom envrc\n")
 	requireFileContent(t, filepath.Join(dir, ".github/pull_request_template.md"), "custom pull request template\n")
@@ -292,52 +366,58 @@ func TestBasteCmdRun(t *testing.T) {
 	}
 }
 
-func TestAlterCmdRun(t *testing.T) {
-	dir, output, run := setupSwatchCommandTest(t)
-	cmd := AlterCmd{run: run}
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("AlterCmd.Run() error: %v", err)
-	}
+func TestRunAlter(t *testing.T) {
+	dir := setupSwatchCommandTest(t)
 
+	var stdout, stderr strings.Builder
+	code := run([]string{"alter"}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("run() = %d, want 0; stderr: %s", code, stderr.String())
+	}
 	want := "copied:                              SUPPORT.md\n" +
+		"copied:                              just/loader.just\n" +
+		"copied:                              just/tailor.just\n" +
+		"copied:                              nix/hooks.nix\n" +
+		"copied:                              nix/hooks/core.nix\n" +
+		"copied:                              nix/loader.nix\n" +
 		"skipped:                             .envrc (first-fit, exists)\n" +
-		"skipped:                             .github/pull_request_template.md (mode never)\n"
-	if output.String() != want {
-		t.Errorf("stdout =\n%s\nwant:\n%s", output.String(), want)
+		"skipped:                             .github/dependabot.yml (not configured or mode never)\n" +
+		"skipped:                             .github/pull_request_template.md (mode never)\n" +
+		"warning: review and add new Nix files to Git because Nix flakes exclude untracked files: `nix/hooks.nix`, `nix/hooks/core.nix`, `nix/loader.nix`\n"
+	if stdout.String() != want {
+		t.Errorf("stdout =\n%s\nwant:\n%s", stdout.String(), want)
 	}
 	requireFileContent(t, filepath.Join(dir, ".envrc"), "custom envrc\n")
 	requireFileContent(t, filepath.Join(dir, ".github/pull_request_template.md"), "custom pull request template\n")
-	wantSupport, err := swatch.Content("SUPPORT.md")
-	if err != nil {
-		t.Fatalf("swatch.Content(): %v", err)
-	}
-	requireFileContent(t, filepath.Join(dir, "SUPPORT.md"), string(wantSupport))
+	requireSwatchContent(t, dir, "SUPPORT.md")
 }
 
-func TestAlterCmdRunRecut(t *testing.T) {
-	dir, output, run := setupSwatchCommandTest(t)
-	cmd := AlterCmd{Recut: true, run: run}
-	if err := cmd.Run(); err != nil {
-		t.Fatalf("AlterCmd{Recut: true}.Run() error: %v", err)
-	}
+func TestRunAlterRecut(t *testing.T) {
+	dir := setupSwatchCommandTest(t)
 
+	var stdout, stderr strings.Builder
+	code := run([]string{"alter", "--recut"}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("run() = %d, want 0; stderr: %s", code, stderr.String())
+	}
 	want := "copied:                              SUPPORT.md\n" +
+		"copied:                              just/loader.just\n" +
+		"copied:                              just/tailor.just\n" +
+		"copied:                              nix/hooks.nix\n" +
+		"copied:                              nix/hooks/core.nix\n" +
+		"copied:                              nix/loader.nix\n" +
 		"overwritten:                         .envrc\n" +
-		"skipped:                             .github/pull_request_template.md (mode never)\n"
-	if output.String() != want {
-		t.Errorf("stdout =\n%s\nwant:\n%s", output.String(), want)
+		"skipped:                             .github/dependabot.yml (not configured or mode never)\n" +
+		"skipped:                             .github/pull_request_template.md (mode never)\n" +
+		"warning: review and add new Nix files to Git because Nix flakes exclude untracked files: `nix/hooks.nix`, `nix/hooks/core.nix`, `nix/loader.nix`\n"
+	if stdout.String() != want {
+		t.Errorf("stdout =\n%s\nwant:\n%s", stdout.String(), want)
 	}
-	wantEnvrc, err := swatch.Content(".envrc")
-	if err != nil {
-		t.Fatalf("swatch.Content(): %v", err)
-	}
-	requireFileContent(t, filepath.Join(dir, ".envrc"), string(wantEnvrc))
+	requireSwatchContent(t, dir, ".envrc")
 	requireFileContent(t, filepath.Join(dir, ".github/pull_request_template.md"), "custom pull request template\n")
-	wantSupport, err := swatch.Content("SUPPORT.md")
-	if err != nil {
-		t.Fatalf("swatch.Content(): %v", err)
-	}
-	requireFileContent(t, filepath.Join(dir, "SUPPORT.md"), string(wantSupport))
+	requireSwatchContent(t, dir, "SUPPORT.md")
 }
 
 func TestRunAlterMalformedConfigError(t *testing.T) {
@@ -345,9 +425,7 @@ func TestRunAlterMalformedConfigError(t *testing.T) {
 	ghfake.FakeNoRepo(t)
 
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, ".tailor.yml"), []byte("unknown: true\n"), 0o644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
+	testutil.WriteConfig(t, dir, "unknown: true\n")
 	t.Chdir(dir)
 
 	err := runAlter(alter.DryRun, io.Discard, io.Discard)
@@ -359,6 +437,209 @@ func TestRunAlterMalformedConfigError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "Run 'tailor fit <path>' to create a valid configuration") {
 		t.Errorf("error = %q, want fit guidance", err.Error())
+	}
+}
+
+func TestMeasurePythonPolicyStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name, policy, destination, status string
+	}{
+		{"equivalent", "[tool.ruff]\n", "ruff.toml", "present"},
+		{"conflicting-formatter", "[tool.black]\n", "ruff.toml", "warning"},
+		{"conflicting-types", "[tool.mypy]\n", "pyrightconfig.json", "warning"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "adoption required")
+			if err := os.Mkdir(dir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			for name, body := range map[string]string{
+				".tailor.yml":    "languages:\n  python: true\nswatches: []\n",
+				"pyproject.toml": tc.policy,
+			} {
+				if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Chdir(dir)
+			var stdout, stderr strings.Builder
+			cmd := MeasureCmd{output: output.New(&stdout, &stderr, output.Plain)}
+			if err := cmd.Run(); err != nil {
+				t.Fatal(err)
+			}
+			want := fmt.Sprintf("%-16s%s ", tc.status+":", tc.destination)
+			if !strings.Contains(stdout.String(), want) {
+				t.Fatalf("output missing %q:\n%s", want, stdout.String())
+			}
+		})
+	}
+}
+
+func TestMeasurePythonPolicyDestination(t *testing.T) {
+	for _, name := range []string{"ruff.toml", "pyrightconfig.json"} {
+		for _, kind := range []string{"missing", "regular", "directory", "symlink", "dangling"} {
+			t.Run(name+"/"+kind, func(t *testing.T) {
+				dir := t.TempDir()
+				if err := os.WriteFile(filepath.Join(dir, ".tailor.yml"), []byte("languages:\n  python: true\nswatches: []\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				path := filepath.Join(dir, name)
+				target := filepath.Join(t.TempDir(), "policy")
+				if kind != "dangling" {
+					if err := os.WriteFile(target, []byte("unchanged"), 0o644); err != nil {
+						t.Fatal(err)
+					}
+				}
+				want := "warning"
+				switch kind {
+				case "missing":
+					want = "missing"
+				case "regular":
+					want = "present"
+					if err := os.WriteFile(path, []byte("{}"), 0o644); err != nil {
+						t.Fatal(err)
+					}
+				case "directory":
+					if err := os.Mkdir(path, 0o755); err != nil {
+						t.Fatal(err)
+					}
+				default:
+					if err := os.Symlink(target, path); err != nil {
+						t.Fatal(err)
+					}
+				}
+				before, _ := os.Lstat(path)
+				t.Chdir(dir)
+				var stdout, stderr strings.Builder
+				cmd := MeasureCmd{output: output.New(&stdout, &stderr, output.Plain)}
+				if err := cmd.Run(); err != nil {
+					t.Fatal(err)
+				}
+				if !strings.Contains(stdout.String(), fmt.Sprintf("%-16s%s", want+":", name)) {
+					t.Fatalf("expected %s for %s:\n%s", want, name, stdout.String())
+				}
+				if want == "warning" && !strings.Contains(stdout.String(), "replace it with a regular file") {
+					t.Fatalf("missing repair guidance:\n%s", stdout.String())
+				}
+				after, err := os.Lstat(path)
+				if kind == "missing" {
+					if !os.IsNotExist(err) {
+						t.Fatalf("measure created destination: %v", err)
+					}
+				} else if err != nil || !os.SameFile(before, after) || before.Mode() != after.Mode() {
+					t.Fatalf("measure changed destination: %v", err)
+				}
+				if kind == "symlink" || kind == "dangling" {
+					if link, err := os.Readlink(path); err != nil || link != target {
+						t.Fatalf("measure changed symlink: %q, %v", link, err)
+					}
+				}
+				if kind == "regular" {
+					if body, err := os.ReadFile(path); err != nil || string(body) != "{}" {
+						t.Fatalf("measure changed policy: %q, %v", body, err)
+					}
+				}
+				body, err := os.ReadFile(target)
+				if kind == "dangling" {
+					if !os.IsNotExist(err) {
+						t.Fatalf("measure created symlink target: %v", err)
+					}
+				} else if err != nil || string(body) != "unchanged" {
+					t.Fatalf("measure changed target: %q, %v", body, err)
+				}
+			})
+		}
+	}
+}
+
+func TestMeasurePythonPolicyInspectionError(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	files := map[string]string{
+		".tailor.yml":           "languages:\n  python: true\nswatches: []\n",
+		"nested/pyproject.toml": "[tool.ruff\n",
+	}
+	for name, body := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Chdir(dir)
+	var stdout, stderr strings.Builder
+	cmd := MeasureCmd{output: output.New(&stdout, &stderr, output.Plain)}
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("health warning must not fail measure: %v", err)
+	}
+	for _, want := range []string{
+		fmt.Sprintf("%-16s%s", "warning:", "README.md"),
+		fmt.Sprintf("%-16s%s", "missing:", "LICENSE"),
+		fmt.Sprintf("%-16s%s", "warning:", "ruff.toml"),
+		fmt.Sprintf("%-16s%s", "warning:", "pyrightconfig.json"),
+		"reading Python policy",
+		filepath.Join(dir, "nested", "pyproject.toml"),
+		"not-configured:",
+	} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("output missing %q:\n%s", want, stdout.String())
+		}
+	}
+	for _, name := range []string{"ruff.toml", "pyrightconfig.json"} {
+		if strings.Contains(stdout.String(), fmt.Sprintf("%-16s%s", "present:", name)) {
+			t.Errorf("failed inspection reported %s as present", name)
+		}
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	if err := filepath.WalkDir(dir, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		name, err := filepath.Rel(dir, path)
+		if err != nil {
+			return err
+		}
+		before, ok := files[filepath.ToSlash(name)]
+		if !ok {
+			t.Errorf("measure created %s", name)
+		}
+		after, err := root.ReadFile(name)
+		if err != nil {
+			return err
+		}
+		if string(after) != before {
+			t.Errorf("measure changed %s", name)
+		}
+		delete(files, filepath.ToSlash(name))
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 0 {
+		t.Errorf("measure removed files: %v", files)
+	}
+}
+
+func TestMeasureCmdRejectsMalformedConfig(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ".tailor.yml"), []byte("languages: [\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	var stdout, stderr strings.Builder
+	cmd := MeasureCmd{output: output.New(&stdout, &stderr, output.Plain)}
+	if err := cmd.Run(); err == nil || !strings.Contains(err.Error(), "loading config:") {
+		t.Fatalf("expected fatal configuration error, got %v", err)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("invalid configuration produced a health report: %s", stdout.String())
 	}
 }
 
@@ -502,67 +783,6 @@ func TestRunUnknownFlag(t *testing.T) {
 	}
 }
 
-func TestRunFitWarningsToStderr(t *testing.T) {
-	ghfake.FakeAuth(t, "gho_test")
-	ghfake.FakeRepo(t, "octocat", "my-project")
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case strings.HasSuffix(r.URL.Path, "/user"):
-			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprint(w, `{"login":"octocat"}`)
-		case strings.HasSuffix(r.URL.Path, "/actions/permissions/workflow"):
-			w.WriteHeader(http.StatusForbidden)
-			fmt.Fprint(w, `{"message":"forbidden"}`)
-		case strings.HasSuffix(r.URL.Path, "/private-vulnerability-reporting"),
-			strings.HasSuffix(r.URL.Path, "/automated-security-fixes"):
-			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprint(w, `{"enabled":true}`)
-		case strings.HasSuffix(r.URL.Path, "/vulnerability-alerts"):
-			w.WriteHeader(http.StatusNoContent)
-		case strings.HasSuffix(r.URL.Path, "/repos/octocat/my-project"):
-			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprint(w, `{}`)
-		default:
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	t.Cleanup(srv.Close)
-	restore := gh.SetNewRESTClientFunc(func(string) (*api.RESTClient, error) {
-		return testutil.NewTestClient(t, srv), nil
-	})
-	t.Cleanup(restore)
-
-	dir := t.TempDir()
-	var stdout, stderr strings.Builder
-
-	code := run([]string{"fit", dir}, &stdout, &stderr)
-
-	if code != 0 {
-		t.Fatalf("run() = %d, want 0; stderr: %s", code, stderr.String())
-	}
-	if !strings.HasPrefix(stderr.String(), "warning: fetch workflow permissions") {
-		t.Errorf("stderr = %q, want plain warning prefix", stderr.String())
-	}
-	if !strings.HasSuffix(stderr.String(), "\n") {
-		t.Errorf("stderr = %q, want trailing newline", stderr.String())
-	}
-
-	// The live repository carries no description or homepage, so fit
-	// defaults them to the repository name and URL.
-	data, err := os.ReadFile(filepath.Join(dir, ".tailor.yml"))
-	if err != nil {
-		t.Fatalf("ReadFile: %v", err)
-	}
-	content := string(data)
-	if !strings.Contains(content, "description: my-project") {
-		t.Errorf("config does not contain 'description: my-project':\n%s", content)
-	}
-	if !strings.Contains(content, "homepage: https://github.com/octocat/my-project") {
-		t.Errorf("config does not contain default homepage:\n%s", content)
-	}
-}
-
 func TestRunBasteUsesCommandWriters(t *testing.T) {
 	ghfake.FakeAuth(t, "gho_test")
 	ghfake.FakeNoRepo(t)
@@ -582,9 +802,7 @@ func TestRunBasteUsesCommandWriters(t *testing.T) {
 
 	dir := t.TempDir()
 	configYAML := "license: none\nswatches:\n  - path: .gitignore\n    alteration: first-fit\n"
-	if err := os.WriteFile(filepath.Join(dir, ".tailor.yml"), []byte(configYAML), 0o644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
+	testutil.WriteConfig(t, dir, configYAML)
 	t.Chdir(dir)
 
 	var stdout, stderr strings.Builder

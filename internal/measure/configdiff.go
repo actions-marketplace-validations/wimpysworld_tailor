@@ -1,9 +1,7 @@
 package measure
 
 import (
-	"cmp"
 	"fmt"
-	"slices"
 
 	"github.com/wimpysworld/tailor/internal/config"
 	"github.com/wimpysworld/tailor/internal/swatch"
@@ -26,19 +24,22 @@ type DiffResult struct {
 	Detail   string
 }
 
-// CheckConfigDiff compares the loaded config's swatch list against the
-// default swatch set. Returns results grouped by category in the order:
-// not-configured, config-only, mode-differs. Within each category, entries
-// are sorted lexicographically by path.
+// CheckConfigDiff compares configured and default swatches, excluding paths that cfg.SwatchActive disables from both sets.
+// Results follow not-configured, config-only, mode-differs order, with paths sorted lexicographically within each category.
 func CheckConfigDiff(cfg *config.Config, defaults []swatch.Swatch) []DiffResult {
-	// Build lookup maps by path.
 	configByPath := make(map[string]config.SwatchEntry, len(cfg.Swatches))
 	for _, s := range cfg.Swatches {
+		if !cfg.SwatchActive(s.Path) {
+			continue
+		}
 		configByPath[s.Path] = s
 	}
 
 	defaultByPath := make(map[string]swatch.Swatch, len(defaults))
 	for _, s := range defaults {
+		if !cfg.SwatchActive(s.Path) {
+			continue
+		}
 		defaultByPath[s.Path] = s
 	}
 
@@ -46,6 +47,9 @@ func CheckConfigDiff(cfg *config.Config, defaults []swatch.Swatch) []DiffResult 
 
 	// Paths in default set but not in config.
 	for _, s := range defaults {
+		if !cfg.SwatchActive(s.Path) {
+			continue
+		}
 		if _, found := configByPath[s.Path]; !found {
 			notConfigured = append(notConfigured, DiffResult{
 				Path:     s.Path,
@@ -57,6 +61,9 @@ func CheckConfigDiff(cfg *config.Config, defaults []swatch.Swatch) []DiffResult 
 	// Paths in config but not in default set, or in both but with differing
 	// alteration mode.
 	for _, s := range cfg.Swatches {
+		if !cfg.SwatchActive(s.Path) {
+			continue
+		}
 		def, found := defaultByPath[s.Path]
 		if !found {
 			configOnly = append(configOnly, DiffResult{
@@ -72,12 +79,6 @@ func CheckConfigDiff(cfg *config.Config, defaults []swatch.Swatch) []DiffResult 
 		}
 	}
 
-	sortByPath := func(a, b DiffResult) int {
-		return cmp.Compare(a.Path, b.Path)
-	}
-	slices.SortFunc(notConfigured, sortByPath)
-	slices.SortFunc(configOnly, sortByPath)
-	slices.SortFunc(modeDiffers, sortByPath)
-
-	return slices.Concat(notConfigured, configOnly, modeDiffers)
+	return concatSortedByPath(func(r DiffResult) string { return r.Path },
+		notConfigured, configOnly, modeDiffers)
 }

@@ -1,10 +1,9 @@
 package gh
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
 	"maps"
+	"net/http"
 	"slices"
 	"strings"
 
@@ -24,6 +23,56 @@ type selectedActionsResponse struct {
 	PatternsAllowed    []string `json:"patterns_allowed"`
 }
 
+// ActionsRetentionResponse holds current retention days and the repository's allowed maximum.
+// Nil fields mean that GitHub did not return a value.
+type ActionsRetentionResponse struct {
+	Days               *int `json:"days"`
+	MaximumAllowedDays *int `json:"maximum_allowed_days"`
+}
+
+// ReadActionsRetention reads retention limits and returns access failures as warnings.
+func ReadActionsRetention(client *api.RESTClient, owner, name string) (*ActionsRetentionResponse, []error, error) {
+	path := fmt.Sprintf("repos/%s/%s/actions/permissions/artifact-and-log-retention", owner, name)
+	var retention ActionsRetentionResponse
+	var warnings []error
+	if err := boundedHTTPError(client.Get(path, &retention)); err != nil {
+		err = collectAccessWarning(err, Op(OpFetchActionsRetention), "fetching actions artifact and log retention", &warnings)
+		return nil, warnings, err
+	}
+	return &retention, nil, nil
+}
+
+// ValidateDays requires known retention limits and checks both Tailor's and GitHub's allowed ranges.
+func (r *ActionsRetentionResponse) ValidateDays(days int) error {
+	if days < 1 || days > 90 {
+		return fmt.Errorf("actions.artifact_and_log_retention.days must be between 1 and 90")
+	}
+	if r == nil || r.Days == nil || *r.Days < 1 {
+		return fmt.Errorf("current actions artifact and log retention days is unknown or invalid")
+	}
+	if r.MaximumAllowedDays == nil || *r.MaximumAllowedDays < 1 {
+		return fmt.Errorf("current actions artifact and log retention maximum_allowed_days is unknown or invalid")
+	}
+	if days > *r.MaximumAllowedDays {
+		return fmt.Errorf("actions.artifact_and_log_retention.days exceeds the allowed maximum of %d days", *r.MaximumAllowedDays)
+	}
+	return nil
+}
+
+// ApplyActionsRetention validates days and writes only when the retention period differs.
+func ApplyActionsRetention(client *api.RESTClient, owner, name string, days int, current *ActionsRetentionResponse) (*ApplyResult, error) {
+	if err := current.ValidateDays(days); err != nil {
+		return nil, err
+	}
+	result := &ApplyResult{}
+	if days == *current.Days {
+		return result, nil
+	}
+	path := fmt.Sprintf("repos/%s/%s/actions/permissions/artifact-and-log-retention", owner, name)
+	_, err := applyActionsWrite(client, path, map[string]any{"days": days}, Op(OpSetActionsRetention), result)
+	return result, err
+}
+
 // ReadActionsPolicy reads the configured repository Actions policy endpoints.
 func ReadActionsPolicy(client *api.RESTClient, owner, name string, selected bool) (*model.ActionsSettings, []error, error) {
 	base := fmt.Sprintf("repos/%s/%s/actions/permissions", owner, name)
@@ -33,11 +82,8 @@ func ReadActionsPolicy(client *api.RESTClient, owner, name string, selected bool
 	var permissions actionsPermissionsResponse
 	coreKnown := false
 	if err := boundedHTTPError(client.Get(base, &permissions)); err != nil {
-		classified := classifyHTTPError(err, Op(OpFetchActionsPermissions))
-		if isAccessError(classified) {
-			warnings = append(warnings, classified)
-		} else {
-			return nil, nil, fmt.Errorf("fetching actions permissions: %w", err)
+		if err := collectAccessWarning(err, Op(OpFetchActionsPermissions), "fetching actions permissions", &warnings); err != nil {
+			return nil, nil, err
 		}
 	} else {
 		coreKnown = true
@@ -52,11 +98,8 @@ func ReadActionsPolicy(client *api.RESTClient, owner, name string, selected bool
 	if selected && coreKnown && permissions.AllowedActions == "selected" {
 		var policy selectedActionsResponse
 		if err := boundedHTTPError(client.Get(base+"/selected-actions", &policy)); err != nil {
-			classified := classifyHTTPError(err, Op(OpFetchSelectedActionsPermissions))
-			if isAccessError(classified) {
-				warnings = append(warnings, classified)
-			} else {
-				return nil, nil, fmt.Errorf("fetching selected actions permissions: %w", err)
+			if err := collectAccessWarning(err, Op(OpFetchSelectedActionsPermissions), "fetching selected actions permissions", &warnings); err != nil {
+				return nil, nil, err
 			}
 		} else {
 			settings.GitHubOwnedAllowed = new(policy.GitHubOwnedAllowed)
@@ -120,7 +163,7 @@ func planActionsWriteOrder(desired, current *model.ActionsSettings, core, select
 }
 
 // applyRestrictAllThenSelected narrows an enabled "all" policy: the core write
-// switches to "selected" first, then the selected policy lands. When the
+// switches to "selected" first, then writes the selected policy. When the
 // update also relaxes SHA pinning, the initial core write keeps pinning
 // required and a final core write relaxes it after the selected policy exists.
 func applyRestrictAllThenSelected(client *api.RESTClient, base string, desired, current *model.ActionsSettings, coreBody, selectedBody map[string]any, result *ApplyResult) (*ApplyResult, error) {
@@ -324,9 +367,5 @@ func applyActionsWrite(client *api.RESTClient, path string, body map[string]any,
 }
 
 func putActionsPolicy(client *api.RESTClient, path string, body map[string]any) error {
-	payload, err := json.Marshal(body)
-	if err != nil {
-		return fmt.Errorf("marshalling actions permissions: %w", err)
-	}
-	return boundedHTTPError(client.Put(path, bytes.NewReader(payload), nil))
+	return sendJSON(client, http.MethodPut, path, body)
 }

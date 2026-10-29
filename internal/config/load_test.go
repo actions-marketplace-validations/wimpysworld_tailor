@@ -39,7 +39,9 @@ func TestLoadAcceptsSupportedTopLevelSettings(t *testing.T) {
 	testutil.WriteConfig(t, dir, `license: none
 repository: {}
 actions: {}
+mcp: {}
 labels: []
+variables: []
 swatches: []
 `)
 
@@ -57,12 +59,12 @@ func TestLoadRejectsUnknownTopLevelSettings(t *testing.T) {
 		{
 			name: "one",
 			yaml: "lables: []\nlicense: none\nswatches: []\n",
-			want: `unrecognised top-level setting "lables" in config; valid settings: actions, labels, license, repository, swatches`,
+			want: `unrecognised top-level setting "lables" in config; valid settings: actions, code_quality, code_scanning, immutable_releases, labels, languages, license, mcp, pages, repository, ruleset, swatches, variables`,
 		},
 		{
 			name: "multiple use sorted first key",
 			yaml: "zebra: true\nlicense: none\nswatches: []\nalpaca: true\n",
-			want: `unrecognised top-level setting "alpaca" in config; valid settings: actions, labels, license, repository, swatches`,
+			want: `unrecognised top-level setting "alpaca" in config; valid settings: actions, code_quality, code_scanning, immutable_releases, labels, languages, license, mcp, pages, repository, ruleset, swatches, variables`,
 		},
 	}
 
@@ -109,7 +111,7 @@ func TestLoadRejectsExternalConfigSymlinkWithoutBlocking(t *testing.T) {
 	if err := os.WriteFile(outside, []byte("license: none\nswatches: []\n"), 0o644); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
-	if err := os.Symlink(outside, filepath.Join(dir, configPath)); err != nil {
+	if err := os.Symlink(outside, filepath.Join(dir, ConfigSwatchPath)); err != nil {
 		t.Skipf("Symlink unavailable: %v", err)
 	}
 
@@ -134,7 +136,7 @@ func TestLoadRejectsExternalConfigSymlinkWithoutBlocking(t *testing.T) {
 
 func TestLoadRejectsConfigDirectory(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.Mkdir(filepath.Join(dir, configPath), 0o755); err != nil {
+	if err := os.Mkdir(filepath.Join(dir, ConfigSwatchPath), 0o755); err != nil {
 		t.Fatalf("Mkdir: %v", err)
 	}
 
@@ -147,7 +149,7 @@ func TestLoadRejectsConfigDirectory(t *testing.T) {
 
 func TestLoadRejectsConfigSpecialFile(t *testing.T) {
 	dir := t.TempDir()
-	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "unix", filepath.Join(dir, configPath))
+	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "unix", filepath.Join(dir, ConfigSwatchPath))
 	if err != nil {
 		t.Skipf("Unix sockets unavailable: %v", err)
 	}
@@ -168,7 +170,7 @@ func TestLoadRejectsConfigFIFONonBlocking(t *testing.T) {
 	}
 
 	dir := t.TempDir()
-	path := filepath.Join(dir, configPath)
+	path := filepath.Join(dir, ConfigSwatchPath)
 	if err := exec.CommandContext(t.Context(), "mkfifo", path).Run(); err != nil {
 		t.Skipf("FIFO unavailable: %v", err)
 	}
@@ -230,9 +232,7 @@ func TestLoadConfigSizeLimit(t *testing.T) {
 				prefix = append(prefix, bytes.Repeat([]byte{'x'}, tt.size-len(prefix))...)
 				data = prefix
 			}
-			if err := os.WriteFile(filepath.Join(dir, configPath), data, 0o644); err != nil {
-				t.Fatalf("WriteFile: %v", err)
-			}
+			testutil.WriteConfig(t, dir, string(data))
 
 			_, err := Load(dir)
 			if tt.wantSizeError {

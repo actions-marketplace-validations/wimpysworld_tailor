@@ -13,10 +13,19 @@ import (
 	"github.com/wimpysworld/tailor/internal/swatch"
 )
 
-// wantSpecOutput is the exact byte-for-byte expected output from the
-// specification when writing DefaultConfig("BlueOak-1.0.0") with date 2026-03-02.
+// wantSpecOutput is the expected output of Write for DefaultConfig("BlueOak-1.0.0") on 2026-03-02.
 const wantSpecOutput = `# Initially fitted by tailor on 2026-03-02
 license: BlueOak-1.0.0
+
+languages:
+  go: false
+  rust: false
+  python: false
+
+# Model Context Protocol integrations are opt-in.
+mcp:
+  blender: false
+  playwright: false
 
 repository:
   has_wiki: false
@@ -37,20 +46,137 @@ repository:
   automated_security_fixes_enabled: true
   default_workflow_permissions: read
   can_approve_pull_request_reviews: false
+  secret_scanning: enabled
+  secret_scanning_push_protection: enabled
+  secret_scanning_non_provider_patterns: enabled
+
+immutable_releases:
+  enabled: false
 
 actions:
+  # Options: all, local_only, selected. SHA pinning applies separately.
+  # selected requires github_owned_allowed, verified_allowed, and patterns_allowed.
   enabled: true
-  allowed_actions: selected
+  allowed_actions: all
   sha_pinning_required: false
-  github_owned_allowed: true
-  verified_allowed: true
-  patterns_allowed:
-    - "freerangebytes/setup-actionlint@*"
-    - "golang/govulncheck-action@*"
-    - "golangci/golangci-lint-action@*"
-    - "nick-fields/retry@*"
-    - "robherley/go-test-action@*"
-    - "softprops/action-gh-release@*"
+  fork_pr_contributor_approval:
+    approval_policy: first_time_contributors
+
+code_scanning:
+  state: configured
+  query_suite: default
+  threat_model: remote
+  # An empty list means GitHub detects the languages. Valid values:
+  # actions, c-cpp, csharp, go, java-kotlin, javascript-typescript, python, ruby, swift
+  languages: []
+
+code_quality:
+  state: not-configured
+  # An empty list means GitHub detects the languages. Valid values:
+  # csharp, go, java-kotlin, javascript-typescript, python, ruby
+  languages: []
+
+ruleset:
+  # Tailor manages one ruleset named "Tailor" and owns it entirely.
+  # active enforces the rules. disabled keeps the ruleset on GitHub but
+  # GitHub ignores it, so a hand-made ruleset can govern instead.
+  enforcement: active
+  bypass_actors:
+    # actor_type: RepositoryRole, Team, User, Integration, DeployKey
+    # RepositoryRole actor_id: 2 maintain, 4 write, 5 admin
+    # bypass_mode: always, pull_request, exempt
+    - actor_id: 5
+      actor_type: RepositoryRole
+      bypass_mode: always
+  conditions:
+    ref_name:
+      # Branch names or fnmatch patterns in refs/heads/<name> form.
+      # include also accepts ~DEFAULT_BRANCH and ~ALL.
+      include:
+        - ~DEFAULT_BRANCH
+      exclude: []
+  rules:
+    creation: false
+    update: false
+    deletion: true
+    required_linear_history: false
+    required_signatures: false
+    non_fast_forward: true
+    pull_request:
+      enabled: true
+      parameters:
+        required_approving_review_count: 1
+        dismiss_stale_reviews_on_push: true
+        require_code_owner_review: false
+        require_last_push_approval: false
+        required_review_thread_resolution: true
+        require_extra_approval_for_unattributed_changes: true
+        # Any combination of merge, squash, rebase. At least one.
+        allowed_merge_methods:
+          - squash
+          - rebase
+    required_status_checks:
+      enabled: false
+      parameters:
+        # Require branches to be up to date before merging.
+        strict_required_status_checks_policy: false
+        # Do not require status checks on creation.
+        do_not_enforce_on_create: false
+        # context is the check name as shown on a pull request. For a GitHub
+        # Actions job that is the job's name. integration_id is optional and
+        # restricts the check to one app; 15368 is GitHub Actions.
+        required_status_checks: []
+    code_scanning:
+      enabled: false
+      parameters:
+        # tool is the tool name as GitHub shows it, for example CodeQL.
+        # alerts_threshold: none, errors, errors_and_warnings, all
+        # security_alerts_threshold: none, critical, high_or_higher, medium_or_higher, all
+        code_scanning_tools:
+          - tool: CodeQL
+            alerts_threshold: errors
+            security_alerts_threshold: high_or_higher
+
+# Pages is opt-in. Omission or enabled: false leaves Pages unmanaged.
+# generator: static (default) creates a starter in an empty path. Hugo and Jekyll need an existing site.
+# path: project-relative source directory, default pages.
+# branch: omit to use the current repository default branch.
+# cname: omit to preserve the domain, use "" to clear it, or set a domain.
+pages:
+  enabled: false
+  generator: static
+  path: pages
+  links:
+    website: https://wimpys.world/
+    forum: ""
+    x: ""
+    bluesky: https://bsky.app/profile/wimpys.world
+    mastodon: "https://wimpysworld.social/@martin"
+    linkedin: https://linkedin.com/in/martinwimpress
+    slack: ""
+    discord: https://discord.com/invite/vUsydfP
+    matrix: "https://matrix.to/#/@wimpress:matrix.org"
+    youtube: https://youtube.com/WimpysWorld
+    twitch: https://twitch.tv/WimpysWorld
+    peertube: ""
+    tiktok: ""
+    podcast: https://linuxmatters.sh
+    instagram: ""
+    pixelfed: ""
+    steam: https://steamcommunity.com/id/wimpress/
+    itchio: https://wimpress.itch.io/
+    patreon: ""
+    github_sponsors: https://github.com/sponsors/flexiondotorg
+    kofi: ""
+    email: ""
+    feed: ""
+  # branch: main
+  # cname: www.example.com
+  # Static only. Omit links to leave the page unchanged; {} clears its marked links.
+  # Use full HTTPS URLs, or a bare address for email. Empty values add no icon.
+  # links:
+  #   website: https://example.com
+  #   email: hello@example.com
 
 labels:
   - name: bug
@@ -101,6 +227,14 @@ labels:
     color: df8e1d
     description: Hacktoberfest contribution
 
+# Repository Actions variables are non-secret values.
+# Tailor creates or updates only declared variables and leaves others unchanged.
+# variables:
+#   - name: DEPLOY_REGION
+#     value: "eu-west-2"
+#   - name: RELEASE_SUFFIX
+#     value: ""
+
 swatches:
   - path: .github/dependabot.yml
     alteration: first-fit
@@ -147,9 +281,51 @@ swatches:
   - path: cubic.yaml
     alteration: first-fit
 
+  - path: .github/workflows/tailor-pages.yml
+    alteration: always
+
+  - path: pages/index.html
+    alteration: first-fit
+
+  - path: pages/style.css
+    alteration: first-fit
+
+  - path: pages/theme.js
+    alteration: first-fit
+
+  - path: pages/icon.svg
+    alteration: first-fit
+
+  - path: wiki/Home.md
+    alteration: first-fit
+
+  - path: wiki/_Sidebar.md
+    alteration: first-fit
+
+  - path: wiki/_Footer.md
+    alteration: first-fit
+
+  - path: .github/workflows/tailor-wiki.yml
+    alteration: always
+
   - path: .tailor.yml
     alteration: always
 `
+
+// writeConfig writes cfg into a fresh temporary directory and returns the
+// content of the ConfigSwatchPath file that Write produced.
+func writeConfig(t *testing.T, cfg *Config, date, action string) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := Write(dir, cfg, date, action); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, ConfigSwatchPath))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	return string(got)
+}
 
 func TestWriteDefaultConfigMatchesSpec(t *testing.T) {
 	cfg, err := DefaultConfig("BlueOak-1.0.0")
@@ -157,18 +333,36 @@ func TestWriteDefaultConfigMatchesSpec(t *testing.T) {
 		t.Fatalf("DefaultConfig: %v", err)
 	}
 
-	dir := t.TempDir()
-	if err := Write(dir, cfg, "2026-03-02", "Initially fitted"); err != nil {
-		t.Fatalf("Write: %v", err)
-	}
+	got := writeConfig(t, cfg, "2026-03-02", "Initially fitted")
 
-	got, err := os.ReadFile(filepath.Join(dir, ".tailor.yml"))
-	if err != nil {
-		t.Fatalf("ReadFile: %v", err)
-	}
-
-	if string(got) != wantSpecOutput {
+	if got != wantSpecOutput {
 		t.Errorf("output does not match spec\n--- got ---\n%s\n--- want ---\n%s", got, wantSpecOutput)
+	}
+}
+
+func TestWriteMCP(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		mcp  *MCPSettings
+		want string
+	}{
+		{name: "absent"},
+		{name: "empty", mcp: &MCPSettings{}, want: "mcp: {}"},
+		{name: "disabled", mcp: &MCPSettings{Playwright: new(false)}, want: "mcp:\n  playwright: false"},
+		{name: "enabled", mcp: &MCPSettings{Playwright: new(true)}, want: "mcp:\n  playwright: true"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got := writeConfig(t, &Config{License: "MIT", MCP: tt.mcp}, "2026-09-18", "Altered")
+			if tt.want == "" {
+				if strings.Contains(got, "\nmcp:") {
+					t.Fatalf("output contains absent MCP section:\n%s", got)
+				}
+				return
+			}
+			if !strings.Contains(got, "\n"+tt.want+"\n") {
+				t.Fatalf("output does not contain %q:\n%s", tt.want, got)
+			}
+		})
 	}
 }
 
@@ -176,7 +370,6 @@ func TestWriteCreatesFile(t *testing.T) {
 	dir := t.TempDir()
 	configFile := filepath.Join(dir, ".tailor.yml")
 
-	// Confirm .tailor.yml does not exist before Write.
 	if _, err := os.Stat(configFile); err == nil {
 		t.Fatal(".tailor.yml already exists before Write")
 	}
@@ -365,22 +558,22 @@ repository:
   default_workflow_permissions: write
   can_approve_pull_request_reviews: true
 
+# Repository Actions variables are non-secret values.
+# Tailor creates or updates only declared variables and leaves others unchanged.
+# variables:
+#   - name: DEPLOY_REGION
+#     value: "eu-west-2"
+#   - name: RELEASE_SUFFIX
+#     value: ""
+
 swatches:
   - path: justfile
     alteration: first-fit
 `
 
-	dir := t.TempDir()
-	if err := Write(dir, cfg, "2026-03-02", "Initially fitted"); err != nil {
-		t.Fatalf("Write: %v", err)
-	}
+	got := writeConfig(t, cfg, "2026-03-02", "Initially fitted")
 
-	got, err := os.ReadFile(filepath.Join(dir, ".tailor.yml"))
-	if err != nil {
-		t.Fatalf("ReadFile: %v", err)
-	}
-
-	if string(got) != want {
+	if got != want {
 		t.Errorf("output mismatch with optional fields present\n--- got ---\n%s\n--- want ---\n%s", got, want)
 	}
 }
@@ -431,22 +624,22 @@ repository:
   default_workflow_permissions: read
   can_approve_pull_request_reviews: false
 
+# Repository Actions variables are non-secret values.
+# Tailor creates or updates only declared variables and leaves others unchanged.
+# variables:
+#   - name: DEPLOY_REGION
+#     value: "eu-west-2"
+#   - name: RELEASE_SUFFIX
+#     value: ""
+
 swatches:
   - path: justfile
     alteration: first-fit
 `
 
-	dir := t.TempDir()
-	if err := Write(dir, cfg, "2026-03-02", "Initially fitted"); err != nil {
-		t.Fatalf("Write: %v", err)
-	}
+	got := writeConfig(t, cfg, "2026-03-02", "Initially fitted")
 
-	got, err := os.ReadFile(filepath.Join(dir, ".tailor.yml"))
-	if err != nil {
-		t.Fatalf("ReadFile: %v", err)
-	}
-
-	if string(got) != want {
+	if got != want {
 		t.Errorf("output mismatch with optional fields omitted\n--- got ---\n%s\n--- want ---\n%s", got, want)
 	}
 }
@@ -465,19 +658,11 @@ func TestWriteYAMLSpecialCharactersQuoted(t *testing.T) {
 		},
 	}
 
-	dir := t.TempDir()
-	if err := Write(dir, cfg, "2026-03-04", "Initially fitted"); err != nil {
-		t.Fatalf("Write: %v", err)
-	}
-
-	got, err := os.ReadFile(filepath.Join(dir, ".tailor.yml"))
-	if err != nil {
-		t.Fatalf("ReadFile: %v", err)
-	}
+	got := writeConfig(t, cfg, "2026-03-04", "Initially fitted")
 
 	// The output must be valid YAML that round-trips through yaml.Unmarshal.
 	var parsed Config
-	if err := yaml.Unmarshal(got, &parsed); err != nil {
+	if err := yaml.Unmarshal([]byte(got), &parsed); err != nil {
 		t.Fatalf("output is not valid YAML: %v\n--- output ---\n%s", err, got)
 	}
 
@@ -486,6 +671,50 @@ func TestWriteYAMLSpecialCharactersQuoted(t *testing.T) {
 	}
 	if *parsed.Repository.Description != desc {
 		t.Errorf("round-tripped Description = %q, want %q", *parsed.Repository.Description, desc)
+	}
+}
+
+func TestWriteDescriptionUnicode(t *testing.T) {
+	tests := []struct {
+		name        string
+		description string
+		literal     string
+	}{
+		{"emoji", "Tailor 🪡", "🪡"},
+		{"quoted emoji", `Tailor: "🪡" #templates`, "🪡"},
+		{"emoji sequence", "Tools 👩🏽‍💻 🇬🇧 ❤️", "👩🏽‍💻 🇬🇧 ❤️"},
+		{"non-BMP text", "Letters 𐐀 and 𠮷", "𐐀 and 𠮷"},
+		{"literal escape", `Literal \U0001FAA1`, `\U0001FAA1`},
+		{"emoji and literal escape", `🪡: \U0001FAA1 \\U0001FAA1`, "🪡"},
+		{"backslash before emoji", `\🪡 \\🪡`, "🪡"},
+		{"non-printable non-BMP", "🪡\U000E0001", `\U000E0001`},
+		{"control characters", "🪡\n\t\r\x00\x1b\u0085\u2028\u2029", "🪡"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{
+				License: "MIT",
+				Repository: &model.RepositorySettings{
+					Description: &tt.description,
+				},
+			}
+			for _, verb := range []string{"Initially fitted", "Refitted"} {
+				written := writeConfig(t, cfg, "2026-09-06", verb)
+				if !strings.Contains(written, tt.literal) {
+					t.Errorf("%s output does not contain literal %q: %s", verb, tt.literal, written)
+				}
+				var parsed Config
+				if err := yaml.Unmarshal([]byte(written), &parsed); err != nil {
+					t.Fatalf("%s output is not valid YAML: %v", verb, err)
+				}
+				if parsed.Repository == nil || parsed.Repository.Description == nil {
+					t.Fatal("parsed Repository.Description is nil")
+				}
+				if *parsed.Repository.Description != tt.description {
+					t.Errorf("%s description = %q, want %q", verb, *parsed.Repository.Description, tt.description)
+				}
+			}
+		})
 	}
 }
 
@@ -515,22 +744,60 @@ func TestWriteDynamicScalarsRoundTrip(t *testing.T) {
 		},
 	}
 
-	dir := t.TempDir()
-	if err := Write(dir, cfg, "2026-08-25", "Refitted"); err != nil {
-		t.Fatalf("Write: %v", err)
-	}
-
-	written, err := os.ReadFile(filepath.Join(dir, ".tailor.yml"))
-	if err != nil {
-		t.Fatalf("ReadFile: %v", err)
-	}
+	written := writeConfig(t, cfg, "2026-08-25", "Refitted")
 
 	var parsed Config
-	if err := yaml.Unmarshal(written, &parsed); err != nil {
+	if err := yaml.Unmarshal([]byte(written), &parsed); err != nil {
 		t.Fatalf("output is not valid YAML: %v\n--- output ---\n%s", err, written)
 	}
 	if !reflect.DeepEqual(parsed, *cfg) {
 		t.Errorf("round-tripped config = %#v, want %#v", parsed, *cfg)
+	}
+}
+
+func TestWriteVariablesRoundTrip(t *testing.T) {
+	values := []string{"", "plain", "true", "123", " leading and trailing ", "\t \r\n", "line one\nline two\n", "\"quoted\" \\path", "café 日本 🧵", "{{GITHUB_USERNAME}}", "\\U0001F9F5 🧵", "\u0085\u2028\u2029"}
+	for _, value := range values {
+		t.Run(value, func(t *testing.T) {
+			cfg := &Config{
+				License:   "none",
+				Variables: []model.VariableEntry{{Name: "EXAMPLE", Value: new(value)}},
+			}
+			dir := t.TempDir()
+			if err := Write(dir, cfg, "2026-09-07", "Refitted"); err != nil {
+				t.Fatal(err)
+			}
+			got, err := Load(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got.Variables, cfg.Variables) {
+				t.Fatalf("variables = %#v, want %#v", got.Variables, cfg.Variables)
+			}
+			data, err := os.ReadFile(filepath.Join(dir, ConfigSwatchPath))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(data), "    value: \"") {
+				t.Fatalf("variable value is not double-quoted: %s", data)
+			}
+			if strings.Contains(string(data), "# variables:") {
+				t.Fatal("declared variables also include the commented example")
+			}
+		})
+	}
+}
+
+func TestWriteVariablesAbsent(t *testing.T) {
+	for _, variables := range [][]model.VariableEntry{nil, {}} {
+		cfg := &Config{License: "none", Variables: variables}
+		written := writeConfig(t, cfg, "2026-09-07", "Refitted")
+		if strings.Contains(written, "\nvariables:") {
+			t.Fatal("absent variables produced an active section")
+		}
+		if !strings.Contains(written, "# variables:") || !strings.Contains(written, "#     value: \"\"") {
+			t.Fatal("absent variables did not produce the commented example")
+		}
 	}
 }
 
@@ -557,18 +824,10 @@ func TestWriteHomepageRoundTrips(t *testing.T) {
 				},
 			}
 
-			dir := t.TempDir()
-			if err := Write(dir, cfg, "2026-03-04", "Initially fitted"); err != nil {
-				t.Fatalf("Write: %v", err)
-			}
-
-			got, err := os.ReadFile(filepath.Join(dir, ".tailor.yml"))
-			if err != nil {
-				t.Fatalf("ReadFile: %v", err)
-			}
+			got := writeConfig(t, cfg, "2026-03-04", "Initially fitted")
 
 			var parsed Config
-			if err := yaml.Unmarshal(got, &parsed); err != nil {
+			if err := yaml.Unmarshal([]byte(got), &parsed); err != nil {
 				t.Fatalf("output is not valid YAML: %v\n--- output ---\n%s", err, got)
 			}
 
@@ -595,25 +854,14 @@ func TestWriteTopicsPreserved(t *testing.T) {
 		},
 	}
 
-	dir := t.TempDir()
-	if err := Write(dir, cfg, "2026-03-10", "Refitted"); err != nil {
-		t.Fatalf("Write: %v", err)
-	}
-
-	got, err := os.ReadFile(filepath.Join(dir, ".tailor.yml"))
-	if err != nil {
-		t.Fatalf("ReadFile: %v", err)
-	}
-
-	output := string(got)
+	output := writeConfig(t, cfg, "2026-03-10", "Refitted")
 	if !strings.Contains(output, "topics:") {
 		t.Fatalf("output missing topics:\n%s", output)
 	}
 
-	// Round-trip through YAML to confirm topics survive.
 	var parsed Config
-	if err := yaml.Unmarshal(got, &parsed); err != nil {
-		t.Fatalf("output is not valid YAML: %v\n--- output ---\n%s", err, got)
+	if err := yaml.Unmarshal([]byte(output), &parsed); err != nil {
+		t.Fatalf("output is not valid YAML: %v\n--- output ---\n%s", err, output)
 	}
 
 	if parsed.Repository == nil || parsed.Repository.Topics == nil {
@@ -641,17 +889,9 @@ func TestWriteTopicsOmittedWhenNil(t *testing.T) {
 		},
 	}
 
-	dir := t.TempDir()
-	if err := Write(dir, cfg, "2026-03-10", "Refitted"); err != nil {
-		t.Fatalf("Write: %v", err)
-	}
+	got := writeConfig(t, cfg, "2026-03-10", "Refitted")
 
-	got, err := os.ReadFile(filepath.Join(dir, ".tailor.yml"))
-	if err != nil {
-		t.Fatalf("ReadFile: %v", err)
-	}
-
-	if strings.Contains(string(got), "topics:") {
+	if strings.Contains(got, "topics:") {
 		t.Errorf("output contains 'topics:' when Topics is nil:\n%s", got)
 	}
 }
@@ -669,25 +909,15 @@ func TestWriteEmptyTopicsRoundTrip(t *testing.T) {
 		},
 	}
 
-	dir := t.TempDir()
-	if err := Write(dir, cfg, "2026-03-10", "Refitted"); err != nil {
-		t.Fatalf("Write: %v", err)
-	}
-
-	got, err := os.ReadFile(filepath.Join(dir, ".tailor.yml"))
-	if err != nil {
-		t.Fatalf("ReadFile: %v", err)
-	}
-
-	output := string(got)
+	output := writeConfig(t, cfg, "2026-03-10", "Refitted")
 	if !strings.Contains(output, "topics: []") {
 		t.Fatalf("expected 'topics: []' in output, got:\n%s", output)
 	}
 
-	// Round-trip: parse back and verify Topics is non-nil empty slice.
+	// An explicit empty list must survive encoding so it can clear remote topics.
 	var parsed Config
-	if err := yaml.Unmarshal(got, &parsed); err != nil {
-		t.Fatalf("output is not valid YAML: %v\n--- output ---\n%s", err, got)
+	if err := yaml.Unmarshal([]byte(output), &parsed); err != nil {
+		t.Fatalf("output is not valid YAML: %v\n--- output ---\n%s", err, output)
 	}
 
 	if parsed.Repository == nil || parsed.Repository.Topics == nil {
@@ -706,24 +936,13 @@ func TestWriteNilRepositoryOmitted(t *testing.T) {
 		},
 	}
 
-	dir := t.TempDir()
-	if err := Write(dir, cfg, "2026-03-04", "Initially fitted"); err != nil {
-		t.Fatalf("Write: %v", err)
-	}
-
-	got, err := os.ReadFile(filepath.Join(dir, ".tailor.yml"))
-	if err != nil {
-		t.Fatalf("ReadFile: %v", err)
-	}
-
-	output := string(got)
+	output := writeConfig(t, cfg, "2026-03-04", "Initially fitted")
 	if strings.Contains(output, "repository:") {
 		t.Errorf("output contains 'repository:' when Repository is nil:\n%s", output)
 	}
 
-	// Must still be valid YAML.
 	var parsed Config
-	if err := yaml.Unmarshal(got, &parsed); err != nil {
-		t.Fatalf("output is not valid YAML: %v\n--- output ---\n%s", err, got)
+	if err := yaml.Unmarshal([]byte(output), &parsed); err != nil {
+		t.Fatalf("output is not valid YAML: %v\n--- output ---\n%s", err, output)
 	}
 }

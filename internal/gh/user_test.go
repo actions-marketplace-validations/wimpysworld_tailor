@@ -34,11 +34,7 @@ func TestFetchUsernameSuccess(t *testing.T) {
 }
 
 func TestFetchUsernameAPIError(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusUnauthorized)
-		fmt.Fprint(w, `{"message": "Bad credentials"}`)
-	}))
-	t.Cleanup(server.Close)
+	server := statusServer(t, http.StatusUnauthorized, `{"message": "Bad credentials"}`)
 
 	client := newTestClient(t, server)
 	_, err := FetchUsername(client)
@@ -52,47 +48,20 @@ func TestFetchUsernameHTTPErrorBoundsRenderedLiveResponse(t *testing.T) {
 	for i := range details {
 		details[i] = fmt.Sprintf("detail-%d-\x00\x1b[31m\t\r%s-PRIVATE-TAIL-%d", i, strings.Repeat("x", 300), i)
 	}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusUnauthorized)
-		if err := json.NewEncoder(w).Encode(map[string]any{
-			"message": "Bad credentials\x1b[2J",
-			"errors":  details,
-		}); err != nil {
-			t.Errorf("encode response: %v", err)
-		}
-	}))
-	t.Cleanup(server.Close)
+	body, err := json.Marshal(map[string]any{
+		"message": "Bad credentials\x1b[2J",
+		"errors":  details,
+	})
+	if err != nil {
+		t.Fatalf("encode response: %v", err)
+	}
+	server := statusServer(t, http.StatusUnauthorized, string(body))
 
-	_, err := FetchUsername(newTestClient(t, server))
+	_, err = FetchUsername(newTestClient(t, server))
 	if err == nil {
 		t.Fatal("FetchUsername() error = nil, want HTTP error")
 	}
-	var httpErr *api.HTTPError
-	if !errors.As(err, &httpErr) {
-		t.Fatalf("FetchUsername() error type = %T, want *api.HTTPError", err)
-	}
-	if httpErr.StatusCode != http.StatusUnauthorized {
-		t.Errorf("status = %d, want %d", httpErr.StatusCode, http.StatusUnauthorized)
-	}
-	if len(httpErr.Errors) != 3 {
-		t.Errorf("detail count = %d, want 3", len(httpErr.Errors))
-	}
-	rendered := err.Error()
-	if strings.ContainsAny(rendered, "\x00\x1b\r\t") {
-		t.Errorf("error contains terminal control characters: %q", rendered)
-	}
-	for i := range details {
-		if strings.Contains(rendered, details[i]) || strings.Contains(rendered, fmt.Sprintf("PRIVATE-TAIL-%d", i)) {
-			t.Errorf("error contains unbounded detail %d: %q", i, rendered)
-		}
-	}
-	if strings.Contains(rendered, "detail-3-") {
-		t.Errorf("error contains fourth detail: %q", rendered)
-	}
-	if len(rendered) > 1200 {
-		t.Errorf("rendered error length = %d, want at most 1200", len(rendered))
-	}
+	_ = assertBoundedHTTPError(t, err, http.StatusUnauthorized, details)
 }
 
 func TestFetchUsernameGitHubActionsDoesNotMaskAPIError(t *testing.T) {

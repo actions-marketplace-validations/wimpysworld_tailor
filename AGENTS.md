@@ -6,13 +6,15 @@ Tailor is a local terminal CLI for managing project templates (swatches) across 
 
 The authoritative specification is `docs/SPECIFICATION.md`. All implementation decisions must align with it.
 
+Keep the introduction and installation instructions in `README.md`. Put detailed user documentation in `wiki/`.
+
 ## Tech stack
 
 - **Language**: Go (1.26+)
 - **CLI parser**: [Kong](https://github.com/alecthomas/kong)
 - **GitHub auth**: `GH_TOKEN`/`GITHUB_TOKEN` env var, or `gh` (GitHub CLI) for keyring-based token access
 - **Swatch embedding**: Go `embed` directive (`swatches/` directory)
-- **Dev environment**: Nix flake with `gh`, `go`, `golangci-lint`, `just`
+- **Dev environment**: Nix flake with `gh`, `go`, `golangci-lint`, `govulncheck`, `just`
 
 ## Project structure
 
@@ -21,18 +23,29 @@ tailor/
 ├── .github/workflows/  # CI workflows
 ├── cmd/tailor/         # CLI entrypoint
 ├── internal/           # Internal packages (config, swatch, gh wrappers)
-├── swatches/           # Embedded template files (16 swatches)
+├── swatches/           # Embedded template files (21 swatches)
 ├── docs/               # Specification
 └── AGENTS.md
 ```
 
 ## Build and test commands
 
-- Build: `just build` (or `go build -ldflags "-s -w" -o tailor ./cmd/tailor`)
-- Run tests: `just test` (or `go test ./...`)
-- Run linters: `just lint` (or `gocyclo -over 30 -top 20 -avg -ignore '_test\.go$' . && golangci-lint run && actionlint`)
+- Use only `just build`, `just test`, and `just lint` for quality work.
+- Use `just lint` or `just lint check` for read-only checks. Use `just lint correct` explicitly to tidy modules and format source.
+- Run full vet once in `just test`, then tests with console coverage. Do not create `coverage.out`.
+- Keep Go bodies inline in the core, selected only by explicit Go enablement. Keep `just/go.just` as an empty compatibility import.
+- Put project quality work in optional `just/project/build.sh`, `test.sh`, or `lint.sh` scripts. The lint script receives `check` or `correct`.
+- Keep script check mode read-only. Reject symlinks and non-regular scripts or parents.
+- Build Tailor's stripped root binary through `just/project/build.sh`, after the managed build succeeds.
+- Keep `.golangci.yml` as an ordinary first-fit swatch. Customise that file directly, not `.tailor.yml`.
+- Preserve first-fit lint files during normal alterations. `always` and `--recut` replace them with the shared default.
+- Keep shared security exceptions scoped. See `wiki/Configuration.md`.
+- Keep setup and release operational and outside quality commands. Never run them implicitly.
 - Enter dev shell: `nix develop` or `direnv allow`
 - Task runner: `just` (lists available recipes)
+- Call `tailor alter`, `tailor baste`, and `tailor measure` directly, without Just wrappers.
+- From this source checkout, use `go run ./cmd/tailor <command>`.
+- Run `tailor baste` separately for an authenticated preview. `tailor measure` checks local health without authentication.
 - Create release: `just release 0.1.0`
 
 ## Code style
@@ -45,25 +58,98 @@ tailor/
 - Swatch-to-path mappings and default alteration modes are hardcoded in source, not configurable
 - Field names in the `repository` config section match GitHub REST API names exactly (snake_case)
 - Three alteration modes: `always`, `first-fit`, `never`
-- Adding a new swatch requires: the file in `swatches/`, a registry entry (`registry.go`), an entry in `swatches/.tailor.yml`, updated count assertions in `registry_test.go` and any golden-string test fixtures, plus updates to `docs/SPECIFICATION.md` and `README.md`
+- Adding a new swatch requires: the file in `swatches/`, a registry entry (`registry.go`), an entry in `swatches/.tailor.yml`, updated count assertions in `registry_test.go` and any golden-string test fixtures, plus updates to `docs/SPECIFICATION.md` and `wiki/Configuration.md`
 
 ## Testing
 
 - Table-driven tests following Go conventions
 - Test files sit alongside the code they test (`*_test.go`)
 - Test swatch embedding and config parsing without network access
+- Stub external policy commands in managed recipe tests. Normal tests must not run live vulnerability scans.
+- Keep benchmark and profile recipes as future work.
 - Commands that call `gh` should have their external calls abstracted behind interfaces for testability
 - Test authentication through local `GH_TOKEN`, `GITHUB_TOKEN`, and `gh` credential paths only
 - `measure` is purely local and needs no mocking
 - `measure` emits `warning` results for three local health diagnostics: missing `README.md` (not managed by tailor), `LICENSE` files containing unresolved placeholder tokens (e.g. `[year]`, `[fullname]`), and `LICENSE` files that exist but were not inspected (over 1 MiB or unreadable)
 - `README.md` is checked by exact path at the project root; it is a local diagnostic, not a swatch or config-diff item
 
+### Managed development and browser setup
+
+- To activate Playwright in a target repository, set this declaration in `.tailor.yml`:
+
+  ```yaml
+  mcp:
+    playwright: true
+  ```
+
+- Keep Playwright independent of Pages. Activation does not require `pages.enabled: true` and creates no Playwright Just fragment.
+- Optionally run `tailor baste` for a read-only preview before `tailor alter`.
+- Apply with `tailor alter` only within the approved scope. The command can also change other declared files and repository settings.
+- Preserve existing `justfile` and `flake.nix` roots, including under `--recut` and `always`.
+- If absent, manually add `import 'just/loader.just'` to the preserved `justfile`.
+- If absent, manually append `++ import ./nix/loader.nix { inherit pkgs; }` to the preserved flake's package list.
+- Create MCP starters only at missing `.mcp.json`, `.codex/config.toml`, `opencode.json`, and `.pi/mcp.json` destinations.
+- For existing client files, manually adopt only missing Playwright entries from the corresponding `swatches/` starter. Preserve disabled servers and unrelated settings.
+- Review generated Nix files before staging them with normal approval. Nix flakes exclude untracked files.
+- Enter the target's Nix dev shell with `nix develop`, or use `direnv allow` after review and normal approval.
+- Restart the selected client from that shell to load the new configuration and `playwright-mcp` executable. Keep normal MCP approvals.
+- Never change global trust, tool approvals, network exposure, or sandbox settings to make browser setup work.
+- When `mcp.playwright` is false, remove only the owned `nix/playwright.nix` package fragment among Playwright destinations. Preserve client configurations.
+- Warn that retained client configurations can lose the `playwright-mcp` executable. Manually disable or remove their Playwright entries when appropriate.
+- When `mcp.playwright` is absent, leave Playwright destinations untouched.
+
+### Blender MCP
+
+- Use `mcp.blender: true` for the patched bridge, extension ZIP helper, owned patch, and missing shared starters.
+- Build the bridge and extension from the same patched source through `nix/lib/blender.nix`. Keep Blender and extension installation separate.
+- Preserve the upstream pin unless an upgrade is explicit. Keep `import_local_glb` and `capture_matched_views` in the owned patch.
+- Remove only the owned Blender fragment, helper, and patch on false. Preserve them when the declaration is absent.
+- For preserved roots, adopt the extension package output manually with the same overridden `pkgs` as both loaders.
+- Keep the listener on loopback. For an unsaved blank scene, require an explicit local GLB import root, otherwise keep it blank.
+- Preserve existing clients and disabled entries. Use manual adoption for `blender-agent-bridge`, including under `always` and `--recut`.
+- Keep `BLENDER_BRIDGE_TOKEN` out of tracked files and arguments. Do not grant script trust or weaken sandbox restrictions.
+- Use native Pi fields for new Blender entries. Read the installed Pi MCP documentation and adapter configuration documentation before changes.
+- Preserve existing Playwright launcher bytes and proxy handling. Do not migrate client files automatically.
+- Treat parsed configuration as syntax evidence only. Require fresh-client and extension compatibility checks before runtime acceptance.
+
+### Browser validation
+
+- Use the Nix dev shell, which provides `playwright-mcp` with Chromium.
+- For Pages validation, optionally start `just pages`, or reuse its existing server at `http://127.0.0.1:18473`.
+- Validate generated setup through a newly started client that loads the target configuration, not the existing repository MCP instance.
+- Record the loaded configuration and executable evidence without secrets. Open a unique loopback fixture through that client's configured MCP.
+- Check page content and browser requests. If a fresh client is unavailable, report browser acceptance as pending with restart steps.
+- Use the configured Playwright MCP, which launches its own headless, isolated browser. Do not start a separate CDP endpoint or a manual stdio process.
+- Under Fence, Pi's `.pi/mcp.json` launcher forwards `HTTPS_PROXY` to `--proxy-server` when set. Do not assume that other providers use this proxy configuration.
+- Confirm that the actual CSS, fonts, and icons load before drawing visual conclusions. Report failed loads separately from site defects. Do not quietly mirror assets to make validation pass.
+
 ## Key implementation details
 
-- Swatches are embedded at build time via `//go:embed swatches/*`
+- Swatches are embedded recursively at build time via `//go:embed all:swatches`, including private nested hook templates.
+- Accept Boolean `languages.go` or a mapping with required `enabled` and optional Boolean `cgo` and `ffmpeg-statigo`.
+- Use `EffectiveGoCGO()` for development policy. Keep release generation and source discovery at `CGO_ENABLED=0`.
+- Keep `nix/loader.nix` list-valued and hook strings in typed `nix/hooks.nix` imports. Run helpers first and the core host prepend last.
+- Preserve existing target roots. Document manual hook composition with custom hooks last and the same overridden `pkgs` for both loaders.
+- Prepend component runtime libraries on all Linux hosts. Limit host-driver discovery to runtime `ID=nixos` unless `TAILOR_NIXOS_DRIVERS=0`.
+- Keep host drivers first. Default Vulkan ICD discovery in the core hook, independently of ffmpeg-statigo. Preserve explicit scalar values, including empty values.
+- Supply Staticcheck through generic Go. Build with the caller's Go and preserve sources and overrides at or above the managed floor.
+- Keep delivery tools in Ebitengine tooling, including Linux Avahi. Keep scientific Python libraries and the Blender application excluded.
+- Keep Android SDK consent scoped to its separate shell. Prioritise SDK tools and `jdk.home/bin`, and run shared hooks once.
+- Preserve existing Android outputs. Document manual migration, duplicate declaration removal, and custom hooks last with the same overridden `pkgs`.
+- Supply reusable FiveHorizons tooling through Tailor. Keep assets, engine pins, signing, and application recipes project-owned.
+- Do not edit or migrate FiveHorizons unless separately authorised. Do not claim runtime acceptance from parsing or tool availability.
+- Never auto-run component setup. Explicit `just setup` can change Git config and submodules, remove archives, stage changes, and use the network.
 - Five commands: `fit` (bootstrap), `alter` (apply), `baste` (preview), `measure` (inspect), `docket` (inspect)
 - `fit`, `alter`, and `baste` require a valid GitHub auth token at startup; `measure` and `docket` do not
-- Run `alter` stages in this order: config migration and update, retired workflow cleanup, repository settings, Actions policy, labels, licence, then swatches
+- After wiki readiness passes, write config updates, remove retired workflows, apply repository settings, then immutable releases. Continue with Actions policy, code scanning, Code Quality, ruleset, labels, variables, Pages, wiki, licence, then swatches.
+- Run Pages preflight before config or remote writes. Apply additive Pages ignore rules after swatches.
+- Validate config and complete local wiki safety preflight before writes. Activate the four wiki swatches only for declared `repository.has_wiki: true` on public repositories.
+- For a declared public wiki, enable a disabled wiki with an early PATCH containing only `has_wiki: true`. Stop `alter` on readiness blockers before all remaining writes. Report confirmed enablement even when readiness fails.
+- Keep wiki readiness checks read-only through isolated Git reads. Never import files automatically or change remote wiki history. Distinguish access and network failures from a confirmed empty wiki. Direct first-page creation to the repository's exact `/wiki` URL.
+- Require imported `wiki/.tailor-wiki-base` adoption, or a valid publisher trailer with matching remote tree and source ancestry. Require reviewed reimport after independent remote edits. See `docs/SPECIFICATION.md` for the readiness checks.
+- Keep `baste` free of writes. Report wiki readiness blockers and continue the full preview without failing solely for those blockers.
+- Preserve existing wiki starter pages, including recut. Explicit `has_wiki: false` removes only the marked wiki workflow and preserves source files.
+- Keep wiki publishing independent of Pages.
 - Before strict path and mode validation, prune `.github/workflows/tailor-automerge.yml` and `.github/workflows/tailor.yml` from config
 - Accept legacy `triggered` only for these retired entries during migration
 - Always check both fixed retired paths, regardless of config or mode
@@ -75,10 +161,24 @@ tailor/
 - Licences fetched via GitHub REST API (`GET /licenses/{id}`), not embedded
 - Several repository settings use separate API endpoints rather than the main repo PATCH: `topics`, `default_workflow_permissions`, and `can_approve_pull_request_reviews`; see `internal/gh/settings.go` for implementation
 - `labels` is a top-level config section with its own API layer (`internal/gh/labels.go`) and alter layer (`internal/alter/labels.go`), separate from repository settings
+- `code_scanning` is a top-level config section for CodeQL default setup with its own API layer (`internal/gh/codescanning.go`) and alter layer (`internal/alter/codescanning.go`); it uses `GET`/`PATCH /repos/{owner}/{repo}/code-scanning/default-setup`
+- `code_quality` is a top-level config section for GitHub Code Quality with its own API layer (`internal/gh/codequality.go`) and alter layer (`internal/alter/codequality.go`); it uses `GET`/`PATCH /repos/{owner}/{repo}/code-quality/setup`
+- `secret_scanning`, `secret_scanning_push_protection`, and `secret_scanning_non_provider_patterns` are `repository` fields that travel in the `security_and_analysis` object of the repository PATCH body; send only the declared keys
+- Push protection and non-provider patterns (the GitHub UI calls them generic patterns) require secret scanning: normalise `secret_scanning` to `enabled` with a warning, on the same write path as the automated security fixes prerequisite
+- Free features only: expose no setting that needs a paid plan, an Advanced Security or Secret Protection licence, a self-hosted runner, or AI credit spend; never manage `runner_type`, `runner_label`, `ai_findings_option`, or `security_and_analysis` keys other than the three managed keys
+- An empty `languages` list in `code_scanning` or `code_quality` sends no `languages` field, so GitHub detects the languages; a non-empty list is the complete set, compared as a set (unlike `topics`, where an empty list clears all topics)
+- Default setup writes return `202`; report `409` as `would skip (setup in progress)` and `403` as `would skip (not available)`, and continue
+- `ruleset` is a top-level config section that manages one branch ruleset named `Tailor` with its own API layer (`internal/gh/ruleset.go`) and alter layer (`internal/alter/ruleset.go`); it uses list, get, `POST`, and `PUT` on `/repos/{owner}/{repo}/rulesets`
+- Tailor owns the `Tailor` ruleset entirely: every write sends the complete ruleset, and Tailor never deletes it or touches any other ruleset
+- The `rules` map keys are API rule types; `enabled` on `pull_request`, `required_status_checks`, and `code_scanning` is Tailor's own key, because these three rules carry parameters that stay in the config while the rule is off
+- The ruleset `code_scanning` rule is off by default with one `CodeQL` entry at `errors` and `high_or_higher`, because the rule blocks a merge until the tool has results for both the pull request commit and the base branch, and do not cross-check it against the top-level `code_scanning.state`
+- `enforcement` accepts `active` or `disabled` only; `evaluate` is Enterprise only and is rejected
+- When `allowed_merge_methods` names a method whose `repository` setting is `false`, emit `warning: ruleset allows <method> merging but repository.<field> is false` and continue without changing either value
+- Ruleset writes return `201` (`POST`) or `200` (`PUT`); report `403` as `would skip (not available)` and a read without `bypass_actors` as `would skip (insufficient scope)`, and continue; stop on `422`
 - `validate.go` includes enum validation for `default_workflow_permissions` ("read"|"write"), topic format validation (lowercase alphanumeric start, max 50 chars, lowercase alphanumerics and hyphens only), and label validation (name length, hex colour, description length, duplicate detection)
 - Dry-run output uses dynamically computed label width for `baste` and fixed 16 chars for `measure`
 - `measure` output order: `missing`, `warning`, `present`, then config-diff categories (`not-configured`, `config-only`, `mode-differs`)
-- Branch protection (classic rules and rulesets) is out of scope
+- Classic branch protection rules are out of scope; rulesets outside the `Tailor` ruleset are out of scope
 
 ## Commit guidelines
 
@@ -102,7 +202,7 @@ tailor/
 - Never make alteration modes runtime-configurable; `always`, `first-fit`, `never` are compile-time constants
 - Keep Tailor as a local terminal CLI; never add GitHub Actions runtime detection, execution fallbacks, or installation-token handling
 - Keep Tailor's own CI, the Dependabot swatch, and repository workflow permission settings
-- Never implement branch protection (classic rules or rulesets) - out of scope by design
+- Never implement classic branch protection rules, and never read, write, or delete a ruleset other than `Tailor`
 - Never log or store GitHub tokens
 - Field names in `repository` config must match GitHub REST API names exactly; never rename or alias them
 - Swatch-to-path mappings are hardcoded in source, not configurable at runtime

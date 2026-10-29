@@ -1,6 +1,8 @@
+// Package testutil provides local HTTP, filesystem and terminal fixtures for tests.
 package testutil
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,13 +12,14 @@ import (
 	"github.com/cli/go-gh/v2/pkg/api"
 )
 
-// TestTransport redirects all requests to the test server, preserving the
+// testTransport redirects all requests to the test server, preserving the
 // original request path so the test handler can route by path.
-type TestTransport struct {
+type testTransport struct {
 	Server *httptest.Server
 }
 
-func (t *TestTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+// RoundTrip redirects a cloned request so the caller's request remains unchanged.
+func (t *testTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	clone := req.Clone(req.Context())
 	clone.URL.Scheme = "http"
 	clone.URL.Host = t.Server.Listener.Addr().String()
@@ -30,7 +33,7 @@ func NewTestClient(t *testing.T, server *httptest.Server) *api.RESTClient {
 	client, err := api.NewRESTClient(api.ClientOptions{
 		Host:      "github.com",
 		AuthToken: "test-token",
-		Transport: &TestTransport{Server: server},
+		Transport: &testTransport{Server: server},
 	})
 	if err != nil {
 		t.Fatalf("NewRESTClient: %v", err)
@@ -38,42 +41,57 @@ func NewTestClient(t *testing.T, server *httptest.Server) *api.RESTClient {
 	return client
 }
 
+// FailingServer creates an httptest server that replies 500 with a GitHub
+// style error body to every request. The server closes when the test ends.
+func FailingServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprint(w, `{"message":"Internal Server Error"}`)
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+// WriteFile writes content to filepath.Join(dir, name) and fails the test
+// on error. The parent directory must already exist.
+func WriteFile(t *testing.T, dir, name, content string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+}
+
 // CreateFile creates a file at filepath.Join(dir, name) with dummy content.
 // Parent directories are created as needed.
 func CreateFile(t *testing.T, dir, name string) {
 	t.Helper()
-	path := filepath.Join(dir, name)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(filepath.Join(dir, name)), 0o755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
-	if err := os.WriteFile(path, []byte("test"), 0o644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
+	WriteFile(t, dir, name, "test")
 }
 
 // WriteConfig writes a .tailor.yml file in dir with the given content.
 func WriteConfig(t *testing.T, dir, content string) {
 	t.Helper()
-	if err := os.WriteFile(filepath.Join(dir, ".tailor.yml"), []byte(content), 0o644); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
+	WriteFile(t, dir, ".tailor.yml", content)
 }
 
-// AssertPtr checks a pointer field. When wantNil is true, it expects got to
-// be nil. Otherwise it expects got to be non-nil with value wantVal.
-func AssertPtr[T comparable](t *testing.T, got *T, wantNil bool, wantVal T, field string) {
+// AssertPtrEqual compares nil status and pointed-to values, reporting field on a mismatch.
+func AssertPtrEqual[T comparable](t *testing.T, got, want *T, field string) {
 	t.Helper()
-	if wantNil {
+	if want == nil {
 		if got != nil {
 			t.Errorf("%s = %#v, want nil", field, *got)
 		}
 		return
 	}
 	if got == nil {
-		t.Errorf("%s is nil, want %#v", field, wantVal)
+		t.Errorf("%s is nil, want %#v", field, *want)
 		return
 	}
-	if *got != wantVal {
-		t.Errorf("%s = %#v, want %#v", field, *got, wantVal)
+	if *got != *want {
+		t.Errorf("%s = %#v, want %#v", field, *got, *want)
 	}
 }
