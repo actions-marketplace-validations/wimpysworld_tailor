@@ -7,11 +7,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1790292238,
-        "narHash": "sha256-+v8xWjM2stKj2gtqYjYrn+c1G4Bo6iunbibyQubIz3E=",
+        "lastModified": 1793295165,
+        "narHash": "sha256-iLrDJYPbUE5LsMTow8zx07PYK3vH+Newpa9fl2voi+Q=",
         "owner": "wimpysworld",
         "repo": "nix-packages",
-        "rev": "51d438d2caf033eb0f8d1214e59f8a69a7e71cbe",
+        "rev": "2585fad49a8e9c1ac99e9ad0a270d2bca83dbe1b",
         "type": "github"
       },
       "original": {
