@@ -55,7 +55,7 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
       - name: Install just
         run: nix profile add --inputs-from . --no-write-lock-file nixpkgs#just
       - uses: robherley/go-test-action@2f859e0c8769d755d3174eecb9af8f64660827f3 # v1.1.0
@@ -75,17 +75,24 @@ jobs:
           - ubuntu-24.04-arm
           - macos-15-intel
           - macos-15
+          - windows-2025
+          - windows-11-arm
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
     steps:
+      - name: Configure Git line endings
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
       - name: Install Nix
-        if: runner.os != 'macOS' || runner.arch != 'X64'
-        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        if: >-
+          runner.os != 'Windows'
+          && (runner.os != 'macOS' || runner.arch != 'X64')
+        uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
       - name: Install Nix on Intel macOS
         if: runner.os == 'macOS' && runner.arch == 'X64'
         shell: bash
@@ -106,7 +113,9 @@ jobs:
           echo "/nix/var/nix/profiles/default/bin" >> "$GITHUB_PATH"
           echo "$HOME/.nix-profile/bin" >> "$GITHUB_PATH"
       - name: Install just
-        if: runner.os != 'macOS' || runner.arch != 'X64'
+        if: >-
+          runner.os != 'Windows'
+          && (runner.os != 'macOS' || runner.arch != 'X64')
         run: nix profile add --inputs-from . --no-write-lock-file nixpkgs#just
       - name: Install just on Intel macOS
         if: runner.os == 'macOS' && runner.arch == 'X64'
@@ -138,13 +147,28 @@ jobs:
           test -d "$source"
           echo "TAILOR_BLENDER_TEST_SOURCE=$source" >> "$GITHUB_ENV"
       - name: Test
+        if: runner.os != 'Windows'
         env:
           TAILOR_TEST_PLAYWRIGHT_NIX_BUILDS: "1"
         run: just test
+      - name: Vet (Windows)
+        if: runner.os == 'Windows'
+        run: go vet ./...
+      - name: Test (Windows)
+        if: runner.os == 'Windows'
+        run: go test ./...
       - name: Build tailor
+        if: runner.os != 'Windows'
         run: go build -o tailor ./cmd/tailor
+      - name: Build tailor (Windows)
+        if: runner.os == 'Windows'
+        run: go build -o tailor.exe ./cmd/tailor
       - name: Measure
+        if: runner.os != 'Windows'
         run: ./tailor measure
+      - name: Measure (Windows)
+        if: runner.os == 'Windows'
+        run: ./tailor.exe measure
       - name: Test container
         if: runner.os == 'Linux'
         run: |
@@ -159,7 +183,8 @@ jobs:
           git -C "$context/repository" remote add origin https://github.com/octocat/container-test.git
           docker run --rm --network none --user "$(id -u):$(id -g)" \
             -v "$context/repository:/work:ro" -w /work \
-            tailor:container-test docket | grep -Eq '^repository: +octocat/container-test$'
+            tailor:container-test docket --format=plain |
+            grep -Eq '^repository: +octocat/container-test$'
 
   security:
     name: Security 🔒
@@ -203,7 +228,7 @@ jobs:
         run: govulncheck -mode convert -format sarif < govulncheck.json > govulncheck.sarif
 
       - name: Upload SARIF
-        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         if: >-
           always() && !cancelled()
           && !github.event.repository.private
@@ -223,7 +248,9 @@ jobs:
     permissions: {}
     steps:
       - name: Check results
-        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        if: >-
+          contains(needs.*.result, 'failure')
+          || contains(needs.*.result, 'cancelled')
         run: exit 1
 
   snapshot:
@@ -246,13 +273,13 @@ jobs:
           go-version-file: go.mod
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
 
       - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
         with:
           version: "v2.18.0"
           args: release --snapshot --clean --skip=sign
@@ -280,7 +307,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to GHCR
         uses: nick-fields/retry@ad984534de44a9489a53aefd81eb77f87c70dc60 # v4.0.0
@@ -293,13 +320,13 @@ jobs:
             echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
       - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
 
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
         with:
           version: "v2.18.0"
           args: release --clean

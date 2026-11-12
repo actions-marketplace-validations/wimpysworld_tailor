@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -80,6 +81,9 @@ func TestFitNewDirectoryDefaultConfig(t *testing.T) {
 }
 
 func TestFitPlainOutputPreservesPathControls(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("newline in directory path requires unix")
+	}
 	fakeNoRepoAuth(t)
 
 	dir := filepath.Join(t.TempDir(), "safe\ninjected")
@@ -98,6 +102,9 @@ func TestFitPlainOutputPreservesPathControls(t *testing.T) {
 }
 
 func TestFitRichOutputEscapesPathControls(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("newline in directory path requires unix")
+	}
 	fakeNoRepoAuth(t)
 	t.Setenv("TERM", "xterm-256color")
 	t.Setenv("NO_COLOR", "1")
@@ -341,7 +348,7 @@ func TestRunBaste(t *testing.T) {
 	dir := setupSwatchCommandTest(t)
 
 	var stdout, stderr strings.Builder
-	code := run([]string{"baste"}, &stdout, &stderr)
+	code := run([]string{"baste", "--format=plain"}, &stdout, &stderr)
 
 	if code != 0 {
 		t.Fatalf("run() = %d, want 0; stderr: %s", code, stderr.String())
@@ -355,7 +362,7 @@ func TestRunBaste(t *testing.T) {
 		"skipped:                             .envrc (first-fit, exists)\n" +
 		"skipped:                             .github/dependabot.yml (not configured or mode never)\n" +
 		"skipped:                             .github/pull_request_template.md (mode never)\n" +
-		"warning: review and add new Nix files to Git because Nix flakes exclude untracked files: `nix/hooks.nix`, `nix/hooks/core.nix`, `nix/loader.nix`\n"
+		"Optional: review and add new Nix files to Git before using the development shell, because Nix flakes exclude untracked files: `nix/hooks.nix`, `nix/hooks/core.nix`, `nix/loader.nix`. Keep normal shell, direnv, SDK, extension, and client approvals.\n"
 	if stdout.String() != want {
 		t.Errorf("stdout =\n%s\nwant:\n%s", stdout.String(), want)
 	}
@@ -370,7 +377,7 @@ func TestRunAlter(t *testing.T) {
 	dir := setupSwatchCommandTest(t)
 
 	var stdout, stderr strings.Builder
-	code := run([]string{"alter"}, &stdout, &stderr)
+	code := run([]string{"alter", "--format=plain"}, &stdout, &stderr)
 
 	if code != 0 {
 		t.Fatalf("run() = %d, want 0; stderr: %s", code, stderr.String())
@@ -384,7 +391,7 @@ func TestRunAlter(t *testing.T) {
 		"skipped:                             .envrc (first-fit, exists)\n" +
 		"skipped:                             .github/dependabot.yml (not configured or mode never)\n" +
 		"skipped:                             .github/pull_request_template.md (mode never)\n" +
-		"warning: review and add new Nix files to Git because Nix flakes exclude untracked files: `nix/hooks.nix`, `nix/hooks/core.nix`, `nix/loader.nix`\n"
+		"Optional: review and add new Nix files to Git before using the development shell, because Nix flakes exclude untracked files: `nix/hooks.nix`, `nix/hooks/core.nix`, `nix/loader.nix`. Keep normal shell, direnv, SDK, extension, and client approvals.\n"
 	if stdout.String() != want {
 		t.Errorf("stdout =\n%s\nwant:\n%s", stdout.String(), want)
 	}
@@ -397,7 +404,7 @@ func TestRunAlterRecut(t *testing.T) {
 	dir := setupSwatchCommandTest(t)
 
 	var stdout, stderr strings.Builder
-	code := run([]string{"alter", "--recut"}, &stdout, &stderr)
+	code := run([]string{"alter", "--recut", "--format=plain"}, &stdout, &stderr)
 
 	if code != 0 {
 		t.Fatalf("run() = %d, want 0; stderr: %s", code, stderr.String())
@@ -411,7 +418,7 @@ func TestRunAlterRecut(t *testing.T) {
 		"overwritten:                         .envrc\n" +
 		"skipped:                             .github/dependabot.yml (not configured or mode never)\n" +
 		"skipped:                             .github/pull_request_template.md (mode never)\n" +
-		"warning: review and add new Nix files to Git because Nix flakes exclude untracked files: `nix/hooks.nix`, `nix/hooks/core.nix`, `nix/loader.nix`\n"
+		"Optional: review and add new Nix files to Git before using the development shell, because Nix flakes exclude untracked files: `nix/hooks.nix`, `nix/hooks/core.nix`, `nix/loader.nix`. Keep normal shell, direnv, SDK, extension, and client approvals.\n"
 	if stdout.String() != want {
 		t.Errorf("stdout =\n%s\nwant:\n%s", stdout.String(), want)
 	}
@@ -505,7 +512,7 @@ func TestMeasurePythonPolicyDestination(t *testing.T) {
 					}
 				default:
 					if err := os.Symlink(target, path); err != nil {
-						t.Fatal(err)
+						t.Skipf("Symlink unavailable: %v", err)
 					}
 				}
 				before, _ := os.Lstat(path)
@@ -553,7 +560,10 @@ func TestMeasurePythonPolicyDestination(t *testing.T) {
 }
 
 func TestMeasurePythonPolicyInspectionError(t *testing.T) {
-	dir := t.TempDir()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Mkdir(filepath.Join(dir, "nested"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -577,8 +587,7 @@ func TestMeasurePythonPolicyInspectionError(t *testing.T) {
 		fmt.Sprintf("%-16s%s", "missing:", "LICENSE"),
 		fmt.Sprintf("%-16s%s", "warning:", "ruff.toml"),
 		fmt.Sprintf("%-16s%s", "warning:", "pyrightconfig.json"),
-		"reading Python policy",
-		filepath.Join(dir, "nested", "pyproject.toml"),
+		fmt.Sprintf("reading Python policy %q", filepath.Join(dir, "nested", "pyproject.toml")),
 		"not-configured:",
 	} {
 		if !strings.Contains(stdout.String(), want) {
@@ -811,11 +820,59 @@ func TestRunBasteUsesCommandWriters(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("run() = %d, want 0; stderr: %s", code, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "would copy:                          .gitignore\n") {
+	if !strings.Contains(stdout.String(), ".gitignore: would copy\n") {
 		t.Errorf("stdout = %q, want .gitignore preview", stdout.String())
 	}
 	if !strings.HasPrefix(stderr.String(), "No licence file found and no licence configured.") {
 		t.Errorf("stderr = %q, want missing licence warning", stderr.String())
+	}
+}
+
+func TestQuietBasteKeepsWarningAndUnknownInspection(t *testing.T) {
+	fakeNoRepoAuth(t)
+	dir := t.TempDir()
+	files := map[string]string{
+		".tailor.yml": "license: none\nswatches: []\n",
+		"justfile":    "import env('JUST_IMPORT')\n",
+	}
+	for name, content := range files {
+		testutil.WriteFile(t, dir, name, content)
+	}
+	t.Chdir(dir)
+	for _, format := range []string{"auto", "plain"} {
+		t.Run(format, func(t *testing.T) {
+			var stdout, stderr strings.Builder
+			code := run([]string{"baste", "--quiet", "--format=" + format}, &stdout, &stderr)
+			if code != 0 {
+				t.Fatalf("exit %d, stderr: %s", code, stderr.String())
+			}
+			const warning = "No licence file found and no licence configured."
+			if !strings.Contains(stderr.String(), warning) || strings.Contains(stdout.String(), warning) {
+				t.Fatalf("warning streams: stdout=%q stderr=%q", stdout.String(), stderr.String())
+			}
+			got := stdout.String()
+			if !strings.Contains(got, "Verify `import 'just/loader.just'` in `justfile`") || !strings.Contains(got, "alteration") {
+				t.Fatalf("quiet omitted totals or verification: %s", got)
+			}
+			for _, unwanted := range []string{"Add `import", "Review the preview", "No changes needed.", "Planned changes", "\x1b"} {
+				if strings.Contains(got, unwanted) {
+					t.Errorf("quiet contains %q: %s", unwanted, got)
+				}
+			}
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != len(files) {
+				t.Fatalf("preview changed the tree: %v", entries)
+			}
+			for name, want := range files {
+				got, err := os.ReadFile(filepath.Join(dir, name))
+				if err != nil || string(got) != want {
+					t.Fatalf("preview changed %s: %q, %v", name, got, err)
+				}
+			}
+		})
 	}
 }
 

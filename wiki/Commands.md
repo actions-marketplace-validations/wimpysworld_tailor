@@ -2,6 +2,31 @@
 
 Run Tailor from your project directory. Use `baste` to preview changes before `alter`.
 
+## Output controls
+
+Tailor selects the terminal layout when standard output is a terminal and `TERM` is not `dumb`. The layout has a command header, context, and a mode badge. Pipes, redirected output, and `TERM=dumb` use border-free concise reports. Both layouts put attention before changes and distinguish preserved, excluded, and unchanged totals.
+
+| Flag | Behaviour |
+|---|---|
+| `--format=auto` | Default terminal layout, or border-free concise output for pipes and `TERM=dumb` |
+| `--format=plain` | Legacy result rows, with state-aware guidance |
+| `--verbose` | Expand every result, with the same delayed terminal spinner |
+| `--quiet` | Keep totals, attention, notices, and essential edits or verification steps |
+| `--color=auto\|always\|never` | Control colour on capable terminals |
+| `--no-progress` | Disable live progress without changing the final report |
+
+`--quiet` takes precedence over `--verbose` and uses border-free concise output even with `--format=plain`. It omits optional and informational guidance, and routine final advice without attention. Required edits and verification steps remain visible. Redirected output and `TERM=dumb` contain no colour or cursor controls, even with `--color=always`. `NO_COLOR` disables automatic colour but retains the terminal layout. `--color=never` also retains the layout. Plain format never uses colour or progress. Verbose mode emits no diagnostic stage records, including in pipes and with `--no-progress`.
+
+The terminal layout uses single-depth panels for attention, proposed or confirmed changes, reapply requests, and the next action. Reapply requests have a separate count outside the alteration count. Default rows use readable names under domain headings. With `--verbose`, totals appear near the header, and domains with changes come first. Each domain groups proposed, applied, created, reapply, matching, preserved, and excluded results in that order. Shared preservation and exclusion reasons appear once before their paths. Qualified ruleset subsections retain exact leaf identifiers. `docket` retains identity details. Matching values have no unchanged-value arrow.
+
+Terminal colours use your palette, with distinct roles for identity, changes, attention, and reapply requests. Matching-only frames use a green accent. All frames use non-grey semantic colours when colour is enabled. Supporting values use normal-weight text in your terminal's foreground, without faint intensity. Suggested commands, explicit backtick spans, and indented guidance snippets receive code highlighting. Backtick delimiters stay visible without colour. Without a UTF-8 locale, frames and arrows use ASCII characters. Widths below 60 columns use no frames. Long result rows use labelled, unboxed details without removing their domain frame. Lists wrap between complete items. Commands, exact keys, paths, and source snippets remain complete.
+
+Default reports hide preserved and excluded details. Border-free concise output also shows reason counts beside their totals. Use `--verbose` to inspect each result. Multiline optional guidance shows a short notice and a verbose hint by default. Use `tailor baste --verbose` for the full adoption steps and safeguards. Explicit `--format=plain` retains the full guidance. Preservation is not a blocker. For example, an unowned Dependabot file is preserved, while inactive Dependabot management is excluded.
+
+Required guidance replaces generic final advice. In the terminal layout, required edits or final advice appear under `Next`. Optional and informational guidance follow `Next` under `Additional guidance` and do not replace the next action. Numbered steps retain their original numbering. For preserved roots and clients, Tailor suppresses instructions for detected setup. See [inspection limits and safety](Configuration#guidance-for-preserved-files). A detected entry is syntax evidence, not runtime acceptance.
+
+Use `tailor --format=plain baste` when you need the legacy rows shown below. Guidance still reflects the inspected state.
+
 ## FFmpeg-statigo setup
 
 `just setup` is the only setup recipe. It runs inline shell bodies for explicitly enabled components in lexical order, each in a separate Bash subshell. A failed component stops setup. With no component enabled, setup succeeds with guidance. Setup never invokes project quality scripts.
@@ -45,18 +70,22 @@ Review `.tailor.yml` and run `tailor baste` before `tailor alter`. The defaults 
 
 Reads `.tailor.yml` in the current directory. It applies repository settings, immutable releases, Actions policy, code scanning, Code Quality, the ruleset, labels, variables, Pages, wiki files, and the licence. The swatch stage then publishes Dependabot, managed development files, and ordinary swatches. Pages files follow.
 
-Wiki setup has one earlier write: after local safety checks, Tailor enables a declared wiki before its readiness check. If readiness fails, no other changes follow. See [GitHub wiki](GitHub-wiki) for setup steps.
+Before normal alterations, Tailor enables a declared public wiki and imports its existing content automatically. Enablement remains if a later check fails. A wiki without pages does not block normal alterations. See [GitHub wiki](GitHub-wiki) for setup and recovery.
 
 ```bash
-tailor alter            # Apply changes
-tailor alter --recut    # Overwrite eligible always and first-fit swatches
+tailor alter               # Apply changes
+tailor alter --recut       # Overwrite eligible always and first-fit swatches
 ```
+
+For a readable unadopted wiki, `alter` imports the complete pinned wiki automatically, including replacements with private backups. Review the plan first with `tailor baste --verbose` if you want to. `--adopt-wiki` is no longer required. `alter` accepts it for compatibility, and it has no effect. `--local-only` rejects `--adopt-wiki`.
+
+Ready, adopted wiki content remains untouched, including dirty edits. The CLI never stages, commits or pushes wiki changes. Commit and push reviewed source changes through the normal project workflow to trigger publication.
 
 `--recut` overrides `first-fit` for ordinary swatches, but it still skips `never`. Existing `justfile`, `flake.nix`, and `.gitignore` roots, wiki starter pages, [static Pages starter files](GitHub-Pages#static-pages-starter), and regular `LICENSE` files are exempt. Ordinary `.gitignore` processing preserves an existing regular file or final symlink byte-for-byte under every mode. It does not read or hash the file, or follow the symlink.
 
 For an active mode other than `never`, Tailor creates a missing `.gitignore` atomically without clobbering a destination that appears during the write. It rejects a directory or special file before repository checks, authentication, or writes. `never` skips that inspection and write. Enabled Hugo or Jekyll Pages is a later additive exception that can replace a final symlink and append its output rule. Review the rule order when an existing matching rule precedes a later negation. For `.tailor.yml`, see [default merging](Configuration#default-merging).
 
-Dependabot uses [whole-file ownership](https://github.com/wimpysworld/tailor/blob/main/docs/design/dependabot-ownership.md). The exact first-line marker is `# Managed by Tailor: .github/dependabot.yml`. Back up a custom file before adding it because the next reconciliation can remove every custom field.
+Dependabot uses [whole-file ownership](https://github.com/wimpysworld/tailor/blob/main/docs/design/dependabot-ownership.md). The exact first-line marker is `# Managed by Tailor: .github/dependabot.yml`. Adoption is optional. Keep a custom file unmarked to preserve it. Before adoption, back up the file and review both supported templates and every custom field that replacement will discard. Set `languages.go` explicitly to `true` or `false`. Resolve any `.github/dependabot.yaml` entry. Add the exact marker only after review, then run `tailor baste`. Run `tailor alter` only after approval.
 
 `first-fit` and `always` reconcile owned content, with or without `--recut`. They preserve an unmarked regular file byte-for-byte. An omitted entry or `never` skips both `.yml` and `.yaml` names without inspection.
 
@@ -78,13 +107,13 @@ Future `.gitignore` atomicity will cover one file only. It will not cover remote
 
 If a later step fails, completed local and repository changes remain. Tailor does not roll them back. Fix the reported error, then run `tailor baste` before you retry `tailor alter`.
 
-`alter` and `alter --recut` report a completed label after each successful change. Labels are `set`, `created`, `updated`, `removed`, `copied`, and `overwritten`.
+`alter` and `alter --recut` report a completed label after each successful change. Labels include `set`, `created`, `updated`, `removed`, `copied`, and `overwritten`. Wiki imports use `import` and `replace with backup`.
 
 A default merge, retired-entry cleanup, or security prerequisite normalisation in `.tailor.yml` reports `updated`. Security normalisation also shows a warning. A retired workflow file cleanup reports `removed`.
 
 ## `baste`
 
-`baste` previews the changes that `alter` will make. It makes no changes.
+`baste` previews the changes that `alter` will make. It makes no persistent changes and never prompts. Wiki inspection uses isolated temporary Git storage. For a readable unadopted wiki, it previews additions and replacements with backups. For a wiki without pages, it reports the browser step for the first page. A disabled wiki produces guidance until `alter` enables it. Readiness blockers alone do not fail the full preview.
 
 For Dependabot, `baste` distinguishes creation, complete-file replacement, unchanged owned content, preserved unmarked content, skipped management, and conflicts. It creates no file, directory, temporary file, or ownership record.
 
@@ -102,12 +131,16 @@ tailor baste
 | `would remove` | `removed` |
 | `would copy` | `copied` |
 | `would overwrite` | `overwritten` |
+| `would import` | `import` |
+| `would replace with backup` | `replace with backup` |
 
-`skipped` and `no change` use the same labels in all three commands. A skipped file shows its reason after the path.
+In legacy plain output, `skipped` and `no change` use the same labels in all three commands. A skipped file shows its reason after the path.
 
 A default merge, retired-entry cleanup, or security prerequisite normalisation in `.tailor.yml` reports `would update` in `baste`. Security normalisation also shows a warning. After a successful write, `alter` reports `updated`.
 
 Each present retired workflow file reports `would remove` in `baste` and `removed` after deletion.
+
+Legacy rows from `tailor --format=plain baste`:
 
 ```
 would set:                           repository.has_wiki = false
@@ -140,6 +173,8 @@ The Pages workflow is not a community health file. Its registered path remains p
 ```bash
 tailor measure
 ```
+
+Legacy rows from `tailor --format=plain measure`:
 
 ```
        missing: .github/FUNDING.yml
@@ -233,7 +268,7 @@ git status --short
 
 Review each new Nix and client file, then stage the approved paths with `git add`. Nix flakes ignore untracked files. Tailor does not stage files.
 
-When Tailor preserves `flake.nix`, add the [Nix loader expression](Configuration#managed-development-files) to its package list. Do the same for the Just loader only when you need other managed recipes. Playwright has no Just fragment or recipe.
+When the package loader is missing from a preserved `flake.nix`, add the [Nix loader expression](Configuration#managed-development-files) to its package list. Do the same for the Just loader only when you need other managed recipes. Playwright has no Just fragment or recipe.
 
 Enter the project shell with `nix develop`, or reload direnv after `direnv allow`. Start a new client instance from that environment, or use the client's configuration reload command. Then approve Playwright MCP tool calls through the client's normal approval prompt.
 
@@ -243,7 +278,7 @@ A [validated future contract](https://github.com/wimpysworld/tailor/blob/main/do
 
 `tailor measure` checks local health without authentication. It does not include the authenticated `tailor baste` preview that the removed `just measure` wrapper ran first. Run `tailor baste` separately when you need that preview.
 
-Tailor preserves an existing root and gives loader adoption guidance, including for `never`, `--recut`, or an omitted swatch entry. Before you add the exact Just loader import from [managed development files](Configuration#managed-development-files), remove or rename each user recipe that duplicates a managed recipe, including `build` and `test`. Keep custom checks under distinct wrapper names. Tailor does not rewrite user recipes or change production recipe names.
+Tailor preserves an existing root and gives state-aware setup guidance, including for `never`, `--recut`, or an omitted swatch entry. Before you add the exact Just loader import from [managed development files](Configuration#managed-development-files), remove or rename each user recipe that duplicates a managed recipe, including `build` and `test`. Keep custom checks under distinct wrapper names. Tailor does not rewrite user recipes or change production recipe names.
 
 A partial `tailor alter` can leave the imported Just files temporarily invalid. Fix the reported error, then retry `tailor alter` before you run a recipe. The generated dispatch is consistent, but installed tool versions and configuration can produce different diagnostics. The lint aggregation does not change CI policy. Generic Go now supplies Staticcheck with the floor described in [Ebitengine tooling](Configuration#ebitengine).
 

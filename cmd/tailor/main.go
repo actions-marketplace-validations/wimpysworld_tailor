@@ -17,7 +17,6 @@ import (
 	"github.com/wimpysworld/tailor/internal/model"
 	"github.com/wimpysworld/tailor/internal/output"
 	"github.com/wimpysworld/tailor/internal/swatch"
-	"github.com/wimpysworld/tailor/internal/termtext"
 )
 
 // version is set at release time by GoReleaser via -X main.version.
@@ -26,10 +25,10 @@ var version = "dev"
 // CLI is the root command structure parsed by Kong.
 type CLI struct {
 	Version    kong.VersionFlag `help:"Show version."`
-	Format     output.Format    `help:"Output format." default:"auto" enum:"auto,plain"`
-	Color      output.Color     `help:"Colour policy." default:"auto" enum:"auto,always,never"`
-	Verbose    bool             `help:"Show every result and stage."`
-	Quiet      bool             `help:"Print only the final summary."`
+	Format     output.Format    `help:"Output format: auto for concise reports, plain for legacy rows." default:"auto" enum:"auto,plain"`
+	Color      output.Color     `help:"Colour policy for capable terminals. Redirected output has no colour." default:"auto" enum:"auto,always,never"`
+	Verbose    bool             `help:"Show every result and its details."`
+	Quiet      bool             `help:"Print totals and essential attention or verification steps."`
 	NoProgress bool             `help:"Disable live progress."`
 	Fit        FitCmd           `cmd:"" help:"Create a new project with default configuration."`
 	Alter      AlterCmd         `cmd:"" help:"Apply swatch templates to the current project."`
@@ -132,11 +131,7 @@ func (f *FitCmd) Run() (runErr error) {
 
 	observe(output.StageEvent{ID: "write", Label: "Configuration created", Phase: "complete"})
 	progress.Stop()
-	renderedPath := f.Path
-	if policy.Rich() {
-		renderedPath = termtext.EscapeControlText(renderedPath)
-	}
-	doc := output.Document{Command: "fit", Context: renderedPath, Items: []output.Item{{Domain: "Configuration", Outcome: output.Created, Action: "create", Name: ".tailor.yml", Provenance: renderedPath}}, Guidance: []output.Guidance{{Order: 1, Text: "Change into the project directory, then run `tailor alter`."}}}
+	doc := output.Document{Command: "fit", Context: f.Path, Items: []output.Item{{Domain: "Configuration", Outcome: output.Created, Action: "create", Name: ".tailor.yml", Provenance: filepath.Join(f.Path, ".tailor.yml")}}, Guidance: []output.Guidance{{Order: 1, Text: "Review `.tailor.yml` in the project directory, then run `tailor baste`. Apply with `tailor alter` only after approval."}}}
 	policy.Print(doc, fmt.Sprintf("Fitted %s with .tailor.yml\n", f.Path))
 	return nil
 }
@@ -152,6 +147,7 @@ func projectName(path string) string {
 // AlterCmd applies configured swatches and GitHub settings to the current project.
 type AlterCmd struct {
 	Recut     bool     `help:"Overwrite existing first-fit swatches and merge missing .tailor.yml defaults (never swatches and the licence stay untouched)." name:"recut"`
+	AdoptWiki bool     `help:"No longer required: alter imports an existing wiki automatically. Accepted for compatibility and has no effect."`
 	LocalOnly bool     `help:"Refresh only explicitly selected existing owned files without authentication or network access."`
 	Path      []string `help:"Existing owned destination to refresh (repeatable; requires --local-only)."`
 	Directory string   `help:"Project directory (requires --local-only)."`
@@ -163,6 +159,9 @@ type AlterCmd struct {
 // Run executes the alter command.
 func (a *AlterCmd) Run() error {
 	if a.LocalOnly {
+		if a.AdoptWiki {
+			return fmt.Errorf("--adopt-wiki cannot be used with --local-only")
+		}
 		if a.Recut {
 			return fmt.Errorf("local-only alteration does not support --recut")
 		}
@@ -175,7 +174,11 @@ func (a *AlterCmd) Run() error {
 	if a.Recut {
 		mode = alter.Recut
 	}
-	return runAlterWithPolicy(mode, a.output, a.stdout, a.stderr)
+	policy := a.output
+	if policy == nil {
+		policy = output.New(a.stdout, a.stderr, output.Auto)
+	}
+	return runAlterWithOptions(mode, policy, a.stdout, a.stderr, alter.Options{AdoptWiki: a.AdoptWiki})
 }
 
 // BasteCmd previews what alter would do without making any changes.
@@ -195,7 +198,11 @@ func runAlter(mode alter.ApplyMode, stdout, stderr io.Writer) error {
 	return runAlterWithPolicy(mode, output.New(stdout, stderr, output.Plain), stdout, stderr)
 }
 
-func runAlterWithPolicy(mode alter.ApplyMode, policy *output.Policy, stdout, stderr io.Writer) (runErr error) {
+func runAlterWithPolicy(mode alter.ApplyMode, policy *output.Policy, stdout, stderr io.Writer) error {
+	return runAlterWithOptions(mode, policy, stdout, stderr, alter.Options{})
+}
+
+func runAlterWithOptions(mode alter.ApplyMode, policy *output.Policy, stdout, stderr io.Writer, options alter.Options) (runErr error) {
 	if policy == nil {
 		policy = output.New(stdout, stderr, output.Auto)
 	}
@@ -236,7 +243,8 @@ func runAlterWithPolicy(mode alter.ApplyMode, policy *output.Policy, stdout, std
 
 	observe(output.StageEvent{ID: "preflight", Label: "Command prepared", Phase: "complete"})
 	stderr = progress.WarningWriter(stderr)
-	report, err := alter.Execute(cfg, dir, mode, nil, stderr, alter.Options{Observer: observe})
+	options.Observer = observe
+	report, err := alter.Execute(cfg, dir, mode, nil, stderr, options)
 	progress.Stop()
 	policy.Print(report.Document, report.Plain)
 	return err
@@ -282,6 +290,52 @@ func (m *MeasureCmd) Run() (runErr error) {
 			return fmt.Errorf("loading config: %w", err)
 		}
 		diff = measure.CheckConfigDiff(cfg, swatch.All())
+		for _, starter := range []struct {
+			enabled bool
+			names   []string
+			inspect func(string, string) (alter.ShellPolicy, error)
+		}{
+			{cfg.ShellEnabled(), []string{".shellcheckrc", ".editorconfig"}, alter.InspectShellPolicy},
+			{cfg.JavaScriptEnabled(), []string{".oxlintrc.json", ".prettierrc.json", ".prettierignore"}, func(dir, name string) (alter.ShellPolicy, error) {
+				policy, err := alter.InspectJavaScriptPolicy(dir, name)
+				return alter.ShellPolicy(policy), err
+			}},
+		} {
+			if !starter.enabled {
+				continue
+			}
+			for _, name := range starter.names {
+				skipped := false
+				for _, entry := range cfg.Swatches {
+					if entry.Path == name && entry.Alteration == swatch.Never {
+						skipped = true
+					}
+				}
+				if skipped {
+					continue
+				}
+				policy, err := starter.inspect(dir, name)
+				if err != nil {
+					policy.AdoptionRequired = true
+					policy.Reason = err.Error()
+				}
+				status := measure.Missing
+				if policy.Present || policy.Reason != "" {
+					status = measure.Present
+					filtered := diff[:0]
+					for _, finding := range diff {
+						if finding.Path != name || finding.Category != measure.NotConfigured {
+							filtered = append(filtered, finding)
+						}
+					}
+					diff = filtered
+				}
+				if policy.AdoptionRequired {
+					status = measure.Warning
+				}
+				health = append(health, measure.HealthResult{Path: name, Status: status, Detail: policy.Reason})
+			}
+		}
 		if cfg.PythonEnabled() {
 			for _, name := range []string{"ruff.toml", "pyrightconfig.json"} {
 				skipped := false
@@ -329,6 +383,7 @@ func (m *MeasureCmd) Run() (runErr error) {
 		}
 	}
 
+	health = measure.SortHealthResults(health)
 	progress.Observe(output.StageEvent{ID: "measure", Label: "Local files measured", Phase: "complete"})
 	progress.Stop()
 	doc := measureDocument(filepath.Base(dir), health, diff, hasConfig)

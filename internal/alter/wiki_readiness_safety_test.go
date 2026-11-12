@@ -95,9 +95,10 @@ func TestWikiReadinessEnabledBlockerAndEnablementFailure(t *testing.T) {
 			t.Cleanup(server.Close)
 			ghfake.FakeRepo(t, "testowner", "testrepo")
 			probes := 0
+			// A network failure remains a blocker, unlike a confirmed empty wiki.
 			t.Cleanup(gh.SetInspectWikiFunc(func(string, string, string) error {
 				probes++
-				return errors.New("wiki exists but wiki/.tailor-wiki-base is missing; import the wiki before adoption")
+				return &gh.WikiAccessError{Reason: gh.WikiReadFailed, State: "wiki remote could not be read; check network, TLS and repository access, then retry tailor alter"}
 			}))
 			dir := t.TempDir()
 			writeOnDisk(t, dir, ".tailor.yml", []byte("license: none\nrepository:\n  has_wiki: true\n  description: changed\nswatches:\n  - path: .gitignore\n    alteration: always\n"))
@@ -110,7 +111,7 @@ func TestWikiReadinessEnabledBlockerAndEnablementFailure(t *testing.T) {
 			var stdout, stderr strings.Builder
 			err := alter.Run(loadTestConfig(t, dir), dir, mode, testutil.NewTestClient(t, server), &stdout, &stderr)
 			if tc.preview {
-				if err != nil || !strings.Contains(stdout.String(), "Tailor needs an imported copy of the wiki in wiki/.") {
+				if err != nil || !strings.Contains(stdout.String(), "Check your network connection") {
 					t.Fatalf("preview error=%v stdout=%q", err, stdout.String())
 				}
 				for _, want := range []string{"repository.description", ".gitignore", "would remove", swatch.WikiDestination} {
@@ -118,7 +119,7 @@ func TestWikiReadinessEnabledBlockerAndEnablementFailure(t *testing.T) {
 						t.Errorf("preview lacks %q: %s", want, stdout.String())
 					}
 				}
-			} else if err == nil || !strings.Contains(err.Error(), "wiki is not ready") {
+			} else if err == nil || !strings.Contains(err.Error(), "wiki is not ready") || (tc.enabled && !strings.Contains(err.Error(), "Check your network connection")) {
 				t.Fatalf("readiness did not block: %v", err)
 			}
 			if tc.enabled {

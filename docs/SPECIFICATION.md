@@ -45,6 +45,11 @@ The `fit`, `alter`, and `baste` commands require a valid authentication token: a
 | `SUPPORT.md` | `SUPPORT.md` |
 | `flake.nix` | `flake.nix` |
 | `justfile` | `justfile` |
+| `.shellcheckrc` | `.shellcheckrc` |
+| `.editorconfig` | `.editorconfig` |
+| `.oxlintrc.json` | `.oxlintrc.json` |
+| `.prettierrc.json` | `.prettierrc.json` |
+| `.prettierignore` | `.prettierignore` |
 | `.golangci.yml` | `.golangci.yml` |
 | `.goreleaser.yaml` | `.goreleaser.yaml` |
 | `.github/workflows/build-go.yml` | `.github/workflows/build-go.yml` |
@@ -274,7 +279,7 @@ mcp:
 
 `mcp` must be a map. Its accepted keys are `blender` and `playwright`, each with a Boolean value. Tailor rejects null sections, null values, duplicate or unknown keys, and non-Boolean values. An empty `mcp: {}` mapping preserves the section but leaves both integrations undeclared.
 
-New configurations contain false declarations for `languages.go`, `languages.python`, `languages.rust`, `pages.enabled`, `mcp.blender`, and `mcp.playwright`. Default merging preserves an absent `mcp` section, an empty mapping, and explicit Boolean values. Configuration writes preserve each form across later runs.
+New configurations contain false declarations for `languages.go`, `languages.python`, `languages.rust`, `languages.shell`, `languages.javascript`, `pages.enabled`, `mcp.blender`, and `mcp.playwright`. Default merging preserves an absent `mcp` section, an empty mapping, and explicit Boolean values. Configuration writes preserve each form across later runs.
 
 The declaration is independent of `pages`. Playwright can be true when Pages is false or absent. A true declaration provisions the Playwright package fragment and renders four MCP client starters from `fixedManagedMCPRegistry`. Pages publishing and the optional `just pages` preview remain separate. The registry also contains `blender-agent-bridge`. Each setting remains independently absent, false, or true.
 
@@ -299,14 +304,16 @@ Tailor uses one fixed internal registry for development roots, loaders, and frag
 | Go fragments | `just/go.just`, `nix/go.nix` |
 | Python fragments | `just/python.just`, `nix/python.nix` |
 | Rust fragments | `just/rust.just`, `nix/rust.nix` |
+| Shell fragments | `just/shell.just`, `nix/shell.nix` |
+| JavaScript fragments | `just/javascript.just`, `nix/javascript.nix` |
 | Pages fragments | `just/pages.just`, `nix/pages.nix` |
 | Playwright package fragment | `nix/playwright.nix` |
 | Blender package and support | `nix/blender.nix`, `nix/lib/blender.nix`, `nix/patches/blender-agent-bridge-local-glb.patch` |
 | Shared MCP client starters | `.mcp.json`, `.codex/config.toml`, `opencode.json`, `.pi/mcp.json` |
 
-The ordinary default set contains 31 configured swatches. The `justfile` and `flake.nix` entries control only missing-root creation. Managed templates are a separate class and add no swatch entries.
+The registry contains 36 ordinary swatches. Fresh configurations with all languages disabled contain 25 active swatches. The `justfile` and `flake.nix` entries control only missing-root creation. Managed templates are a separate class and add no swatch entries.
 
-Tailor reconciles both loaders and `just/tailor.just` on every `baste`, `alter`, and `alter --recut` run. The fixed Just loader does not change. Tailor renders the `build`, `test`, and `lint` dependencies from the current reconciliation plan, not by parsing live configuration when Just runs. The Go, Python, Rust, Pages, Blender, and Playwright package declarations have this exact lifecycle:
+Tailor reconciles both loaders and `just/tailor.just` on every `baste`, `alter`, and `alter --recut` run. The fixed Just loader does not change. Tailor renders the `build`, `test`, and `lint` dependencies from the current reconciliation plan, not by parsing live configuration when Just runs. The Go, Python, Rust, Shell, JavaScript, Pages, Blender, and Playwright package declarations have this exact lifecycle:
 
 | Declaration | Fragment action |
 | --- | --- |
@@ -318,19 +325,25 @@ An owned loader, core file, or fragment starts with the exact first line `# Mana
 
 For each client, Tailor aggregates all selected server definitions into one destination. It orders servers by lexical server name and materialises each destination once. Each server must define Claude, Codex, OpenCode, and Pi output. Registry validation rejects duplicate names or providers, missing providers, invalid UTF-8, control characters, unresolved `[[TAILOR_` tokens, and unsupported provider fields. Printable strings and the literal Pi proxy command remain unchanged through serialisation.
 
-When `mcp.playwright` is true, Tailor creates each missing MCP client starter. Tailor preserves an existing regular file or final symlink and reports the client entry that the user must add manually. Tailor never parses, merges, or replaces these shared files. A false declaration preserves all four client files and removes only an owned `nix/playwright.nix`, through the existing Nix fragment lifecycle. Tailor warns in preview and apply that retained client settings can refer to a missing `playwright-mcp` executable. An absent declaration does not inspect or change the client destinations or package fragment. Shared-file adoption is not implemented.
+When `mcp.playwright` is true, Tailor creates each missing MCP client starter. Tailor preserves an existing regular file or final symlink and reports missing client entries or required manual verification. Tailor inspects supported client syntax for guidance only. It never merges or replaces these shared files. A false declaration preserves all four client files and removes only an owned `nix/playwright.nix`, through the existing Nix fragment lifecycle. Tailor warns in preview and apply that retained client settings can refer to a missing `playwright-mcp` executable. An absent declaration does not inspect or change the client destinations or package fragment. Shared-file adoption is not implemented.
 
 A [future MCP entry adoption contract](design/mcp-adoption.md) defines explicit per-entry consent. The proposed `--adopt-mcp` and `--release-mcp` flags are not implemented. Tailor will not infer consent from declarations, file contents, swatch modes, or `--recut`. The future design uses a local ownership ledger bound to the canonical project root. Entry edits preserve all non-target client bytes, and release preserves all client file bytes. Release is blocked while a transaction is pending. Reviewed recovery comes first. Client-version acceptance and adoption implementation remain separate follow-on work.
 
-The protected roots have no ownership marker. Tailor preserves an existing regular file or final symlink, including a dangling symlink, for `always`, `first-fit`, `never`, `--recut`, and an omitted swatch entry. It reports the existing root as preserved and gives loader adoption guidance in each case. Tailor creates a missing root only when its swatch entry is `always` or `first-fit`. A missing root with an omitted entry or `never` produces no root result or adoption guidance.
+The protected roots have no ownership marker. Tailor preserves an existing regular file or final symlink, including a dangling symlink, for `always`, `first-fit`, `never`, `--recut`, and an omitted swatch entry. It reports the existing root as preserved and inspects supported syntax for state-aware guidance in each case. Tailor creates a missing root only when its swatch entry is `always` or `first-fit`. A missing root with an omitted entry or `never` produces no root result or adoption guidance.
 
-Tailor does not parse or rewrite a preserved root. If the line is absent, add `import 'just/loader.just'` to `justfile`. If the expression is absent, add `++ import ./nix/loader.nix { inherit pkgs; }` to the existing package list in `flake.nix`.
+Tailor never rewrites a preserved root. Read-only inspection distinguishes detected setup, confirmed missing setup within supported syntax, and unknown setup. Detected setup suppresses redundant adoption instructions. Missing setup produces specific manual edits. Unknown setup produces verification instructions, not a claim that an entry is missing.
+
+Inspection accepts regular files of at most 1 MiB. It rejects final and parent symlinks, unsafe paths, non-regular files, unreadable files, and files that change during inspection. These cases produce unknown state. No-follow inspection is unavailable on non-Unix platforms, so preserved files require manual verification there. JSON inspection rejects duplicate keys, trailing values, and excessive nesting. TOML inspection requires a valid server table.
+
+Just inspection recognises literal top-level loader imports. Unsupported expressions and indirect composition can require manual verification. Nix inspection recognises limited literal development-shell forms for the package loader, core hook, enabled Android output, and enabled Blender extension output. It does not evaluate Nix or establish runtime compatibility. Preserve existing overrides, use the same overridden `pkgs` for both loaders, and keep custom hooks last.
+
+For supported client files, Tailor suggests only absent enabled server names, with provider-specific snippets and a preview/restart check. An existing name counts as present, including a disabled entry. Tailor neither validates its runtime configuration nor suggests replacement. Unknown client syntax produces verification guidance without an adoption snippet. Existing and disabled entries remain untouched.
 
 The `.envrc` starter keeps `nix_direnv_manual_reload` and registers `watch_file` for `nix`, `nix/hooks`, `nix/lib`, `nix/shells`, and existing `.nix` files directly within those directories before `use flake`. Directory watches cover fragment creation and removal. Watches on absent directories cover initial creation. File watches cover edits to package and hook fragments and their loaders. Existing first-fit `.envrc` files require manual adoption. After review, users approve a changed `.envrc` through normal direnv approval and run `nix-direnv-reload` to rebuild a stale cache. Tailor never grants approval or rebuilds the cache automatically.
 
 The generated root requires Just 1.23.0 or later and owns the sole `default` recipe. The core provides exactly three quality commands: `build`, `test`, and `lint`. It also keeps the operational `setup` and `release` commands. Call `tailor alter`, `tailor baste`, and `tailor measure` directly, without Just wrappers. Pages owns `pages`. `just/go.just` is an empty compatibility import with no recipes.
 
-Typed registry metadata selects embedded shell bodies for explicitly enabled capabilities. The renderer places those bodies directly in the core in lexical capability order. Preflight checks each selected body in the core. False and absent Go declarations exclude Go bodies. Go, Python, and Rust are the supported quality ecosystems. Empty build and test commands print guidance, then run an optional project script. Workflow lint runs once when a YAML workflow exists, otherwise it prints a skip message. Missing tools and command failures remain errors.
+Typed registry metadata selects embedded shell bodies for explicitly enabled capabilities. The renderer places those bodies directly in the core in lexical capability order. Preflight checks each selected body in the core. False and absent Go declarations exclude Go bodies. Go, Python, Rust, Shell, and unified JavaScript/TypeScript are the supported quality ecosystems. Empty build and test commands print guidance, then run an optional project script. Workflow lint runs once when a YAML workflow exists, otherwise it prints a skip message. Missing tools and command failures remain errors.
 
 A `never` mode for `justfile` or `.golangci.yml` does not disable Go bodies selected by `languages.go: true`. Remove old quality recipes and aliases from preserved roots and project fragments before loader adoption. Move project-specific quality work into the optional scripts below. Retained marked Go fragments with legacy quality recipes require explicit Go enablement for migration, or manual removal of those recipes. Do not rename legacy helpers into another quality API. Release remains independent of language declarations and keeps its existing local tag flow.
 
@@ -343,6 +356,8 @@ Graphics package selection and component runtime library prepends apply on all L
 The component packages are `pkg-config`, `git`, `curl`, and `jq`, plus Linux-only `vulkan-loader`, `intel-media-driver`, and `vpl-gpu-rt`. Its library paths are oneVPL, Intel media, then Vulkan, after the host path and before existing entries. Unset-only defaults select oneVPL libraries, system DRI or Intel DRI fallback, and sorted readable system Vulkan ICD manifests through linked driver directories. Preserve explicit empty values and custom values for `ONEVPL_SEARCH_PATH`, `LIBVA_DRIVERS_PATH`, and `VK_DRIVER_FILES`. Do not inspect hardware vendors or set `LIBVA_DRIVER_NAME`.
 
 The Nix loader returns only a package list. It passes the existing `pkgs` set to each fragment and does not add inputs, change outputs, or update the lock file. This packages-only guarantee covers packages available through the existing flake inputs. The Go fragment supplies Go, golangci-lint, govulncheck, GoReleaser, gocyclo, goperf, and Staticcheck. Staticcheck uses the caller's Go and has a `2026.2.2` floor. Package versions at or above that floor retain the caller's source and overrides, including forks. Older versions use the pinned upstream fallback. The Playwright fragment supplies `playwright-mcp` with Chromium only. It excludes Firefox, WebKit, and the Chromium headless shell.
+
+Shell and JavaScript follow the Go tool-ownership pattern: Nix supplies fixed tools and the shared Just core runs checks and corrections. The Shell package fragment supplies ShellCheck and shfmt. The JavaScript package fragment supplies Node.js, Oxlint, and Prettier from the caller's `pkgs`. Both fragments remain list-valued and add no inputs, lock changes, hooks, or installers.
 
 The Go body of `build` uses `go list` and both `go build` commands under the same `GOOS`, `GOARCH`, `GOFLAGS`, and build-tag environment. It validates all packages without writing an executable in the project root. A library-only module succeeds without creating `bin/`. For executable packages, it rejects duplicate Go output names, a symlinked `bin`, and symlink, directory, or special-file output destinations before compilation. It builds and validates every package in a temporary directory before it publishes any executable. Publication replaces existing regular `bin/<name>` executables and rechecks the destinations first. Output names follow Go directory builds, including `.exe` for Windows and the parent name for semantic `/v2` or later import paths.
 
@@ -383,7 +398,7 @@ To add Android, replace `ebitengine: true` with `ebitengine: {enabled: true, and
 
 Android accepts only a mapping with the required Boolean `enabled`. Enabling Android accepts the Android SDK licence terms. Only the dedicated shell imports a private SDK package set with scoped licence acceptance and an Android-only unfree predicate. Global Nix settings remain unchanged. Android uses fixed platform `"35"`, build-tools `"35.0.0"`, and NDK `"28.2.13676358"`. There are no desktop, web, assets, delivery, licence, or version switches. Default shells do not evaluate the SDK, even when Android is enabled. Unsupported package attributes or versions fail rather than silently omit tools. Different versions require a project-owned shell.
 
-The four owned destinations are `nix/go-ebitengine.nix`, `nix/lib/go-ebitengine-runtime.nix`, `nix/hooks/go-ebitengine.nix`, and optional `nix/shells/go-ebitengine-android.nix`. Support and shell kinds never enter automatic package or hook loaders. Missing support files leave the desktop hook inactive. An incomplete Android shell fails with reconciliation guidance. Existing ownership, symlink, preflight, preview, and protected-root rules apply. The ordinary swatch count is 31. No quality body, setup body, or Just alias is added.
+The four owned destinations are `nix/go-ebitengine.nix`, `nix/lib/go-ebitengine-runtime.nix`, `nix/hooks/go-ebitengine.nix`, and optional `nix/shells/go-ebitengine-android.nix`. Support and shell kinds never enter automatic package or hook loaders. Missing support files leave the desktop hook inactive. An incomplete Android shell fails with reconciliation guidance. Existing ownership, symlink, preflight, preview, and protected-root rules apply. The ordinary swatch count is 36. No quality body, setup body, or Just alias is added.
 
 Base tools include Bash, GNU tools, Git, curl, gzip, zip, unzip, and `tailor-ebitenmobile`. Generic Go supplies Staticcheck. Linux adds nine ALSA, GL, and X11 client libraries, mesa-demos, pciutils, and Avahi. Runtime libraries enter `LD_LIBRARY_PATH` on all Linux hosts through the shared path helper. NixOS host drivers remain first. Brotli and miniserve are always included; the project must use its selected Go's `wasm_exec.js`. Common tools always include FFmpeg (`ffmpeg-headless`), ImageMagick, Vorbis tools, Git LFS, standalone `android-tools`, Node.js, Wrangler, Butler, OpenSSH, rsync, and OpenSSL. Python, NumPy, Pillow, Matplotlib, Blender, and Pyright are not included. Android SDK, NDK, JDK, and Gradle remain exclusive to the enabled Android shell. Engine pins and forks, asset content and processing, application recipes, signing, and deployment remain project-owned. Blender bridge support requires the separate `mcp.blender` declaration. Reusable tooling is supplied by Tailor rather than retained as a project default. Ebitengine does not enable ffmpeg-statigo.
 
@@ -407,20 +422,22 @@ Build runs `uv build --python "$project_python" --no-python-downloads`, never `u
 
 Audit uses a securely created temporary file and an exit cleanup trap. Export uses `uv export --locked --format requirements-txt --no-emit-project --no-hashes`. The selected Nix interpreter runs `-m pip_audit --requirement FILE --no-deps --disable-pip --strict`. Require identical `packaging.markers.default_environment()` maps for project and audit Python, including full Python versions, implementation, and platform fields. Probe the project interpreter with the managed `packaging` module without installing it in `.venv`. Reject mismatches before any quality command or environment sync and require an explicit `.venv` rebuild through setup. Coverage is the root package dependencies and default groups on the active platform, not every extra or platform. All export, collection, network, and vulnerability failures fail lint. Cache writes remain permitted.
 
-The canonical Ruff starter uses 88 columns, stable correctness rules, safe fixes, and runtime typing preservation. The type starter selects `standard` and `failOnWarnings: false`. Shared TOML-aware discovery checks root, ancestors, and nested policy files. Never shadow alternative Ruff or BasedPyright policies, including recut and `always`. Preserve Black and mypy policy, skip conflicting starters, and report adoption guidance. Quality requires explicit Ruff and BasedPyright policies and never substitutes recommended defaults. Ruff can use nested policies. The root BasedPyright invocation requires a root or ancestor policy and does not load nested policies. Preserve nested type policies and require manual root adoption before lint. Measure uses the same preservation discovery and reports equivalent policies as present, not as proof that root lint can use them. Project hooks run after successful workflows and lexical Go, Python, Rust bodies.
+The canonical Ruff starter uses 88 columns, stable correctness rules, safe fixes, and runtime typing preservation. The type starter selects `standard` and `failOnWarnings: false`. Shared TOML-aware discovery checks root, ancestors, and nested policy files. Never shadow alternative Ruff or BasedPyright policies, including recut and `always`. Preserve Black and mypy policy, skip conflicting starters, and report adoption guidance. Quality requires explicit Ruff and BasedPyright policies and never substitutes recommended defaults. Ruff can use nested policies. The root BasedPyright invocation requires a root or ancestor policy and does not load nested policies. Preserve nested type policies and require manual root adoption before lint. Measure uses the same preservation discovery and reports equivalent policies as present, not as proof that root lint can use them. Project hooks run after successful workflows and enabled ecosystem bodies in lexical capability order.
 
 ### Go ecosystem support
 
-The top-level `languages` section selects language-specific development support. Its supported keys are `go`, `python`, and `rust`:
+The top-level `languages` section selects language-specific development support. Its supported keys are `go`, `python`, `rust`, `shell`, `javascript`, and the `typescript` alias:
 
 ```yaml
 languages:
   go: true
 ```
 
-`languages` must be a map. It accepts Boolean `go`, `python`, and `rust` values, plus the Go mapping described below. Reject null sections, null values, unknown keys, and invalid types. An empty map leaves all languages unspecified. Internally, `Languages *LanguageSettings` and `Go *bool` preserve absent, false, and true states.
+`languages` must be a map. Each supported key accepts only a Boolean, except `go`, which also accepts the mapping below. Reject null sections, null values, duplicate keys, unknown keys, and invalid types. An empty map leaves all languages unspecified. Pointer fields preserve absent, false, and true states.
 
-New configurations contain `languages.go: false`. Default merging preserves an absent `languages` section or absent `go` key in existing configurations. It never infers language selection from source files or CodeQL settings. `code_scanning.languages` and `code_quality.languages` remain independent.
+`javascript` is canonical. `typescript` is an alternative spelling for the same capability, not a separate language state. Reject both keys in one mapping, regardless of their values, including equal values, false, null, or invalid types. Internally, one `JavaScript *bool` stores the normalised value. Separate metadata records the authored alias spelling. Both configuration writers preserve that spelling and never emit both keys. `Shell *bool` is independent.
+
+New configurations declare `go`, `python`, `rust`, `shell`, and `javascript` as false and omit `typescript`. Default merging preserves absent sections, empty maps, absent language keys, explicit values, and the authored JavaScript alias, including under `--recut`. It never adds `javascript` beside `typescript` or infers language selection from source files or CodeQL settings. `code_scanning.languages` and `code_quality.languages` remain independent.
 
 Explicit `languages.go: true` or `languages.go: {enabled: true}` activates `.golangci.yml`, `.goreleaser.yaml`, `.github/workflows/build-go.yml`, and `Dockerfile`. All four are development swatches with `first-fit` defaults. The registry contains these entries even when Go is inactive. Default merging appends missing entries only when the config swatch mode permits merging, without changing existing modes.
 
@@ -515,6 +532,113 @@ The builder workflow runs tests, coverage, lint checks, and govulncheck. The sec
 
 The Go release templates use GitHub-hosted runners and do not require Nix or GoReleaser Pro. The release job authenticates to GHCR with the existing GitHub token and grants `packages: write`. No extra secrets are required. The templates do not configure signing or external package repositories. Go support does not change Tailor's independent CodeQL default setup.
 
+### Shell and JavaScript ecosystem support
+
+`languages.shell: true` enables Shell support independently of other languages. Either `languages.javascript: true` or `languages.typescript: true` enables the same combined JavaScript and TypeScript support. Both spellings select identical tools, managed destinations, quality bodies, and lifecycle behaviour.
+
+True creates or updates owned fragments. False removes only owned fragments. Omission preserves fragments without inspection. Shell uses `just/shell.just` and `nix/shell.nix`. JavaScript uses `just/javascript.just` and `nix/javascript.nix`, including when the authored key is `typescript`. The Just fragments are empty compatibility imports. Existing protected roots and ownership checks follow the shared managed-file rules.
+
+Shell lint uses ShellCheck for checks and shfmt for formatting. JavaScript lint uses standalone Oxlint for JavaScript and TypeScript checks and Prettier for formatting. Check mode does not change source files. Correction applies formatter changes first, after source path validation, then runs the same checks once. Oxlint and ShellCheck do not run before formatting. Tailor never enables Oxlint fixes or typed checks. Missing tools and command failures stop later bodies and project scripts. Workflow lint still runs once, and enabled ecosystem bodies run in lexical capability order.
+
+Source discovery uses NUL-delimited Git paths, including untracked files and excluding Git-ignored files even when tracked. JavaScript selects `.js`, `.jsx`, `.mjs`, `.cjs`, `.ts`, `.tsx`, `.mts`, and `.cts`. Shell selects `.sh`, `.bash`, and extensionless files with sh/bash shebangs, without requiring executable permission. Shell fragments without an extension or shebang and shell embedded in YAML require the project lint hook. Empty selections print scope guidance and do not invoke source tools.
+
+Both capabilities include authored sources in hidden directories and in `config` or `configs` directories. They exclude specific metadata, dependency, vendor, output, credential, and secret paths. Tool configuration filenames such as `.prettierrc.*`, `.eslintrc.*`, `.babelrc.*`, and `*.config.*` remain excluded, alongside generated and minified filenames and TypeScript declarations. Generated markers (`@generated`, `Code generated`, or `DO NOT EDIT`) exclude files only within leading header comments in the first 50 lines. Strings and comments after source code do not exclude files. Project ignore rules must cover other generated or sensitive outputs. Native tool ignores remain active. Oxlint uses `--deny-warnings` and permits a selection that its native ignores exclude completely. Each tool receives explicit source paths, never a whole-repository formatting request.
+
+Git submodule entries and untracked nested repository directories are skipped without recursion. A tracked regular source file replaced by a directory still fails validation. Source files must be regular files without symlinks. Their parents within the project must be directories without symlinks. Symlinked workspace ancestors outside the project are permitted. Missing tracked files are skipped.
+
+ShellCheck retains project rc policy without a blanket `-x`. shfmt uses only `--apply-ignore` with `-d` or `-w`. Existing EditorConfig settings remain project-owned, including any semantic formatting options that the project explicitly enables. Tailor adds no EditorConfig parser or command-line style override. The Shell starters below apply only to missing destinations. Prettier retains project configuration, including responsibility for local plugins. Alteration never evaluates configuration code. It parses only package metadata to detect existing policy keys. Lint preflight checks tool availability and source paths before workflow or ecosystem commands.
+
+Neither capability adds automatic build, test, setup, or release commands. Project-specific builds and tests use the existing optional project scripts. JavaScript support requires no npm dependencies, npm scripts, local ESLint installation, or TypeScript parser plugin. Tailor does not install packages, select package managers or lint backends, generate framework configuration, or automate typed lint and compiler checks. Existing project configuration remains project-owned. No target project migration is implicit.
+
+#### Shell policy starters
+
+`languages.shell: true` activates `.shellcheckrc` and `.editorconfig` as ordinary development swatches with `first-fit` defaults. False or omission preserves both files. Default merging adds their entries only with Shell enabled and preserves existing modes. Fresh language-disabled configurations still contain 25 active swatches.
+
+These starters create missing destinations only. Existing root files, including empty and comments-only files, stay byte-for-byte unchanged under `first-fit`, `always`, and `--recut`. Tailor never appends, merges, or rewrites them. `never` skips inspection and creation. Protected creation does not replace a destination that appears during publication.
+
+The `.shellcheckrc` starter contains exactly these comments, with a final newline:
+
+```ini
+# Keep the default checks and infer the dialect from each script.
+# Supply sourced files explicitly, or use -x in a project-specific hook.
+
+# Add only after checking that runtime source paths are script-relative:
+# source-path=SCRIPTDIR
+
+# Enable only after reviewing intentional conditional function calls:
+# enable=check-set-e-suppressed
+```
+
+The absence of active directives is intentional. The starter retains ShellCheck defaults and script dialect inference. It does not enable external sources, disable checks, or force Bash. Review the commented options per project before enabling them.
+
+A comments-only rc still shadows inherited policy. Inspection follows ShellCheck 0.11 native precedence: `.shellcheckrc`, then `shellcheckrc`, in the project directory and each ancestor. The first candidate wins. If none exists, Unix lookup checks `$HOME/.shellcheckrc`, then `$XDG_CONFIG_HOME/shellcheckrc`. An absent or relative XDG directory uses `$HOME/.config/shellcheckrc`. An inherited candidate prevents a competing root starter. Nested rc files remain untouched and are not searched. Non-empty `SHELLCHECK_OPTS`, unknown home paths, and unsupported Windows fallback lookup require manual verification before missing-root creation. Tailor never parses or executes rc directives.
+
+The `.editorconfig` starter contains exactly this Shell-only section, with a final newline:
+
+```ini
+[*.{sh,bash}]
+indent_style = space
+indent_size = 4
+switch_case_indent = true
+simplify = false
+minify = false
+```
+
+Four-space indentation is a personal style choice, not a correctness requirement. Use the supported shfmt key `switch_case_indent`, not the newer master key `case_indent`. The starter has no `root = true`, global `[*]` section, or forced dialect. Safe ancestor EditorConfig files do not block creation, so other-language settings continue to inherit. Existing shared EditorConfig files require manual review of the Shell section unless their bytes exactly match the starter. Tailor does not infer equivalent coverage from globs, section order, or `unset`. Add exact sections for extensionless scripts manually in project-owned configuration. Tailor creates no `.shfmtrc` and adds no shfmt style flags.
+
+Inspection checks only fixed root, ancestor, home, and XDG paths. It uses bounded no-follow reads of regular files up to 1 MiB. Symlinks, non-regular files, inaccessible paths, oversized files, and unsupported inspection produce manual-adoption warnings, never absence claims. `baste` remains read-only. `measure` reports inherited rc policy as present and unsafe or unverified policy as warnings, without misleading missing or not-configured findings. Presence establishes no runtime compatibility.
+
+Native lookup follows the [ShellCheck 0.11 manual](https://github.com/koalaman/shellcheck/blob/v0.11.0/shellcheck.1.md#rc-files) and its [implementation](https://github.com/koalaman/shellcheck/blob/v0.11.0/shellcheck.hs).
+
+#### JavaScript policy starters
+
+Either JavaScript spelling activates three ordinary development swatches with `first-fit` defaults: `.oxlintrc.json`, `.prettierrc.json`, and `.prettierignore`. False or omission makes these starters inactive without deleting existing files. Normal alterations preserve canonical files. Explicit `always` and `--recut` can replace canonical files unless inspection finds an alternate, conflicting, or unsafe policy.
+
+The Oxlint starter contains exactly:
+
+```json
+{
+  "plugins": ["typescript", "unicorn", "oxc"],
+  "categories": {"correctness": "error"}
+}
+```
+
+The Prettier starter records syntax defaults without selecting a parser. It omits `printWidth`, `tabWidth`, `useTabs`, and `endOfLine`. Existing EditorConfig width, indentation, and line-ending policy continues to apply. Without that policy, Prettier uses its defaults.
+
+```json
+{
+  "$schema": "https://www.schemastore.org/prettierrc.json",
+  "semi": true,
+  "singleQuote": false,
+  "trailingComma": "all",
+  "bracketSpacing": true,
+  "arrowParens": "always"
+}
+```
+
+The ignore starter contains these lines with a final newline:
+
+```text
+node_modules/
+vendor/
+third_party/
+third-party/
+generated/
+dist/
+build/
+coverage/
+*.min.*
+*.map
+```
+
+Inspection checks fixed filenames at the project root and ancestors only, never descendants. Alternative or inherited native Prettier filename variants and top-level `prettier` entries in `package.json` or `package.yaml` prevent competing configuration and ignore starters. A root canonical `.prettierrc.json` does not block creation or restoration of `.prettierignore`, including in the same alteration. Existing `.oxlintrc.json` policies prevent a competing Oxlint starter. `.oxlintrc.jsonc`, `oxlint.config.ts`, and `oxlint.config.mts` require manual adoption without claims about runtime acceptance. ESLint legacy or flat configurations, package `eslintConfig`, and Biome JSON or JSONC policies prevent all three starters and require manual adoption. Tailor never translates these policies or selects another backend. Native Oxlint and Prettier lint bodies remain enabled, so review policy before running lint.
+
+Inspection preserves symlinks, non-regular files, unreadable files, and unsupported or ambiguous metadata. Metadata reads are limited to 1 MiB. Read or parse failures produce manual-adoption warnings, never absence claims. Canonical JSON policy files need no rule validation. `baste` stays read-only. `measure` reports equivalent policies as present and adoption cases as warnings, suppressing misleading `not-configured` findings. Presence alone proves no policy or runtime compatibility.
+
+Projects can extend native configuration with browser, Node.js, or framework scopes. Tailor adds no universal globals, framework rules, typed checks, compiler checks, or npm dependencies. Build and test policy stays in project hooks. Editor configuration and Nix package policy remain project-owned.
+
+The baselines follow [Oxlint configuration](https://oxc.rs/docs/guide/usage/linter/config), [Oxlint plugins](https://oxc.rs/docs/guide/usage/linter/plugins), and Prettier [options](https://prettier.io/docs/options), [configuration](https://prettier.io/docs/configuration), and [ignores](https://prettier.io/docs/ignore).
+
 ### Rust ecosystem support
 
 Explicit `languages.rust: true` enables one root Cargo package or host-compatible workspace. False removes owned `just/rust.just` and `nix/rust.nix` fragments. Omission preserves them without inspection. The Just fragment is an empty compatibility import. New configurations declare false. Default merging and serialisation preserve omission and explicit values. Cargo files never activate Rust automatically.
@@ -542,27 +666,37 @@ The wiki publication job uses `ubuntu-slim` with an explicit 15-minute timeout, 
 
 `repository.has_wiki: true` activates four wiki swatches on public repositories. No separate config section or command exists. Every config that `fit` creates uses `has_wiki: false`, including for repositories with an enabled wiki. An omitted setting leaves wiki files unmanaged, even when default merging adds `false` during that run.
 
-The fixed sources are `wiki/Home.md`, `wiki/_Sidebar.md` and `wiki/_Footer.md`, with `first-fit` defaults. Existing starter destinations remain unchanged, including recut and an explicit `always` mode. `never` skips creation. `.github/workflows/tailor-wiki.yml` defaults to `always`, starts with `# Managed by Tailor: wiki`, and uses resolved-content comparison. A protected `first-fit` or `never` workflow must match the generated YAML semantics. An unmarked workflow blocks enabled setup before writes, including recut. The four paths are development swatches, excluded from generic processing and local health checks but included in config comparison. The registry contains 31 swatches.
+The fixed sources are `wiki/Home.md`, `wiki/_Sidebar.md` and `wiki/_Footer.md`, with `first-fit` defaults. Starter generation preserves existing destinations, including recut and an explicit `always` mode. An automatic import can replace same-path files with backups. `never` skips starter creation. `.github/workflows/tailor-wiki.yml` defaults to `always`, starts with `# Managed by Tailor: wiki`, and uses resolved-content comparison. A protected `first-fit` or `never` workflow must match the generated YAML semantics. An unmarked workflow blocks enabled setup before writes, including recut. The four paths are development swatches, excluded from generic processing and local health checks but included in config comparison. The registry contains 36 swatches.
 
 Local safety preflight runs before writes. It rejects source symlinks, Git metadata, non-regular files and unsafe workflow destinations or parents through rooted filesystem access. Pages preflight also completes before wiki enablement. Tailor reads repository privacy, the current default branch and `has_wiki`. Known private repositories and projects without repository context skip wiki files. Unavailable or incomplete repository metadata blocks readiness.
 
-For a declared public wiki, `alter` enables a disabled wiki through a repository PATCH containing only `has_wiki: true`. This is the sole write before readiness. Tailor then checks the remote wiki and local adoption. A readiness blocker exits nonzero before config updates, retired workflow removal or any other local or remote write. Confirmed enablement remains in effect if readiness fails. Tailor reports that change. An enablement failure stops the command.
+For a declared public wiki, `alter` enables a disabled wiki through a repository PATCH containing only `has_wiki: true`, then continues in the same run. This is the sole remote write before readiness. Tailor then checks the remote wiki, local adoption and pending import state. Whatever the state of the remote wiki, `alter` does the required work automatically, without a prompt or a flag. A blocker stops normal alterations before config updates, retired workflow removal and all remaining local or remote writes. Confirmed enablement remains in effect after a later failure. Tailor reports that change. An enablement failure stops the command.
 
-Inspect the public wiki through bounded, anonymous Git reads in an isolated temporary clone. Never import into the project, push commits or change remote wiki history. A confirmed empty remote requires the user to create and save the first page at the repository's `/wiki` URL. The user then manually imports all files except `.git` from a separate wiki clone into `wiki/`, after reviewing local conflicts. After import, the user records the imported HEAD in `wiki/.tailor-wiki-base`. The user runs `tailor baste` to recheck readiness. When the wiki checks pass, the user runs `tailor alter`.
+Inspect the public wiki through isolated, anonymous Git reads in temporary storage. Ready, adopted sources remain untouched, including dirty local edits. A pending import prevents normal readiness even when the baseline otherwise passes. For a readable unadopted wiki, prepare an import pinned to remote HEAD. Eligible reimports include independent remote changes, incomplete imports and unavailable published source history. Malformed baselines, unsafe content and unknown inspection states require manual review, not automatic repair.
 
-Failed Git access remains unknown. Report access or network errors separately, with conditional first-page guidance rather than a claim that the wiki is missing.
+`alter` applies the complete pinned import automatically, in interactive and noninteractive runs and with or without `--recut`. The import keeps every safety check below. `tailor baste --verbose` shows the full plan before the run. `--adopt-wiki` is no longer required. `alter` accepts it for compatibility, and it has no effect. `--local-only` rejects `--adopt-wiki`. Normal declared alterations follow after the import. The CLI never stages, commits, pushes wiki changes or changes remote wiki history.
 
-`baste` reports readiness blockers and continues the full preview without writes. After all preview results, it appends a `Next steps:` section for the blocker. The section states that `would copy` and other pending changes wait until wiki readiness passes. Readiness blockers alone do not change the preview's successful exit status.
+GitHub creates the wiki Git repository only when the first page is saved. Until then, an anonymous Git read answers "not found" or asks for credentials. When repository metadata confirms `private: false` and `has_wiki: true`, including a wiki that this run enabled, Tailor classifies that answer as a confirmed empty wiki. Without that metadata, the answer remains an unknown access state. A confirmed empty wiki does not block the run. `alter` creates the local starter pages and the wiki workflow, applies all other declared alterations, and reports the browser step as guidance. The user creates and saves the first page at the repository's exact `/wiki` URL, then runs `tailor alter` again to import it. Tailor does not use a first-page API or attempt an initial push. Report other access or network errors separately rather than claiming that the wiki is missing.
 
-A disabled wiki requires enablement before remote readiness can be checked. Its next steps start with `tailor alter` to enable the wiki through the API. They include conditional first-page creation at the repository's exact `/wiki` URL and manual import instructions if adoption is required. Include the separate clone command, conflict review, import of all files except `.git`, and the command to record imported HEAD in `wiki/.tailor-wiki-base`. Do not claim that a disabled wiki has no pages. Finish with `tailor baste` to recheck readiness, then `tailor alter` to apply the remaining changes.
+`baste` never prompts or writes persistent data. Temporary isolated Git reads remain permitted. It reports import plans, the empty-wiki browser step or readiness blockers and continues the full preview. For a blocker, guidance follows the preview and states that other changes wait until wiki readiness passes. Readiness blockers alone do not change the preview's successful exit status.
 
-Confirmed access and network blockers give check-and-retry instructions, without page creation or import instructions. If Tailor cannot distinguish absence from denied access, direct the user to check access at the exact `/wiki` URL. Only after access works does that guidance suggest first-page creation, if no page exists. It gives no import instructions for this unknown state.
+A disabled wiki requires enablement before remote readiness can be checked. Its next steps start with `tailor alter`, which enables the wiki through the API and imports existing pages automatically. First-page creation remains conditional until then. Guidance uses the repository's exact `/wiki` URL. Do not claim that a disabled wiki has no pages.
+
+Access and network blockers give check-and-retry instructions, without page creation or import instructions. If Tailor cannot distinguish absence from denied access, because metadata does not confirm a public repository with an enabled wiki, direct the user to check access at the exact `/wiki` URL. Only after access works does that guidance suggest first-page creation, if no page exists. It gives no import instructions for this unknown state.
 
 Reconcile ready wiki files after Pages and before the licence. Pages and its source directory remain independent. `measure` and `docket` add no wiki requests.
 
-The generated workflow runs for default-branch changes to `wiki/**` or itself, and manual dispatch on that branch. It checks current wiki availability, public visibility and the current default branch before publishing. The workflow uses a GitHub-hosted runner and built-in `GITHUB_TOKEN` with `contents: write`. Upstream implementation evidence supports token access, but Tailor's end-to-end publication is not live-tested. Tailor does not provision secrets or personal access tokens.
+The generated workflow runs for default-branch changes to `wiki/**` or itself, and manual dispatch on that branch. It checks current wiki availability, public visibility and the current default branch before publishing. When the wiki has no pages, the clone answers "not found" or returns no commits. The workflow then logs that it skips publication until the first page exists, and succeeds. The workflow uses a GitHub-hosted runner and built-in `GITHUB_TOKEN` with `contents: write`. Upstream implementation evidence supports token access. Tests use offline fixtures, not live adoption or publication acceptance. Tailor does not provision secrets or personal access tokens.
 
-Before initial adoption, the user reviews local conflicts and manually imports every file from a separate wiki clone, except `.git`, into `wiki/`. Only after import does the user record the imported HEAD in `wiki/.tailor-wiki-base`, as one full 40-character lowercase hexadecimal commit ID. The user runs `tailor baste` to recheck readiness, then `tailor alter` before committing the imported files, baseline and workflow. A missing, malformed or stale baseline blocks initial setup. Starter pages alone never authorise replacement.
+Read snapshot blobs directly from Git objects without checkout filters. Preserve binary bytes and executable modes. Reject symlinks, submodules, unsupported modes, unsafe or reserved paths, case or Unicode path collisions, and unresolved conflict markers. The snapshot limits are 10,000 files, 16 MiB per blob, 64 MiB total content, 8 MiB tree output, 4096 bytes per path and 64 path components. These limits do not bound clone-history disk use. Validate local-only paths and combined path collisions before the import. Local-only files and identical files remain unchanged.
+
+Before replacements, preserve original bytes and modes in `tailor/wiki-imports/<transaction>` under the actual per-worktree Git directory. Keep recovery data outside project files and `wiki/`, including for linked worktrees. Stage source bytes and backups before installing files. Write `wiki/.tailor-wiki-base` last as the full 40-character lowercase hexadecimal remote commit ID. Retain journals and backups after completion. The user reviews and commits imported files, the baseline and workflow through the normal project workflow.
+
+Resume only a valid interrupted plan bound to the same project, remote and pinned HEAD. Check journal structure, stored sources, backups, modes and before/after hashes. Valid incomplete staging can resume when missing stored data matches the recorded plan. `alter` resumes a valid plan automatically. Changed remote or local data, corrupt state, unknown backups, missing valid journals and detected unsafe races stop adoption with recovery guidance. Preserve recovery data for manual review rather than discarding it.
+
+Use an exclusive import lock and recheck destinations, parents and remote HEAD before publication and baseline installation. Safe import locking is explicitly unsupported on non-Unix platforms. Supported releases target Linux and macOS. File publication does not make the import or complete `alter` run atomic. A later failure can leave completed writes in place. Do not promise rollback or a filesystem compare-and-swap against concurrent editors.
+
+Reserved `.tailor-wiki-*` artefacts block adoption and publication, except the root `wiki/.tailor-wiki-base`. This includes abandoned publication temporary files. Retain such artefacts for manual review before retrying. Starter pages alone never authorise replacement.
 
 Readiness accepts initial adoption or explicit reimport when the baseline matches remote HEAD and every remote file path exists as a regular local source file. Local edits remain permitted. Otherwise, readiness requires exactly one valid `Tailor-Wiki-Source` trailer and a source commit that is an ancestor of local HEAD. Remote file modes and Git object IDs must match that commit's wiki tree, excluding the baseline. Independent remote edits or unknown source history block readiness and require reviewed reimport. These checks do not prove successful publication. The user checks the generated workflow run after the push.
 
@@ -733,6 +867,11 @@ Use an exclusive sibling temporary file, file sync, close, rename, and directory
 | `justfile` | `first-fit` |
 | `cubic.yaml` | `first-fit` |
 | `flake.nix` | `first-fit` |
+| `.shellcheckrc` (only when `languages.shell: true`) | `first-fit` |
+| `.editorconfig` (only when `languages.shell: true`) | `first-fit` |
+| `.oxlintrc.json` (JavaScript enabled through either spelling) | `first-fit` |
+| `.prettierrc.json` (JavaScript enabled through either spelling) | `first-fit` |
+| `.prettierignore` (JavaScript enabled through either spelling) | `first-fit` |
 | `.golangci.yml` (only when `languages.go: true`) | `first-fit` |
 | `.goreleaser.yaml` (only when `languages.go: true`) | `first-fit` |
 | `.github/workflows/build-go.yml` (only when `languages.go: true`) | `first-fit` |
@@ -766,6 +905,11 @@ Use an exclusive sibling temporary file, file sync, close, rename, and directory
 - `.envrc`
 - `flake.nix`
 - `justfile`
+- `.shellcheckrc`
+- `.editorconfig`
+- `.oxlintrc.json`
+- `.prettierrc.json`
+- `.prettierignore`
 - `ruff.toml`
 - `pyrightconfig.json`
 - `.golangci.yml`
@@ -843,25 +987,31 @@ Commands divide into three categories: bootstrap commands, which create the proj
 
 ### Output formats
 
-Tailor has two display contracts. `--format=auto` is the default. It uses rich output when standard output is a terminal. It uses plain output for redirected output, piped output, `TERM=dumb`, and `--format=plain`.
+`--format=auto` is the default. On terminal standard output with `TERM` other than `dumb`, it selects the terminal layout. Pipes, redirected streams, and `TERM=dumb` use border-free concise reports. Explicit `--format=plain` selects the legacy result rows documented below. Their order, escaping, streams, partial-write reporting, and exit codes stay unchanged. Guidance uses inspection-based instructions. Plain output has no ANSI or cursor controls. Help, version, parse errors, warnings, and fatal errors keep their existing streams and formats.
 
-Plain output is the stable text contract that each command documents below. Its bytes, order, escaping, streams, partial-write reports, and exit codes do not change. Plain output has no ANSI or cursor controls. Help, version, parse errors, warnings, and fatal errors keep their existing streams and formats.
+Concise output uses typed results, notices, ordered guidance, and summary totals. Results record domain, category, outcome, action, name, before and after values, reason, and provenance. The renderer does not infer status from display text.
 
-Rich output uses typed results before flat formatting. Each result records the command, context, domain, category, outcome, action, name, before value, after value, reason, and provenance. Notices, ordered guidance, and summary totals are also typed. The renderer does not infer status from display text.
+Reports show command and context, the command's preview or execution mode, notices, attention, changes, and totals. Default reports hide preserved, excluded, and unchanged details, except for identity details in `docket`. `--verbose` shows every result.
 
-Rich reports use this order: command and context summary, all planned or applied changes, all items that need attention, policy-preserved items, already-matching items, notices, then ordered guidance. Domain is the second grouping level. The default report collapses policy-preserved items by reason and unchanged items by domain. `--verbose` expands every item inside its outcome and domain groups. The default report never hides a mutation or an actionable blocker.
+The terminal layout uses a command header, context, and a mode badge. Attention appears first under `Needs attention`. Default changes appear under `Proposed changes` for `baste`, or `Results` for other commands. `Reapply requests` has a separate panel and count, outside the alteration count. `docket` shows unchanged identity results under `Identity`. Panels have one frame depth. Default rows use readable names and domain headings, with category qualifiers where needed. Verbose reports put totals below the mode badge, without repeated totals at the end. Domains with changes precede matching-only domains. Within each domain, results appear once under proposed, applied, created, reapply, matching, preserved, and excluded headings, in that order. Preserved and excluded results share each reason once, followed by their paths. Reasons use lexical order, with source order retained within each reason. Ruleset parameters use qualified subsection headings and exact leaf identifiers. Matching values have no unchanged-value arrow. Preserved and excluded totals have no reason breakdown in the terminal layout.
 
-Each group is a bordered card. At 72 columns or more, a row keeps its highlighted value beside its name and category summaries use count grids. Below 72 columns, values move below names and category counts stack. Borders fit the detected width. An ASCII terminal uses `+`, `-`, and `|` borders, `*` for active work, `ok` for completion, `~` for a change, and `!` for attention.
+Border-free concise reports group results by outcome and use provenance-qualified names. Preserved and excluded totals include reason counts. Both layouts wrap prose without splitting backtick commands or long paths. Source snippets retain indentation and complete lines. Terminal widths below 60 columns use labelled sections without frames. Oversized result rows use a labelled detail block outside their domain frame. The frame retains a readable reference to that block. Typed list values wrap between items, never within an item. Exact keys, paths, commands, and indented source snippets stay complete, without truncation. Oversized guidance stays unboxed. A planned reapply request shows `would reapply`, the value, and the exact reason without an unchanged-value arrow.
 
-Colour does not carry meaning. Words, symbols, and counts identify every outcome. The Tailor heading uses violet. Planned alterations use cyan, applied and matching results use green, attention uses amber, and errors use red. Policy preservation uses neutral violet, not warning colour. `--color=auto|always|never` controls colour independently from layout. `NO_COLOR` disables automatic colour. Tailor escapes control characters in untrusted presentation fields before styling them.
+Preservation means that policy keeps an existing item, such as a first-fit file, protected root, or unowned Dependabot file. Exclusion means that management is disabled, such as `never` or inactive Dependabot management. Neither outcome is an actionable blocker by itself. Ownership conflicts and access or setup blockers appear under attention.
 
-`--quiet` prints one final summary while warnings and fatal errors remain on standard error. `--no-progress` disables live progress without changing the final rich report. `--format=plain` disables progress regardless of the other flags.
+Guidance uses deduplicated action blocks ordered by their explicit order value, with final advice last. Equal order values retain input order. Source numbering stays intact without an extra numbered wrapper. Required manual edits or verification steps replace generic final advice. The terminal layout puts required guidance or final advice in `Next`. Optional and informational guidance follow `Next` under `Additional guidance` and do not suppress the next action. Missing MCP entries include their location, a copyable provider snippet, and a preview/restart check. Dependabot adoption is optional. Default concise output shows only the first line of multiline optional guidance and a command-specific verbose hint. `--verbose` shows the full adoption steps and safeguards, including backup, template review, explicit Go state, exact-marker, alternate-path, preview, and approval steps. Legacy plain reports append the same state-aware guidance.
+
+Colour does not carry meaning. The terminal layout uses the user's palette without background queries. Identity and suggested commands use palette index 5, changes use 6, attention uses 3, and reapply requests use 4. Matching-only domain frames use palette index 2. Every frame has a non-grey semantic accent when colour is enabled. Matching, preserved, and excluded values use normal-weight supporting text in the terminal's foreground, without faint intensity. Explicit backtick spans and indented guidance commands or source snippets receive code highlighting. Backtick delimiters remain visible, including in monochrome output.
+
+`--color=auto|always|never` controls colour on capable terminals only. `NO_COLOR` disables automatic colour without changing the terminal layout, while `always` overrides it. `--color=never` also retains the layout. Locale detection checks `LC_ALL`, then `LC_CTYPE`, then `LANG`. Without a UTF-8 locale, frames and transition arrows use ASCII characters. Redirected output, `TERM=dumb`, and `--format=plain` have no colour, including with `--color=always`. Tailor escapes control characters in presentation fields before styling them.
+
+`--quiet` prints totals, attention details, notices, and essential manual edits or verification steps. It omits optional and informational guidance, and routine final advice without attention. Quiet takes precedence over verbose and selects concise output even with `--format=plain`. Warnings and fatal errors remain on standard error. `--no-progress` disables live progress without changing final output. `--format=plain` disables progress regardless of the other flags.
 
 ### Progress
 
-`fit`, `baste`, `alter`, `measure`, and `docket` publish typed stage events around meaningful local and GitHub operations. A rich command writes one inline Bubble Tea display to standard error and never enters the alternate screen. Stage text appears promptly. The spinner starts only after the active stage lasts about 300 milliseconds. Tailor uses one indeterminate spinner because the GitHub request count can change. Tailor does not show a percentage unless planning supplies a fixed total.
+`fit`, `baste`, `alter`, `measure`, and `docket` publish typed stage events around meaningful local and GitHub operations. An automatic-format command on capable terminals writes one inline Bubble Tea display to standard error and never enters the alternate screen. Stage text appears promptly. The spinner starts only after the active stage lasts about 300 milliseconds. Tailor uses one indeterminate spinner because the GitHub request count can change. Tailor does not show a percentage unless planning supplies a fixed total.
 
-The live display contains at most three lines and stops before final standard output. Tailor suspends the display around warnings and errors, then redraws the active stage. Non-terminal standard error, `TERM=dumb`, `--format=plain`, and `--no-progress` emit no animation or cursor controls. With `--verbose`, stage diagnostics can use append-only records. Durable command results use standard output. Warnings and fatal errors use standard error.
+The live display contains at most three lines and stops before final standard output. Tailor suspends the display around warnings and errors, then redraws the active stage. Non-terminal standard error, `TERM=dumb`, `--format=plain`, and `--no-progress` emit no animation or cursor controls. Verbose mode retains the same delayed spinner and emits no append-only stage records. Non-terminal verbose reports emit no progress records. Durable command results use standard output. Warnings and fatal errors use standard error.
 
 ### `fit <path>`
 
@@ -869,7 +1019,7 @@ Creates a project directory and writes `.tailor.yml` from the embedded `swatches
 
 The defaults can disable an existing wiki, Code Quality and immutable releases, and replace an existing `Tailor` ruleset when `alter` applies them. Edit the generated config before `alter` to preserve different settings. Topics stay unmanaged because the embedded defaults omit them.
 
-The default swatch set contains 31 registered destinations:
+The default swatch set contains 36 registered destinations:
 
 - `.github/workflows/tailor-pages.yml`
 - `pages/index.html`
@@ -891,6 +1041,11 @@ The default swatch set contains 31 registered destinations:
 - `CONTRIBUTING.md`
 - `SUPPORT.md`
 - `justfile`
+- `.shellcheckrc`
+- `.editorconfig`
+- `.oxlintrc.json`
+- `.prettierrc.json`
+- `.prettierignore`
 - `ruff.toml`
 - `pyrightconfig.json`
 - `.golangci.yml`
@@ -951,7 +1106,7 @@ tailor alter --local-only --directory /path/to/project \
   --path .github/dependabot.yml --path nix/hooks/go.nix --path just/tailor.just
 ```
 
-This mode requires at least one explicit `--path`. The initial fixed allowlist contains only the three paths above. Duplicate and unsupported paths fail. `--directory` defaults to the current directory. Both flags require `--local-only`, and this mode rejects `--recut`.
+This mode requires at least one explicit `--path`. The initial fixed allowlist contains only the three paths above. Duplicate and unsupported paths fail. `--directory` defaults to the current directory. Both flags require `--local-only`, and this mode rejects `--recut` and `--adopt-wiki`.
 
 The command reads the existing `.tailor.yml` and uses the normal template renderers. It does not resolve authentication or repository context, call GitHub, run external commands, or access the network. It does not merge defaults, migrate config, bootstrap files, remove files, or change the Git index. Repository settings, licences, Pages, wiki, and other destinations remain untouched.
 
@@ -966,15 +1121,17 @@ All requested files pass preflight before the first write. Each replacement is a
 Without `--local-only`, `alter` checks at startup that an authentication token is present for the effective host and exits with an error if the token is missing. It then reads `.tailor.yml` in the current working directory. No upward traversal is performed. The API verification of the token (`GET /user`) happens after config parsing and normalisation, before the config write and any other local file change; if the effective host rejects the token, `alter` exits with the API error. Implementation Note 9 gives the full execution order.
 
 ```bash
-tailor alter              # Apply changes
-tailor alter --recut      # Apply and override first-fit protection
+tailor alter               # Apply changes
+tailor alter --recut       # Apply and override first-fit protection
 ```
+
+`alter` imports an existing wiki automatically, without a prompt. `--adopt-wiki` is no longer required. `alter` accepts it for compatibility, and it has no effect. See [GitHub wiki](#github-wiki) for import and recovery rules.
 
 Behaviour:
 
 - If `.tailor.yml` is missing or malformed, exits immediately with the error described in Error Handling.
 - **Retired workflow migration**: before strict path and mode validation, `alter` removes both retired paths from the in-memory config. The paths are `.github/workflows/tailor-automerge.yml` and `.github/workflows/tailor.yml`. This migration accepts the historical `triggered` mode only on these retired entries. The migration ignores the entry mode and the mode of the `.tailor.yml` swatch.
-- **Config update**: after migration, Tailor normalises the security prerequisites (automated security fixes, secret scanning push protection, and secret scanning non-provider patterns) and emits their warnings before validation. `alter` then writes a changed config once. The write uses a `# Refitted by tailor on <DATE>` header comment (YYYY-MM-DD). It combines security prerequisite normalisation and all retired-entry removals with built-in defaults merged in the same run. The write occurs before repository API changes, except the early wiki enablement described above. Wiki readiness must pass first. If the config did not change, `alter` does not write it. The default merge runs when `.tailor.yml` has `alteration: always`. The `alteration: first-fit` mode skips the merge. Sections restored by the merge are managed in the same run, so omission alone does not disable them. Security prerequisite normalisation is independent of the config swatch mode. See "Header comment" below for the comment format. The merge rules are:
+- **Config update**: after migration, Tailor normalises the security prerequisites (automated security fixes, secret scanning push protection, and secret scanning non-provider patterns) and emits their warnings before validation. `alter` then writes a changed config once. The write uses a `# Refitted by tailor on <DATE>` header comment (YYYY-MM-DD). It combines security prerequisite normalisation and all retired-entry removals with built-in defaults merged in the same run. The write occurs after any automatic wiki import and before repository API changes, except the early wiki enablement described above. Wiki readiness must pass first. If the config did not change, `alter` does not write it. The default merge runs when `.tailor.yml` has `alteration: always`. The `alteration: first-fit` mode skips the merge. Sections restored by the merge are managed in the same run, so omission alone does not disable them. Security prerequisite normalisation is independent of the config swatch mode. See "Header comment" below for the comment format. The merge rules are:
   - **Swatches**: appends each missing default swatch with the default alteration mode. The merge does not modify active entries.
   - **Repository settings**: fills nil fields only from built-in defaults; never overwrites non-nil fields. This appends missing security settings with the built-in defaults (`true` for the Boolean settings and `enabled` for the secret scanning settings) and preserves explicit `false` or `disabled` values except for the automated security fixes, secret scanning push protection, and secret scanning non-provider patterns prerequisites described above. `Description`, `Homepage`, and `Topics` are excluded from this merge because they are project-specific.
   - **Actions policy**: adds the complete default section when absent. Otherwise, it fills missing core fields and missing or null approval policies without changing explicit values. It fills missing selected-action fields only when the effective policy is `selected`.
@@ -993,6 +1150,7 @@ Behaviour:
 - For `always` swatches other than `.tailor.yml`: compares the SHA-256 of the embedded swatch content against the on-disk file. Tailor overwrites the file if the hashes differ. For a token-bearing swatch configured as `always`, Tailor resolves `{{GITHUB_USERNAME}}`, `{{ADVISORY_URL}}`, or `{{SUPPORT_URL}}` before the comparison. The resolved content can produce `no change` when it matches the on-disk file. The token-bearing swatches are `.github/FUNDING.yml`, `SECURITY.md`, and `.github/ISSUE_TEMPLATE/config.yml`.
 - For `first-fit` swatches: copies only if the destination file does not exist; never overwrites. If the destination exists, the swatch is skipped entirely - no SHA-256 comparison is performed.
 - For `never` swatches: skips entirely. No file is written or compared.
+- Shell policy starters are protected exceptions: existing `.shellcheckrc` and `.editorconfig` files remain unchanged in every mode, including `--recut`. Inherited rc policy prevents a competing root starter.
 - For licences: if `.tailor.yml` contains a `license` key with a value other than `none`, and no `LICENSE` file exists on disk, fetches the licence text via the GitHub REST API (`GET /licenses/{id}`) and writes it to `LICENSE`. The text is written verbatim as returned by GitHub - no token substitution is performed. Always treated as `first-fit`; the on-disk `LICENSE` file is never overwritten. If the licence fetch fails (e.g. unrecognised licence identifier), `alter` exits with the API error.
 - For `.github/FUNDING.yml`: substitutes `{{GITHUB_USERNAME}}` before writing. `{{GITHUB_USERNAME}}` is resolved through `GET /user`. Tailor returns the API error if the request fails. The Sponsorships checkbox under Settings > General > Features is not exposed via the GitHub API. After alter places `.github/FUNDING.yml`, enable sponsorships manually in repository settings.
 - For `SECURITY.md`: substitutes `{{ADVISORY_URL}}` before writing. `{{ADVISORY_URL}}` is constructed at `alter` time as `https://github.com/<owner>/<name>/security/advisories/new` from the repository context (owner/name). If no GitHub repository context exists (e.g. a brand-new project with no remote), `{{ADVISORY_URL}}` is left unsubstituted in the written file. `alter` will resolve and substitute it on a subsequent run once the repository has a remote.
@@ -1021,7 +1179,7 @@ Behaviour:
 - Before strict validation, `baste` applies the same in-memory retired workflow migration and security prerequisite normalisation as `alter`. It accepts historical `triggered` entries only for the two retired paths. It emits the normalisation warning and reports `would update: .tailor.yml` without writing.
 - `baste` performs the same comparison and file-safety checks as `alter` but writes and removes nothing. It reports what `alter` would do.
 
-Output contract - repository settings, Actions policy settings, code scanning settings, Code Quality settings, and ruleset settings are shown first, then labels, then variables, then file results. Actions policy fields use the `actions.` prefix. Code scanning fields use the `code_scanning.` prefix, and Code Quality fields use the `code_quality.` prefix, for example `code_scanning.state = configured` and `code_quality.state (already not-configured)`. Ruleset fields use the `ruleset.` prefix, for example `ruleset.enforcement = active`, `ruleset.rules.pull_request (already enabled)`, `ruleset.rules.required_status_checks.parameters.required_status_checks = Sentinel 👁️`, `ruleset.rules.code_scanning (already disabled)`, and `ruleset.rules.code_scanning.parameters.code_scanning_tools = CodeQL (errors, high_or_higher)`. File results include the licence, the `.tailor.yml` default merge, and swatches. `baste` uses planned labels. `alter` and `alter --recut` use completed labels, and report each label only after the change succeeds. Informational and access-warning labels are the same for all three commands.
+Legacy result-row contract (`--format=plain`) - repository settings, Actions policy settings, code scanning settings, Code Quality settings, and ruleset settings are shown first, then labels, then variables, then file results. Actions policy fields use the `actions.` prefix. Code scanning fields use the `code_scanning.` prefix, and Code Quality fields use the `code_quality.` prefix, for example `code_scanning.state = configured` and `code_quality.state (already not-configured)`. Ruleset fields use the `ruleset.` prefix, for example `ruleset.enforcement = active`, `ruleset.rules.pull_request (already enabled)`, `ruleset.rules.required_status_checks.parameters.required_status_checks = Sentinel 👁️`, `ruleset.rules.code_scanning (already disabled)`, and `ruleset.rules.code_scanning.parameters.code_scanning_tools = CodeQL (errors, high_or_higher)`. File results include the licence, the `.tailor.yml` default merge, and swatches. `baste` uses planned labels. `alter` and `alter --recut` use completed labels, and report each label only after the change succeeds. Informational and access-warning labels are the same for all three commands.
 
 | Result | `baste` | `alter` and `alter --recut` |
 |---|---|---|
@@ -1143,6 +1301,8 @@ Assesses a project's community health files and, when `.tailor.yml` is present, 
 ```bash
 tailor measure
 ```
+
+The following examples and category ordering describe `--format=plain`. Default concise output groups health and configuration problems under attention.
 
 **Without `.tailor.yml`** (health file check only):
 
@@ -1277,7 +1437,7 @@ Behaviour:
 
 Tailor opens `.tailor.yml` relative to the project root. It does not search parent directories. The config must be a regular file no larger than 1 MiB (1,048,576 bytes).
 
-The active configuration has 31 swatches and three alteration modes: `always`, `first-fit`, and `never`. Two paths are retired migration entries: `.github/workflows/tailor-automerge.yml` and `.github/workflows/tailor.yml`. `alter` and `baste` remove every matching entry before strict path, duplicate-path, and mode validation. The historical `triggered` mode is accepted only on these removed entries. Retired paths are not active swatches. Tailor never adds them to a generated or refitted config.
+The registry has 36 swatches, with 25 active in fresh language-disabled configurations, and three alteration modes: `always`, `first-fit`, and `never`. Two paths are retired migration entries: `.github/workflows/tailor-automerge.yml` and `.github/workflows/tailor.yml`. `alter` and `baste` remove every matching entry before strict path, duplicate-path, and mode validation. The historical `triggered` mode is accepted only on these removed entries. Retired paths are not active swatches. Tailor never adds them to a generated or refitted config.
 
 Default (with `--license=BlueOak-1.0.0`). The `license` key varies by flag (`MIT`, `Apache-2.0`, `none`, etc.) - the rest of the generated file is identical regardless of licence choice:
 
@@ -1285,6 +1445,10 @@ Default (with `--license=BlueOak-1.0.0`). The `license` key varies by flag (`MIT
 # Initially fitted by tailor on 2026-03-02
 languages:
   go: false
+  rust: false
+  python: false
+  shell: false
+  javascript: false
 
 license: BlueOak-1.0.0
 
@@ -1602,11 +1766,16 @@ Swatches are embedded in the tailor binary at build time from `swatches/`:
 
 ```
 swatches/
+├── .editorconfig
+├── .shellcheckrc
 ├── .envrc
 ├── .gitignore
 ├── .golangci.yml
 ├── .goreleaser.yaml
 ├── .mcp.json
+├── .oxlintrc.json
+├── .prettierrc.json
+├── .prettierignore
 ├── Dockerfile
 ├── cubic.yaml
 ├── CODE_OF_CONDUCT.md
@@ -1626,10 +1795,14 @@ swatches/
 │   ├── loader.just
 │   ├── tailor.just
 │   ├── go.just
+│   ├── javascript.just
+│   ├── shell.just
 │   └── pages.just
 ├── nix/
 │   ├── loader.nix
 │   ├── go.nix
+│   ├── javascript.nix
+│   ├── shell.nix
 │   ├── pages.nix
 │   └── playwright.nix
 ├── .github/
@@ -1650,6 +1823,10 @@ swatches/
 │   ├── static.yml
 │   ├── hugo.yml
 │   └── jekyll.yml
+├── quality/
+│   ├── lint-javascript.sh
+│   ├── lint-shell.sh
+│   └── source-preflight.sh
 └── .tailor.yml
 ```
 
@@ -1680,4 +1857,4 @@ The loader conditionally imports available fragments. The core owns `build`, `te
 6. **Authentication via `go-gh`**: All project metadata, user metadata, licence content, and repository settings are resolved via `go-gh` (`github.com/cli/go-gh/v2`), the official Go library for GitHub CLI extensions. Token resolution follows the `go-gh` precedence order: `GH_TOKEN` environment variable, `GITHUB_TOKEN` environment variable, `gh` config file, `gh` keyring (via the `gh` binary). When `GH_TOKEN` or `GITHUB_TOKEN` is set, the `gh` binary is not required. The `gh` binary is needed only for `gh auth login` (establishing credentials) and as a fallback for keyring-based token access when no environment variable is set. Repository context detection reads git remotes via `go-gh`, so `git` must be present when a GitHub remote exists - but any directory with a GitHub remote already has `git` installed. If no token can be resolved, or the effective host rejects the token, `fit`, `alter`, and `baste` exit immediately with an error.
 7. **CLI parsing**: [Kong](https://github.com/alecthomas/kong) is used as the command line parser.
 8. **Repository settings via API**: Repository settings are applied via `PATCH /repos/{owner}/{repo}` with a JSON body constructed from the `repository` section of `.tailor.yml`, plus separate API calls for security features, topics, and Actions workflow permissions. The `secret_scanning`, `secret_scanning_push_protection`, and `secret_scanning_non_provider_patterns` fields travel in the `security_and_analysis` object of the same PATCH body. The top-level `actions` section uses separate endpoints for core permissions, selected actions, artifact and log retention, and fork pull request contributor approval. The top-level `code_scanning` and `code_quality` sections use the code scanning default setup and Code Quality setup endpoints. The top-level `ruleset` section uses the repository rulesets endpoints (list, get, `POST`, and `PUT` on `/repos/{owner}/{repo}/rulesets`). Field names map directly to the GitHub REST API without translation, except for the `rules` map and its `enabled` keys, which are Tailor's form of the API `rules` list. Current settings are read via `GET /repos/{owner}/{repo}` and the relevant separate endpoints for `baste` comparison. All API calls use `go-gh`'s pre-authenticated REST client.
-9. **Execution order**: after config parsing, `alter` removes retired entries in memory before authentication. It then normalises the security prerequisites (automated security fixes, secret scanning push protection, and secret scanning non-provider patterns) and emits their warnings before validation. Next, it completes Dependabot preflight, required Go discovery, Pages preparation, and the managed-file preflight before token verification with `GET /user`. It completes Pages and local wiki safety checks and renders any required Go builder workflow before wiki enablement. For a declared public wiki, it enables `has_wiki` through the API if needed, then checks remote readiness and local adoption. A blocker stops the command before other writes. After readiness passes, it writes the changed config once and removes present retired workflow files. The same `GET /user` response resolves `{{GITHUB_USERNAME}}`, so verification adds no extra API call. It then applies repository settings, immutable releases, Actions policy, code scanning, Code Quality, the ruleset, labels, variables, Pages, wiki files, and the licence. In the swatch stage, it publishes Dependabot first, then managed development files and ordinary swatches. Pages files follow. `baste` uses `DryRun`. It reports wiki readiness blockers and continues the full preview, but writes and removes nothing. `alter` uses `Apply`, and `alter --recut` uses `Recut`.
+9. **Execution order**: after config parsing, `alter` removes retired entries in memory before authentication. It then normalises the security prerequisites (automated security fixes, secret scanning push protection, and secret scanning non-provider patterns) and emits their warnings before validation. Next, it completes Dependabot preflight, required Go discovery, Pages preparation, and the managed-file preflight before token verification with `GET /user`. It completes Pages and local wiki safety checks and renders any required Go builder workflow before wiki enablement. For a declared public wiki, it enables `has_wiki` through the API if needed, then checks remote readiness, local adoption and pending imports. An eligible import runs automatically and completes before normal alterations. A confirmed empty wiki is not a blocker. A blocker stops remaining writes. Confirmed enablement and completed import writes remain. After readiness passes, it writes the changed config once and removes present retired workflow files. The same `GET /user` response resolves `{{GITHUB_USERNAME}}`, so verification adds no extra API call. It then applies repository settings, immutable releases, Actions policy, code scanning, Code Quality, the ruleset, labels, variables, Pages, wiki files, and the licence. In the swatch stage, it publishes Dependabot first, then managed development files and ordinary swatches. Pages files follow. `baste` uses `DryRun`. It reports wiki import plans and readiness blockers and continues the full preview, but writes and removes nothing. `alter` uses `Apply`, and `alter --recut` uses `Recut`.

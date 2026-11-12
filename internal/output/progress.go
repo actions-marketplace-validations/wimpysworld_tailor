@@ -20,7 +20,7 @@ type (
 	}
 	stopProgress   struct{}
 	progressConfig struct {
-		animate, verbose, colour, ascii bool
+		animate, colour, ascii bool
 	}
 )
 
@@ -79,6 +79,8 @@ func (m ProgressModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.spinner, cmd = m.spinner.Update(msg)
 			return m, cmd
 		}
+	case progressPrompt:
+		return m, tea.Exec(promptCommand{run: msg.run}, func(err error) tea.Msg { msg.done <- err; return nil })
 	case stopProgress:
 		return m, tea.Quit
 	}
@@ -160,15 +162,11 @@ func (p *Progress) Observe(event StageEvent) {
 	if p.stopped {
 		return
 	}
-	if p.config.verbose {
-		fmt.Fprintln(p.writer, stageRecord(event))
-		return
-	}
+	p.stage = event
 	if p.program != nil {
 		p.program.Send(event)
 		return
 	}
-	p.stage = event
 	p.generation++
 	if p.timer != nil {
 		p.timer.Stop()
@@ -194,20 +192,6 @@ func (p *Progress) activate(generation uint64) {
 	go func() { _, _ = p.program.Run(); close(p.done) }()
 }
 
-func stageRecord(event StageEvent) string {
-	parts := []string{"[" + termtext.EscapeControlText(event.Phase) + "]", termtext.EscapeControlText(event.Label)}
-	if event.Total > 0 {
-		parts = append(parts, fmt.Sprintf("%d of %d", event.Current, event.Total))
-	}
-	if event.Item != "" {
-		parts = append(parts, termtext.EscapeControlText(event.Item))
-	}
-	if event.Err != nil {
-		parts = append(parts, termtext.EscapeControlText(event.Err.Error()))
-	}
-	return strings.Join(parts, " · ")
-}
-
 // WarningWriter prints above the live display, then Bubble Tea redraws the active stage.
 func (p *Progress) WarningWriter(fallback io.Writer) io.Writer {
 	if p == nil {
@@ -222,6 +206,49 @@ func (p *Progress) WarningWriter(fallback io.Writer) io.Writer {
 		p.program.Printf("%s", data)
 		return len(data), nil
 	})
+}
+
+type progressPrompt struct {
+	run  func() error
+	done chan error
+}
+
+type promptCommand struct{ run func() error }
+
+func (c promptCommand) Run() error        { return c.run() }
+func (promptCommand) SetStdin(io.Reader)  {}
+func (promptCommand) SetStdout(io.Writer) {}
+func (promptCommand) SetStderr(io.Writer) {}
+
+// WithPaused gives a prompt exclusive terminal access, then restores progress.
+func (p *Progress) WithPaused(run func() error) error {
+	if p == nil {
+		return run()
+	}
+	p.mu.Lock()
+	p.generation++
+	if p.timer != nil {
+		p.timer.Stop()
+		p.timer = nil
+	}
+	program, stage := p.program, p.stage
+	var err error
+	if program != nil && !p.stopped {
+		done := make(chan error, 1)
+		program.Send(progressPrompt{run: run, done: done})
+		select {
+		case err = <-done:
+		case <-p.done:
+			err = fmt.Errorf("progress stopped before confirmation")
+		}
+	} else {
+		err = run()
+	}
+	p.mu.Unlock()
+	if program == nil {
+		p.Observe(stage)
+	}
+	return err
 }
 
 type writerFunc func([]byte) (int, error)

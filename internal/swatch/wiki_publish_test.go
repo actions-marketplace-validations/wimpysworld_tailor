@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -94,6 +95,9 @@ type wikiPublisherFixture struct {
 
 func newWikiPublisherFixture(t *testing.T) *wikiPublisherFixture {
 	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX wiki publisher script tests do not run on Windows")
+	}
 	for _, program := range []string{"git", "python3"} {
 		if _, err := exec.LookPath(program); err != nil {
 			t.Skip(program + " is required for offline publisher tests")
@@ -218,6 +222,35 @@ func (f *wikiPublisherFixture) requirePublish() {
 	f.t.Helper()
 	if output, err := f.publish(""); err != nil {
 		f.t.Fatalf("publisher: %v\n%s", err, output)
+	}
+}
+
+func TestWikiPublisherRejectsRecoveryArtifacts(t *testing.T) {
+	for _, name := range []string{".tailor-wiki-tmp-abandoned", "nested/.tailor-wiki-tmp-abandoned", ".TAILOR-WIKI-backup"} {
+		t.Run(name, func(t *testing.T) {
+			f := newWikiPublisherFixture(t)
+			filename := filepath.Join(f.source, "wiki", name)
+			f.write(filename, "private recovery payload")
+			f.commit()
+			before := f.git(f.remote, "rev-parse", "HEAD")
+			if output, err := f.publish(""); err == nil || !strings.Contains(output, "reserved wiki recovery data") {
+				t.Fatalf("publisher accepted recovery data: %v %s", err, output)
+			}
+			if after := f.git(f.remote, "rev-parse", "HEAD"); after != before {
+				t.Fatal("publisher changed remote")
+			}
+			data, err := os.ReadFile(filename)
+			if err != nil || string(data) != "private recovery payload" {
+				t.Fatal("publisher changed retained artifact")
+			}
+			// A missing worktree file must not bypass the committed-tree check.
+			if err := os.Rename(filename, filepath.Join(f.root, "retained")); err != nil {
+				t.Fatal(err)
+			}
+			if output, err := f.publish(""); err == nil || !strings.Contains(output, "reserved wiki recovery data") {
+				t.Fatalf("publisher accepted committed recovery data: %v %s", err, output)
+			}
+		})
 	}
 }
 
@@ -406,7 +439,7 @@ func TestWikiPublisherUnchangedAdoptionRecordsOwnership(t *testing.T) {
 }
 
 func TestWikiPublisherRefusesUnsafeStates(t *testing.T) {
-	for _, name := range []string{"missing baseline", "invalid baseline", "wrong baseline", "unavailable remote", "empty remote", "symlink", "committed symlink", "special file", "git directory", "stale source", "missing source branch", "unavailable source"} {
+	for _, name := range []string{"missing baseline", "invalid baseline", "wrong baseline", "unavailable remote", "symlink", "committed symlink", "special file", "git directory", "stale source", "missing source branch", "unavailable source"} {
 		t.Run(name, func(t *testing.T) {
 			f := newWikiPublisherFixture(t)
 			before := f.git(f.remote, "rev-parse", "HEAD")
@@ -427,8 +460,6 @@ func TestWikiPublisherRefusesUnsafeStates(t *testing.T) {
 				if err := os.Rename(f.remote, f.remote+".saved"); err != nil {
 					t.Fatal(err)
 				}
-			case "empty remote":
-				f.git(f.remote, "update-ref", "-d", "refs/heads/handbook")
 			case "symlink":
 				if err := os.Symlink("../outside", filepath.Join(f.source, "wiki", "linked")); err != nil {
 					t.Fatal(err)
@@ -468,7 +499,7 @@ func TestWikiPublisherRefusesUnsafeStates(t *testing.T) {
 			if output, err := f.publish(sha); err == nil {
 				t.Fatalf("unsafe publication succeeded: %s", output)
 			}
-			if name != "unavailable remote" && name != "empty remote" && f.git(f.remote, "rev-parse", "HEAD") != before {
+			if name != "unavailable remote" && f.git(f.remote, "rev-parse", "HEAD") != before {
 				t.Fatal("rejected publication changed the wiki")
 			}
 		})
@@ -568,5 +599,56 @@ func TestWikiPublisherRefusesSourceHistoryRewind(t *testing.T) {
 	}
 	if after := f.git(f.remote, "rev-parse", "HEAD"); after != before {
 		t.Fatal("source history rewind changed the wiki")
+	}
+}
+
+// GitHub serves no wiki repository until the first page exists, so publication skips without failing.
+func TestWikiPublisherSkipsWikiWithoutPages(t *testing.T) {
+	for _, name := range []string{"not found", "not found without baseline", "empty remote", "empty remote without baseline"} {
+		t.Run(name, func(t *testing.T) {
+			f := newWikiPublisherFixture(t)
+			if strings.HasSuffix(name, "without baseline") {
+				if err := os.Remove(filepath.Join(f.source, "wiki", ".tailor-wiki-base")); err != nil {
+					t.Fatal(err)
+				}
+				f.commit()
+			}
+			var extraEnv []string
+			if strings.HasPrefix(name, "not found") {
+				gitPath, err := exec.LookPath("git")
+				if err != nil {
+					t.Fatal(err)
+				}
+				wrapper := filepath.Join(f.root, "bin", "git")
+				f.write(wrapper, "#!/bin/sh\nfor argument do\n  if [ \"$argument\" = clone ]; then\n"+
+					"    echo 'remote: Repository not found.' >&2\n    exit 128\n  fi\ndone\nexec '"+gitPath+"' \"$@\"\n")
+				if err := os.Chmod(wrapper, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				extraEnv = append(extraEnv, "PATH="+filepath.Dir(wrapper)+string(os.PathListSeparator)+os.Getenv("PATH"))
+			} else {
+				f.git(f.remote, "update-ref", "-d", "refs/heads/handbook")
+			}
+			output, err := f.publish("", extraEnv...)
+			if err != nil || !strings.Contains(output, "wiki has no pages; skipping publication") {
+				t.Fatalf("wiki without pages failed publication: %v\n%s", err, output)
+			}
+		})
+	}
+}
+
+// A non-file baseline is corrupt recovery state, so an empty wiki must not hide it.
+func TestWikiPublisherRefusesBaselineDirectoryForEmptyWiki(t *testing.T) {
+	f := newWikiPublisherFixture(t)
+	baseline := filepath.Join(f.source, "wiki", ".tailor-wiki-base")
+	if err := os.Remove(baseline); err != nil {
+		t.Fatal(err)
+	}
+	f.write(filepath.Join(baseline, "Home.md"), "Directory baseline\n")
+	f.commit()
+	f.git(f.remote, "update-ref", "-d", "refs/heads/handbook")
+	output, err := f.publish("")
+	if err == nil || !strings.Contains(output, "wiki/.tailor-wiki-base must be a regular file") {
+		t.Fatalf("baseline directory did not stop publication: %v\n%s", err, output)
 	}
 }

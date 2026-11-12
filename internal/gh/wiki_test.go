@@ -7,13 +7,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
 
 func wikiFixtureGit(t *testing.T, dir string, args ...string) string {
 	t.Helper()
-	command := exec.CommandContext(t.Context(), "git", append([]string{"-C", dir}, args...)...) // #nosec G204 -- Isolated local Git fixtures.
+	command := exec.CommandContext(t.Context(), "git", append([]string{"-c", "core.autocrlf=false", "-C", dir}, args...)...) // #nosec G204 -- Isolated local Git fixtures.
 	command.Env = append(os.Environ(), "GIT_AUTHOR_NAME=Test", "GIT_AUTHOR_EMAIL=test@example.com", "GIT_COMMITTER_NAME=Test", "GIT_COMMITTER_EMAIL=test@example.com")
 	output, err := command.CombinedOutput()
 	if err != nil {
@@ -151,10 +152,16 @@ func TestInspectWikiFileReadinessReasons(t *testing.T) {
 			remote := t.TempDir()
 			wikiFixtureGit(t, remote, "init", "-b", "main")
 			if tc.symlink {
+				if runtime.GOOS == "windows" {
+					t.Skip("POSIX Git symlink staging is unsupported on Windows")
+				}
 				if err := os.Symlink("Home.md", filepath.Join(remote, tc.file)); err != nil {
 					t.Fatal(err)
 				}
 			} else {
+				if runtime.GOOS == "windows" && strings.ContainsAny(tc.file, `:"`) {
+					t.Skip("filenames with colons or quotes are unsupported on Windows")
+				}
 				wikiFixtureWrite(t, remote, tc.file, "page")
 			}
 			wikiFixtureGit(t, remote, "add", ".")
@@ -175,6 +182,9 @@ func TestInspectWikiFileReadinessReasons(t *testing.T) {
 func TestInspectWikiSourceTreeReadinessReasons(t *testing.T) {
 	for _, unsafe := range []bool{false, true} {
 		t.Run(fmt.Sprintf("unsafe=%t", unsafe), func(t *testing.T) {
+			if unsafe && runtime.GOOS == "windows" {
+				t.Skip("POSIX Git symlink staging is unsupported on Windows")
+			}
 			dir, remote := t.TempDir(), t.TempDir()
 			for _, root := range []string{dir, remote} {
 				wikiFixtureGit(t, root, "init", "-b", "main")
@@ -233,5 +243,42 @@ func TestSafeWikiTree(t *testing.T) {
 		if got := safeWikiTree([]byte(tc.entry)); got != tc.want {
 			t.Errorf("safeWikiTree(%q)=%t, want %t", tc.entry, got, tc.want)
 		}
+	}
+}
+
+// GitHub serves no Git repository for an enabled public wiki until its first page exists.
+func TestWikiNotFoundClassificationUsesMetadata(t *testing.T) {
+	confirmed := WikiRepository{Public: true, Enabled: true}
+	for _, tc := range []struct {
+		name, stderr string
+		repository   WikiRepository
+		reason       WikiReadinessReason
+	}{
+		{"not found with confirmed metadata", "remote: Repository not found.", confirmed, WikiEmpty},
+		{"credential prompt with confirmed metadata", "fatal: could not read Username for 'https://github.com': terminal prompts disabled", confirmed, WikiEmpty},
+		{"not found without metadata", "remote: Repository not found.", WikiRepository{}, WikiAccessUnknown},
+		{"not found for a private repository", "remote: Repository not found.", WikiRepository{Enabled: true}, WikiAccessUnknown},
+		{"not found for a disabled wiki", "remote: Repository not found.", WikiRepository{Public: true}, WikiAccessUnknown},
+		{"denied with confirmed metadata", "fatal: Authentication failed", confirmed, WikiAccessDenied},
+		{"network with confirmed metadata", "fatal: Could not resolve host: github.com", confirmed, WikiReadFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wikiMetadataGit(t, fmt.Sprintf("printf '%%s\\n' %q >&2; exit 128\n", tc.stderr))
+			for name, err := range map[string]error{
+				"inspect": InspectWiki(t.TempDir(), "https://github.com/owner/project.wiki.git", "", tc.repository),
+				"snapshot": func() error {
+					snapshot, err := ReadWikiSnapshot(t.TempDir(), "https://github.com/owner/project.wiki.git", "", tc.repository)
+					if snapshot != nil {
+						t.Fatal("unavailable wiki returned a snapshot")
+					}
+					return err
+				}(),
+			} {
+				var access *WikiAccessError
+				if !errors.As(err, &access) || access.Reason != tc.reason {
+					t.Fatalf("%s: error=%v, want %s", name, err, tc.reason)
+				}
+			}
+		})
 	}
 }

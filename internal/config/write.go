@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"reflect"
+	"runtime"
 	"slices"
 	"strings"
 	"text/template"
@@ -128,6 +129,8 @@ var templateFuncs = template.FuncMap{
 		}
 		w.boolean(2, "rust", languages.Rust)
 		w.boolean(2, "python", languages.Python)
+		w.boolean(2, "shell", languages.Shell)
+		w.boolean(2, languages.javaScriptYAMLKey(), languages.JavaScript)
 		return w.lines, w.err
 	},
 	"repositoryLines": func(cfg *Config) ([]string, error) {
@@ -429,7 +432,7 @@ var configTemplate = template.Must(template.New("config").Funcs(templateFuncs).P
 license: {{ yamlVal .License }}
 
 {{- if .Languages }}
-{{- if or .GoDeclared .RustDeclared .PythonDeclared }}
+{{- if or .GoDeclared .RustDeclared .PythonDeclared .ShellDeclared .JavaScriptDeclared }}
 
 languages:
 {{- range languageLines .Languages }}
@@ -638,9 +641,11 @@ func Write(dir string, cfg *Config, date string, verb string) (retErr error) {
 	if err != nil {
 		return fmt.Errorf("opening config directory: %w", err)
 	}
-	if err := rootDir.Sync(); err != nil {
-		_ = rootDir.Close()
-		return fmt.Errorf("syncing config directory: %w", err)
+	if runtime.GOOS != "windows" {
+		if err := rootDir.Sync(); err != nil {
+			_ = rootDir.Close()
+			return fmt.Errorf("syncing config directory: %w", err)
+		}
 	}
 	if err := rootDir.Close(); err != nil {
 		return fmt.Errorf("closing config directory: %w", err)
